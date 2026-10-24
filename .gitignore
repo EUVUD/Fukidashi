@@ -1,0 +1,14 @@
+# data (OpenMantra is CC BY-NC 4.0; images are not redistributed)
+data/
+
+# local secrets and run outputs
+.env
+runs/
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# os
+.DS_Store
