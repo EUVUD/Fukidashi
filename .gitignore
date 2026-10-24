@@ -5,6 +5,9 @@ data/
 .env
 runs/
 
+# local task queue shared by the architect / executor / reviewer sessions (see CLAUDE.md)
+tasks/
+
 # python
 .venv/
 __pycache__/
