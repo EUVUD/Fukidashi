@@ -1,6 +1,6 @@
 # Design Diagrams
 
-> 2026-10-24 · 对应 M1 完成时的代码（`main` 上的 `4fa61fd`）。图用 Mermaid 写，GitHub 上直接渲染。
+> 2026-10-24 · 对应 M1 完成、并把 Run 的逻辑从 router 抽到 service 层之后的代码。图用 Mermaid 写，GitHub 上直接渲染。
 > **实线 = 已实现；虚线 = 计划中**（里程碑见 [OUTLINE.md](../OUTLINE.md) 第 7 节）。术语沿用 OUTLINE 第 0 节。
 
 Fukidashi 把日文漫画翻成简体中文（zh-Hans）：每一页有若干个 Segment（一个 oracle box 里的一句台词），模型看着整页图片把它们一起翻译，用户在浏览器里对照图上的 box 检查译文。
@@ -91,24 +91,26 @@ sequenceDiagram
 
 ## 3. Object Interaction Diagram（对象交互图）
 
-系统内部：一次 `translate` 请求经过哪些对象，按什么顺序（对应 `backend/app/api/pages.py` 的 `translate_page`）。
+系统内部：一次 `translate` 请求经过哪些对象，按什么顺序（对应 `api/pages.py` 的 `translate_page` 和 `runs.py` 的 `translate_page`）。
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant V as PageView<br/>(React)
     participant R as pages router<br/>(FastAPI)
-    participant D as SQLite
+    participant U as runs<br/>(service)
+    participant D as SQLite<br/>(via store)
     participant B as baseline<br/>(pipeline)
     participant C as LLMClient
     participant G as Meter,<br/>PageBudget
     participant M as LLM provider
 
     V->>R: POST /api/pages/:book/:index/translate
-    R->>D: read Page and Segments
-    R->>C: build LLMClient (config from .env, new Meter)
-    R->>D: INSERT Run (status running)
-    R->>B: run_baseline(page, client, budget)
+    R->>U: translate_page(book, index, make_client)
+    U->>D: read Page and Segments
+    U->>C: make_client() (config from .env, new Meter)
+    U->>D: INSERT Run (status running)
+    U->>B: run_baseline(page, client, budget)
     B->>B: build_messages (image, ja, boxes only)
     loop up to 2 attempts (retry only if the output is empty or unparseable)
         B->>C: chat(messages, budget)
@@ -119,8 +121,9 @@ sequenceDiagram
         C-->>B: LLMResult
         B->>B: parse_translations()
     end
-    B-->>R: BaselineResult (translations or error)
-    R->>D: UPDATE Run (usage, cost, status), INSERT Translations
+    B-->>U: BaselineResult (translations or error)
+    U->>D: UPDATE Run (usage, cost, status), INSERT Translations
+    U-->>R: Outcome (run id, result)
     alt ok
         R->>D: read Segments with latest Translations
         R-->>V: 200 PageDetail (Segments, zh-Hans, Run)
@@ -138,7 +141,7 @@ sequenceDiagram
 
 ### 4.1 Backend
 
-颜色表示层：蓝 = API，绿 = Pipeline，橙 = LLM，紫 = Data。
+颜色表示层：蓝 = API，粉 = Service，绿 = Pipeline，橙 = LLM，紫 = Data。
 
 ```mermaid
 classDiagram
@@ -151,6 +154,9 @@ classDiagram
         translate_page()
     }
     class PageDetail:::api
+    class Runs:::service {
+        translate_page()
+    }
     class Baseline:::pipeline {
         run_baseline()
     }
@@ -169,6 +175,11 @@ classDiagram
     class PageBudget:::llm
     class Page:::data
     class Segment:::data
+    class Store:::data {
+        find_page()
+        start_run()
+        finish_run()
+    }
     class SQLite:::data {
         books
         pages
@@ -181,8 +192,11 @@ classDiagram
     }
 
     PagesRouter ..> PageDetail : returns
-    PagesRouter ..> SQLite : reads, writes
-    PagesRouter ..> Baseline : calls
+    PagesRouter ..> Runs : translate
+    PagesRouter ..> Store : reads
+    Runs ..> Store : Runs, Translations
+    Runs ..> Baseline : run_baseline
+    Runs ..> Page : builds
     Baseline ..> Page : reads
     Baseline ..> LLMClient : chat
     Baseline ..> BaselineResult : returns
@@ -190,18 +204,22 @@ classDiagram
     LLMClient o-- Meter
     LLMClient ..> PageBudget : check, charge
     Page *-- Segment
+    Store ..> SQLite : SQL
     Importer ..> Page : loads
     Importer ..> SQLite : fills
 
     classDef api fill:#e8f0fe,stroke:#4a78d0,color:#222
+    classDef service fill:#fde8f1,stroke:#c4527f,color:#222
     classDef pipeline fill:#e6f4ea,stroke:#3a9d5d,color:#222
     classDef llm fill:#fff4e0,stroke:#d08a2a,color:#222
     classDef data fill:#f1e9fb,stroke:#8a5fc4,color:#222
 ```
 
+- `PagesRouter` 只做参数解析、错误码映射和响应整形，里面没有 SQL。「翻译一页并记一个 Run」在 `Runs.translate_page`，SQL 在 `Store`。
+- `Runs.translate_page` 不依赖 HTTP，eval harness 可以直接调它（OUTLINE 第 1.3 节的 Same code path）。页面无效时它抛 `PageNotFound` 等异常，由 router 映射成 404 / 422；模型调用失败不是异常，是一个 `failed` 的 Run。
 - `PagesRouter` 通过 FastAPI 的 `Depends` 拿到 SQLite 连接、数据集路径和 `LLMClient` 的工厂（`get_db`、`get_dataset_root`、`get_client_factory`）。测试里把它们换成临时 DB 和 fake `LLMClient`，所以测试不会发真实请求。
-- 每次 `translate` 都新建一个 `LLMClient` 和 `Meter`，这样一个 Run 的 usage 只算它自己的。
-- `Baseline` 不碰 SQLite，读写都在 `PagesRouter`。这样以后 eval harness 不经过 HTTP，也能直接调同一个 `run_baseline`（OUTLINE 第 1.3 节的 Same code path）。
+- 传给 `Runs` 的是 `LLMClient` 的工厂，不是 client：每个 Run 新建一个 `LLMClient` 和 `Meter`，一个 Run 的 usage 只算它自己的。
+- `Baseline` 不碰 HTTP 也不碰 SQLite。
 
 ### 4.2 Frontend
 
@@ -243,11 +261,11 @@ classDiagram
 | Book | `books` | `book_title`（字符串） | `PageSummary.book_title` |
 | Page | `pages` | `Page` | `PageSummary`、`PageDetail` |
 | Segment | `segments` | `Segment` | `SegmentOut` / `Segment` |
-| Run | `runs` | 没有单独的类：`_finish_run` 用 `Meter.summary()` 和 `BaselineResult` 写这一行 | `RunOut` / `Run` |
+| Run | `runs` | 没有单独的类：`Runs.translate_page` 用 `Meter.summary()` 和 `BaselineResult`，经 `Store.start_run` / `finish_run` 写这一行 | `RunOut` / `Run` |
 | Translation | `translations` | `BaselineResult.translations` | `Segment.text_zh_hans` |
 
 ### 4.4 后面的里程碑接在哪里
 
-- **M2：** `Baseline` 旁边加 Orchestrator 和 Translator Agent（tool loop，目录见 OUTLINE 第 6 节的 `orchestrator/`、`agents/`）。`LLMClient`、`Meter`、`PageBudget` 不变，Agent 的每次调用照样走它们。
+- **M2：** `Baseline` 旁边加 Orchestrator 和 Translator Agent（tool loop，目录见 OUTLINE 第 6 节的 `orchestrator/`、`agents/`）。`LLMClient`、`Meter`、`PageBudget` 不变，Agent 的每次调用照样走它们；`Runs.translate_page` 改成按 `config` 选 Baseline 还是 Orchestrator。
 - **M3：** 加 `KB`（Glossary、Character Profiles、Proposal Queue）和 Reviewer / Curator Agent；`runs.config` 多出 `full` 和 `full_no_kb`。
 - **M7：** Frontend 在 `PageView` 里加 canvas 和编辑功能；加 SSE，`api` 模块多一个订阅 event 的入口。

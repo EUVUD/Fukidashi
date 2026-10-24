@@ -7,7 +7,6 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import HTTPException
 
 from .. import config
 from ..db import connect
@@ -32,10 +31,6 @@ def get_client_factory() -> Callable[[], LLMClient]:
 
     def make() -> LLMClient:
         load_dotenv(config.ROOT / ".env")
-        try:
-            llm_config = LLMConfig.from_env()
-        except RuntimeError as e:  # names the missing variables, never their values
-            raise HTTPException(status_code=503, detail=str(e)) from e
-        return LLMClient(llm_config, Meter(ledger_path=config.LEDGER_PATH))
+        return LLMClient(LLMConfig.from_env(), Meter(ledger_path=config.LEDGER_PATH))  # may raise LLMNotConfigured
 
     return make

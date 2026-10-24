@@ -12,6 +12,10 @@ from openai.types import CompletionUsage
 from .metering import CallRecord, Meter, PageBudget, Usage
 
 
+class LLMNotConfigured(RuntimeError):
+    """The LLM_* variables are missing. The message names them, never their values."""
+
+
 @dataclass(frozen=True)
 class LLMConfig:
     base_url: str
@@ -26,7 +30,7 @@ class LLMConfig:
     def from_env(cls) -> LLMConfig:
         missing = [k for k in ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL") if not os.environ.get(k)]
         if missing:
-            raise RuntimeError(f"Set {', '.join(missing)} in .env (see .env.example)")
+            raise LLMNotConfigured(f"Set {', '.join(missing)} in .env (see .env.example)")
 
         def price(key: str) -> float | None:
             value = os.environ.get(key, "").strip()
