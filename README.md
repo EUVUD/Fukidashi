@@ -1,6 +1,6 @@
 # Fukidashi
 
-多 agent 漫画翻译编辑器（日 → 简体中文）。设计见 [OUTLINE.md](OUTLINE.md)，范围见 [SCOPE.md](SCOPE.md)。
+多 agent 漫画翻译编辑器（日 → 简体中文）。设计见 [OUTLINE.md](OUTLINE.md)，范围见 [SCOPE.md](SCOPE.md)，结构一览（Domain Model、System Sequence Diagram、Object Interaction Diagram、Object Model）见 [docs/design.md](docs/design.md)。
 
 ## Setup
 
