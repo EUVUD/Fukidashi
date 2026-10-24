@@ -6,6 +6,7 @@
 > **v0.4 改动（2026-10-24）：** M1 新增术语 Run（第 0 节）。
 > **v0.5 改动（2026-10-24）：** 第 0 节新增 Translation、Reference translation（`docs/design.md` 用到）。
 > **v0.6 改动（2026-10-24）：** 第 6 节同步 M1 的实际结构：Python 包定名 `fukidashi`，新增 `runs.py`、`store.py`、`pipeline/`。
+> **v0.7 改动（2026-10-24）：** 第 7 节标记 M1 完成。
 > 写法约定：正文用中文，**专业术语一律用英文**，代码、文档、commit message 和报告统一使用第 0 节的 canonical term。
 
 ---
@@ -352,7 +353,7 @@ fukidashi/
 | Milestone | Week | Dates | Hours | Deliverables |
 |---|---|---|---|---|
 | **M0** Decisions & first call | 1 | 10/16–10/18 | 2.5 | 4 个 decisions；`SCOPE.md`；下载并核对 OpenMantra（`annotation.json` 的字段、作品标题写法、页数、文本区数）；第一条真实 model output（记录 model ID 和 token usage）。**2026-10-24 完成**，见 `docs/m0.md` |
-| **M1** Vertical slice | 2 | 10/19–10/25 | 3.5 | M1-a：FastAPI + SQLite + OpenMantra import（oracle boxes + 原文）；M1-b：C0 → 前端显示页面图片、框和译文列表。**Checkpoint 10/25：浏览器里有一页真实译文** |
+| **M1** Vertical slice | 2 | 10/19–10/25 | 3.5 | M1-a：FastAPI + SQLite + OpenMantra import（oracle boxes + 原文）；M1-b：C0 → 前端显示页面图片、框和译文列表。**Checkpoint 10/25：浏览器里有一页真实译文**。**2026-10-24 完成**，见 `docs/m1.md` |
 | **M2** Agent layer & eval harness | 3 | 10/26–11/1 | 3.5 | Tool-calling loop + guardrails；Translator Agent；metering；接入 tracing tool（M2 选定 Langfuse 或 Phoenix）；eval harness：`eval/run.py` + manifest + sacreBLEU（chrF / BLEU，附 signature）；`baseline` 在 3 页上出分数，Translator Agent 在同样 3 页上跑通（smoke test，不是报告里的 config） |
 | **M3** KB & Reviewer | 4 | 11/2–11/8 | 3 | KB + Curator + Proposal Queue + KB write permission 的 unit tests；把 Reviewer Agent 接进 full system（最多 2 轮，固定值）；dev split 的 gold glossary；`baseline` / `full` / `full_no_kb` 各跑通 1 页 |
 | **M4** Dev evaluation | 5 | 11/9–11/15 | 3 | 先用 3 页估算 token 和费用（包括 judge 调用），对照 budget cap；装好 COMET / xCOMET（Mac 跑不动就用 Windows GPU），核对 checkpoint 的 license 和显存；在 dev split 上全量跑 3 个 config。**11/15：dev split 第一版数字**（chrF / BLEU、COMET、term accuracy、cost、latency） |
