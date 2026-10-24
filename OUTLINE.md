@@ -4,6 +4,7 @@
 > **v0.2 改动：** 评测方案从 artifact v10 的「研究型对照实验」改为「标准 evaluation framework + baseline 对比」（方案 B），见第 4 节；评测相关的部分以本文件为准。
 > **v0.3 改动（2026-10-22）：** 记录 M0 的决定（第 8 节）：项目名 Fukidashi，翻译方向 ja → zh-Hans，OpenAI-compatible provider，费用上限 $100。
 > **v0.4 改动（2026-10-24）：** M1 新增术语 Run（第 0 节）。
+> **v0.5 改动（2026-10-24）：** 第 0 节新增 Translation、Reference translation（`docs/design.md` 用到）。
 > 写法约定：正文用中文，**专业术语一律用英文**，代码、文档、commit message 和报告统一使用第 0 节的 canonical term。
 
 ---
@@ -68,6 +69,8 @@
 | Confidence Interval (CI) | 置信区间 | |
 | Adapter | 适配器 | detection、OCR、inpainting 可以替换 |
 | Checkpoint | 检查点 | 只在 checkpoint 考虑转向 |
+| Translation | 译文 | 一个 Run 给一个 Segment 的 zh-Hans 输出，存在 `translations` 表；同一个 Segment 会随多次 Run 有多条 Translation（v0.5 新增） |
+| Reference translation | 参考译文 | OpenMantra 里每个 Segment 的 zh-Hant 和 en 人工译文，只用于对照和评测，不进 prompt（v0.5 新增） |
 | Run | 一次运行 | 一个 config 在一页上的一次执行，存在 `runs` 表（config、model、usage、cost、status、时间）；页面显示最新一次 succeeded 的 run 的译文。和 Manifest 不同：Manifest 记录一整批 eval 运行（M1 新增） |
 
 **v0.2 删除的术语：** Cost parity、Preregistration（改为 Eval protocol）、Failure taxonomy（改为 MQM error breakdown）、Blind evaluation、Reviewer false positive。
