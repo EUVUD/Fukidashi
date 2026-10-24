@@ -10,13 +10,15 @@ git clone --depth 1 https://github.com/mantra-inc/open-mantra-dataset.git data/o
 cp .env.example .env   # 填 LLM_BASE_URL、LLM_API_KEY、LLM_MODEL
 ```
 
+`uv sync` 会把 `backend/fukidashi/` 以 editable 方式装成 Python 包 `fukidashi`，脚本、测试和以后的 `eval/` 都直接 `import fukidashi`，不需要改 `sys.path`。
+
 OpenMantra 是 CC BY-NC 4.0，图片不进本仓库。数据笔记见 [docs/openmantra.md](docs/openmantra.md)。
 
 ## Run the app（M1 vertical slice）
 
 ```bash
 uv run python scripts/import_openmantra.py          # 214 页导入 runs/fukidashi.db，可重复运行
-uv run uvicorn app.main:app --app-dir backend --port 8000
+uv run uvicorn fukidashi.main:app --port 8000
 npm install --prefix frontend                       # 第一次
 npm run dev --prefix frontend                       # http://localhost:5173/tojime_no_siora/002
 ```

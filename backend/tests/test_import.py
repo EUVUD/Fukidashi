@@ -1,4 +1,4 @@
-from app.datasets.importer import import_openmantra
+from fukidashi.datasets.importer import import_openmantra
 
 
 def table_counts(conn):

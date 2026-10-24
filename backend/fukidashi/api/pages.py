@@ -1,7 +1,7 @@
 """REST endpoints for pages: list, detail (segments + latest translation), image, translate.
 
 This layer parses requests, maps errors to status codes and shapes responses. The work itself lives in
-app.runs (translate and record a Run) and app.store (SQL).
+fukidashi.runs (translate and record a Run) and fukidashi.store (SQL).
 """
 
 from __future__ import annotations

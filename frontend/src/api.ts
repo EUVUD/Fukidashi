@@ -1,4 +1,4 @@
-// Mirrors the response models in backend/app/api/pages.py.
+// Mirrors the response models in backend/fukidashi/api/pages.py.
 
 export interface PageSummary {
   book_title: string

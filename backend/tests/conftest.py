@@ -8,12 +8,12 @@ from dataclasses import dataclass, field
 import pytest
 from fastapi.testclient import TestClient
 
-from app.api.deps import get_client_factory, get_dataset_root, get_db
-from app.datasets.importer import import_openmantra
-from app.db import connect, init_db
-from app.llm.client import LLMConfig, LLMResult
-from app.llm.metering import CallRecord, Meter, Usage
-from app.main import app
+from fukidashi.api.deps import get_client_factory, get_dataset_root, get_db
+from fukidashi.datasets.importer import import_openmantra
+from fukidashi.db import connect, init_db
+from fukidashi.llm.client import LLMConfig, LLMResult
+from fukidashi.llm.metering import CallRecord, Meter, Usage
+from fukidashi.main import app
 
 # Reference strings are distinctive so a test can check they never reach the prompt.
 SEGMENTS = [

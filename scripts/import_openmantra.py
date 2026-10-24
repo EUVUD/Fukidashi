@@ -11,12 +11,9 @@ import argparse
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "backend"))
-
-from app.config import DATASET_ROOT, DB_PATH  # noqa: E402
-from app.datasets.importer import import_openmantra  # noqa: E402
-from app.db import connect, init_db  # noqa: E402
+from fukidashi.config import DATASET_ROOT, DB_PATH
+from fukidashi.datasets.importer import import_openmantra
+from fukidashi.db import connect, init_db
 
 
 def main() -> None:
