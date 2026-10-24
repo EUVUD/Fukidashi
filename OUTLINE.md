@@ -5,6 +5,7 @@
 > **v0.3 改动（2026-10-22）：** 记录 M0 的决定（第 8 节）：项目名 Fukidashi，翻译方向 ja → zh-Hans，OpenAI-compatible provider，费用上限 $100。
 > **v0.4 改动（2026-10-24）：** M1 新增术语 Run（第 0 节）。
 > **v0.5 改动（2026-10-24）：** 第 0 节新增 Translation、Reference translation（`docs/design.md` 用到）。
+> **v0.6 改动（2026-10-24）：** 第 6 节同步 M1 的实际结构：Python 包定名 `fukidashi`，新增 `runs.py`、`store.py`、`pipeline/`。
 > 写法约定：正文用中文，**专业术语一律用英文**，代码、文档、commit message 和报告统一使用第 0 节的 canonical term。
 
 ---
@@ -316,9 +317,12 @@ fukidashi/
 ├── docs/                  # 数据笔记，例如 openmantra.md
 ├── scripts/               # 一次性脚本，例如 m0_first_call.py
 ├── backend/
-│   ├── app/
-│   │   ├── api/           # REST + SSE endpoints
-│   │   ├── datasets/      # OpenMantra loader
+│   ├── fukidashi/         # 可安装的 Python 包（uv sync 会 editable 安装），脚本和 eval 直接 import fukidashi
+│   │   ├── api/           # REST + SSE endpoints（只做请求解析、错误码映射、响应整形）
+│   │   ├── runs.py        # 翻译一页并记一个 Run；API 和 eval harness 共用（M1 新增）
+│   │   ├── store.py       # SQLite 的 SQL（M1 新增）
+│   │   ├── datasets/      # OpenMantra loader 和 import
+│   │   ├── pipeline/      # baseline（M1）；M2 起 orchestrator 接管调度，baseline 保留为一个 config
 │   │   ├── orchestrator/  # translate → review → finalize
 │   │   ├── agents/        # translator.py, reviewer.py, curator.py
 │   │   ├── tools/         # lookup_term, lookup_character, ...

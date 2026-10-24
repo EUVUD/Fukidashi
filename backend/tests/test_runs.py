@@ -5,8 +5,8 @@ import json
 import pytest
 from conftest import FakeClient
 
-from app import runs
-from app.datasets.importer import import_openmantra
+from fukidashi import runs
+from fukidashi.datasets.importer import import_openmantra
 
 GOOD = json.dumps({"translations": [{"id": 0, "zh": "你好"}, {"id": 1, "zh": "再见"}]}, ensure_ascii=False)
 

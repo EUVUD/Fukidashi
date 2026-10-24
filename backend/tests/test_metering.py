@@ -1,8 +1,8 @@
 import pytest
 from openai.types import CompletionUsage
 
-from app.llm.client import usage_from_api
-from app.llm.metering import BudgetExceeded, CallRecord, Meter, PageBudget, Usage
+from fukidashi.llm.client import usage_from_api
+from fukidashi.llm.metering import BudgetExceeded, CallRecord, Meter, PageBudget, Usage
 
 
 def record(usage, cost=None):

@@ -1,4 +1,4 @@
--- Fukidashi SQLite schema. Applied by app.db.init_db; every statement is idempotent.
+-- Fukidashi SQLite schema. Applied by fukidashi.db.init_db; every statement is idempotent.
 
 -- Imported from OpenMantra (oracle boxes + source text + reference translations).
 CREATE TABLE IF NOT EXISTS books (

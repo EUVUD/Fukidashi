@@ -14,21 +14,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "backend"))  # backend/app is a package, not installed
+from dotenv import load_dotenv
 
-from dotenv import load_dotenv  # noqa: E402
-
-from app.datasets.openmantra import get_page  # noqa: E402
-from app.llm.client import LLMClient, LLMConfig  # noqa: E402
-from app.llm.metering import Meter, PageBudget  # noqa: E402
-from app.pipeline.baseline import (  # noqa: E402
+from fukidashi.datasets.openmantra import get_page
+from fukidashi.llm.client import LLMClient, LLMConfig
+from fukidashi.llm.metering import Meter, PageBudget
+from fukidashi.pipeline.baseline import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_PAGE_BUDGET,
     SYSTEM_PROMPT,
     build_messages,
     run_baseline,
 )
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def main() -> None:

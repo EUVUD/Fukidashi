@@ -1,6 +1,6 @@
 """FastAPI entry point.
 
-  uv run uvicorn app.main:app --app-dir backend --port 8000
+  uv run uvicorn fukidashi.main:app --port 8000
 """
 
 from collections.abc import AsyncIterator
