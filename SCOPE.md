@@ -1,13 +1,13 @@
 # SCOPE
 
-> Fukidashi 的范围文件。v3 · 2026-10-22 · 由 [OUTLINE.md](OUTLINE.md) 第 2 节生成，范围以本文件为准。
-> 术语沿用 OUTLINE.md 第 0 节的 Terminology 表。
+> Fukidashi's scope file. v4 · 2026-10-26 · Derived from [OUTLINE.md](OUTLINE.md) §2; this file is authoritative for scope.
+> Terms follow the Terminology table in OUTLINE.md §0.
 
-**三条规则：**
+**Three rules:**
 
-1. 不在 In scope 里的不做。要加功能先改本文件，而且只在 checkpoint（10/25、12/13）改；其他时候冒出的想法先记进 `IDEAS.md`。
-2. 超时就按第 3 节的表，**从最下面一行往上砍**。
-3. 砍 product feature 时不动 eval code path。
+1. What is not in scope does not get built. Adding a feature means changing this file first, and only at a checkpoint (10/25, 12/13); ideas that come up in between go into `IDEAS.md`.
+2. When time runs out, cut from §3, **starting at the bottom row**.
+3. Cutting a product feature never touches the eval code path.
 
 ---
 
@@ -15,57 +15,57 @@
 
 | In scope | Out of scope |
 |---|---|
-| 日→简体中文（zh-Hans）单方向翻译（M0 决定） | 多语言方向、繁体输出、用户系统、多人实时协作 |
-| Oracle path（评测用）+ end-to-end visual path（demo 用） | 自训 detection / OCR / inpainting 模型 |
-| 3 个 agent + code orchestration | 通用 agent framework、自己的 workflow DSL |
-| SQLite KB + Proposal Queue | Vector database（RAG 不是本项目重点） |
-| Evaluation framework（sacreBLEU、COMET / xCOMET、GEMBA-MQM、term accuracy、cost、latency）+ `baseline` vs `full` + KB ablation（`full_no_kb`），dev/test split | 单独评测 Reviewer（independent review vs Self-Refine）、cost parity 调参；长篇作品上的 KB 收益（只在报告里讨论） |
-| Tracing 用 Langfuse 或 Arize Phoenix | 自写 trace 存储和 dashboard |
-| Canvas editor（第 3 节列出的 feature） | 完整的排版软件功能、字体管理 |
-| SSE live trace + `Last-Event-ID` reconnect | WebSocket、分布式任务队列 |
-| 一个最小 MCP server（只暴露 `lookup_term`） | 把整个系统做成 MCP 服务 |
+| One direction: Japanese → Simplified Chinese (zh-Hans), decided in M0 | Other language pairs, Traditional Chinese output, user accounts, real-time multi-user editing |
+| Oracle path (for evaluation) + end-to-end visual path (for the demo) | Training our own detection / OCR / inpainting models |
+| 3 agents + code orchestration | A general agent framework or our own workflow DSL |
+| SQLite KB + Proposal Queue | A vector database (RAG is not the focus) |
+| Evaluation framework (sacreBLEU, COMET / xCOMET, GEMBA-MQM, term accuracy, cost, latency) + `baseline` vs `full` + KB ablation (`full_no_kb`), dev/test split | Evaluating the Reviewer on its own (independent review vs Self-Refine), cost-parity tuning; KB gains on long books (discussed in the report only) |
+| Tracing with Langfuse or Arize Phoenix | Custom trace storage and dashboards |
+| Canvas editor (the features in §3) | Full typesetting features, font management |
+| SSE live trace + `Last-Event-ID` reconnect | WebSocket, a distributed task queue |
+| A minimal MCP server (exposes `lookup_term` only) | Turning the whole system into an MCP service |
 
 ---
 
 ## 2. Never cut
 
-下面两组不在 cut order 里。如果连它们都保不住，就按 10/25 的 pivot rule 处理：放下前端，只走 CLI 实验路径。
+These two groups are not part of the cut order. If even they are at risk, apply the 10/25 pivot rule: drop the frontend and keep only the CLI path.
 
-- **Eval path（M2–M6、M8）：** OpenMantra import（oracle path）；Orchestrator + Translator / Reviewer / Curator Agent；`baseline` / `full` / `full_no_kb` 三个 config；metering + tracing tool（Langfuse 或 Phoenix）；eval harness（`eval/run.py`）+ manifest；sacreBLEU（chrF / BLEU，附 signature）+ COMET / xCOMET + GEMBA-MQM（含 human agreement check）+ term accuracy / consistency + cost / latency；两组对比的 paired bootstrap；`eval/PROTOCOL.md` + tag `exp-frozen`。
-- **Vertical slice（M1）：** 浏览器里显示页面图片、oracle boxes 和 translation list，能对一页触发 C0 并看到真实译文。
+- **Eval path (M2–M6, M8):** OpenMantra import (oracle path); Orchestrator + Translator / Reviewer / Curator Agent; the `baseline` / `full` / `full_no_kb` configs; metering + tracing tool (Langfuse or Phoenix); eval harness (`eval/run.py`) + manifest; sacreBLEU (chrF / BLEU, with signature) + COMET / xCOMET + GEMBA-MQM (with the human agreement check) + term accuracy / consistency + cost / latency; paired bootstrap for both comparisons; `eval/PROTOCOL.md` + tag `exp-frozen`.
+- **Vertical slice (M1):** the browser shows the page image, the oracle boxes and the translation list, and can trigger C0 on a page and show the real translation.
 
 ---
 
 ## 3. Product Features — Cut Order
 
-M7 的预算是 12 h（12/14–12/20；v2 起从评测简化省下的 3 h 挪到这里）。**#1 最后砍，最下面一行最先砍。**
+M7 has a 12-hour budget (12/14–12/20; since v2 it includes the 3 hours saved by the simpler evaluation). **#1 is cut last; the bottom row is cut first.**
 
-**规则：** 每一项只依赖排在它上面的项，所以从下往上砍，保留下来的功能不会坏。
+**Rule:** each feature depends only on features above it, so cutting from the bottom never breaks what remains.
 
-| # | Feature | Done when（acceptance criteria） | Depends on | 为什么排在这里 |
+| # | Feature | Done when (acceptance criteria) | Depends on | Why it sits here |
 |---|---|---|---|---|
-| 1 | **Edit translation** | 在 translation list 里改一个 box 的译文，保存到 SQLite，刷新后还在 | Vertical slice | 编辑器最基本的功能；没有它就不算 editor |
-| 2 | **Live agent trace（SSE）** | 翻译一页时，前端实时显示每个 step（tool call、tool result、review round、finalize）；每个 event 带递增的 `seq` | — | 这是能直接演示多 agent 的地方，面试 demo 的核心 |
-| 3 | **Canvas typesetting** | 译文渲染进对应的 box（canvas overlay），字号自动缩小到放得下；能统计 overflow rate | — | 没有它，demo 看不出是漫画；#6、#9、#11 都依赖它 |
-| 4 | **Review comments & uncertain flags** | Reviewer 的意见和 `flag_uncertain` 标记在对应的 box 上高亮，点开能看到内容 | Reviewer Agent（M3） | 在产品里看得见 RQ1 的那个 Reviewer |
-| 5 | **Proposal approve / reject** | KB 面板列出 Proposal Queue 和 Human Review Queue；approve 或 reject 之后 KB 更新，entry 的 `provenance` 记为 human | KB + Curator（M3） | human-in-the-loop，能回答「错误条目怎么防」 |
-| 6 | **Rename → whole-book sync** | 改一个 term 的 `target_term` 后，全书用到它的 box 都更新，并重新 typesetting | #3、#5 | 产品的 headline feature，KB 在产品里最直观的体现 |
-| 7 | **SSE reconnect** | 断网或刷新页面后，客户端用 `Last-Event-ID` 重连，服务端补发缺失的 event，不重复也不丢 | #2 | 便宜，面试必问；不过 reliability 的故事 Triage Agent 那边（lease、fencing、`kill -9`）也讲得到，所以排在 #6 后面 |
-| 8 | **Detection + OCR（end-to-end path）** | 上传一张不在 OpenMantra 里的页面，自动得到 box 和原文：manga-ocr 必选，comic-text-detector 作为 optional adapter | Vision adapters | 证明系统不只能跑 oracle 数据；实验结论不依赖它 |
-| 9 | **Inpainting + PNG export** | 用 OpenCV 擦掉原文，写入译文，导出 PNG | #3、#8 | 成品图好看，但对 agent 和实验的故事没有帮助 |
-| 10 | **Box editing** | 能拖动、缩放和新建 box | — | 主要在 detection 漏框时才用；oracle path 用不上 |
-| 11 | **Text style** | 能手动改字号，能切换横排 / 竖排 | #3 | 日→中以横排为主，价值最低的排版细节 |
-| 12 | **Simple undo** | 撤销最近一次人工编辑（改字或 box 编辑）；不跨页面，不撤销 agent 的操作 | #1、#10 | 最先砍，没有它 demo 也能完整演示 |
+| 1 | **Edit translation** | Editing one box's translation in the translation list saves it to SQLite, and it survives a reload | Vertical slice | The most basic editor feature; without it this is not an editor |
+| 2 | **Live agent trace (SSE)** | While a page is translated, the frontend shows every step live (tool call, tool result, review round, finalize); every event carries an increasing `seq` | — | Where the multi-agent design is visible; the core of the demo |
+| 3 | **Canvas typesetting** | Translations render inside their boxes (canvas overlay), with the font shrunk until it fits; the overflow rate can be measured | — | Without it the demo does not look like manga; #6, #9 and #11 depend on it |
+| 4 | **Review comments & uncertain flags** | The Reviewer's comments and `flag_uncertain` marks highlight the matching box, and clicking shows the content | Reviewer Agent (M3) | Makes the Reviewer visible in the product |
+| 5 | **Proposal approve / reject** | A KB panel lists the Proposal Queue and the Human Review Queue; approving or rejecting updates the KB and records `provenance` as human | KB + Curator (M3) | Human in the loop; answers "how do wrong entries get stopped" |
+| 6 | **Rename → whole-book sync** | Changing a term's `target_term` updates every box in the book that uses it and re-typesets them | #3, #5 | The headline product feature; the most direct view of the KB in the product |
+| 7 | **SSE reconnect** | After a network drop or a page reload, the client reconnects with `Last-Event-ID` and the server replays the missed events, with no duplicates and no gaps | #2 | Cheap and a common question, but the reliability story is also covered by the companion Triage Agent project (leases, fencing, `kill -9`), so it sits below #6 |
+| 8 | **Detection + OCR (end-to-end path)** | Uploading a page that is not in OpenMantra yields boxes and source text automatically: manga-ocr required, comic-text-detector as an optional adapter | Vision adapters | Shows the system is not limited to oracle data; no evaluation result depends on it |
+| 9 | **Inpainting + PNG export** | OpenCV erases the source text, the translation is written in, and the page exports as PNG | #3, #8 | Nice finished pages, but adds nothing to the agent or evaluation story |
+| 10 | **Box editing** | Boxes can be moved, resized and added | — | Mostly needed when detection misses a box; the oracle path does not need it |
+| 11 | **Text style** | Font size can be set by hand; text switches between horizontal and vertical | #3 | Japanese → Chinese is mostly horizontal; the least valuable typesetting detail |
+| 12 | **Simple undo** | Undo the latest human edit (text or box); not across pages, and not agent actions | #1, #10 | Cut first; the demo is complete without it |
 
-**不是 feature，不参与 cut order：** demo 录屏（M7 草稿，M9 定稿）、README、报告。
+**Not features, so not in the cut order:** the demo recording (draft in M7, final in M9), the README, the report.
 
 ---
 
-## 4. 怎么砍
+## 4. How to cut
 
-- M7 期间每完成一项就记下实际用时。预计会超出 12 h 时，从表的最下面一行开始砍，并在第 5 节记一行（日期、砍掉哪一项、原因）。
-- 被砍的功能在 README 里写明 not implemented，**简历上不把设计稿写成已实现的功能**。
-- 不能拿 Never cut 的时间去补 product feature。
+- Record the actual time for each feature during M7. As soon as 12 hours look likely to be exceeded, cut from the bottom row and log it in §5 (date, feature, reason).
+- A cut feature is listed as not implemented in the README, and **a design is never presented as a finished feature on a résumé**.
+- Never take time from the Never-cut groups to finish a product feature.
 
 ---
 
@@ -73,6 +73,7 @@ M7 的预算是 12 h（12/14–12/20；v2 起从评测简化省下的 3 h 挪到
 
 | Date | Change |
 |---|---|
-| 2026-10-22 | v1：由 OUTLINE.md 第 2 节生成，product feature 按 cut order 排序 |
-| 2026-10-22 | v2：评测方案改为 evaluation framework + baseline 对比（方案 B）。第 1 节的评测行改为 `baseline` vs `full` + KB ablation，并新增 tracing 行；第 2 节 experiment path 改为 eval path；M7 预算从 9 h 改为 12 h。Cut order 不变 |
-| 2026-10-22 | v3：M0 决定。项目名定为 Fukidashi；第 1 节翻译方向改为 ja → zh-Hans，繁体输出列入 Out of scope |
+| 2026-10-22 | v1: derived from OUTLINE.md §2; product features ordered for cutting |
+| 2026-10-22 | v2: evaluation changed to an evaluation framework + baseline comparison (plan B). §1's evaluation row became `baseline` vs `full` + KB ablation, and a tracing row was added; §2's experiment path became the eval path; the M7 budget went from 9 h to 12 h. Cut order unchanged |
+| 2026-10-22 | v3: M0 decisions. Name fixed as Fukidashi; §1's direction became ja → zh-Hans, with Traditional Chinese output out of scope |
+| 2026-10-26 | v4: translated to English; scope and cut order unchanged |

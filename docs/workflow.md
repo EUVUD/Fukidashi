@@ -1,8 +1,8 @@
 # Workflow: Architect → Executor → Reviewer
 
-> 2026-10-24。这份是给你看的使用说明。规则本身（谁能改什么、状态怎么流转、git 怎么用）在 [CLAUDE.md](../CLAUDE.md) 的 “Task workflow”，三个角色的完整指令在 `.claude/commands/`。
+> 2026-10-24. This is the guide for people. The rules themselves (who may change what, how status moves, how git is used) are in "Task workflow" in [CLAUDE.md](../CLAUDE.md), and the full instructions for the three roles are in `.claude/commands/`.
 
-三个互相独立的 chat session，靠一个 task 文件交接：
+Three separate chat sessions hand work over through one task file:
 
 ```mermaid
 sequenceDiagram
@@ -30,22 +30,22 @@ sequenceDiagram
     end
 ```
 
-## 怎么用
+## How to use it
 
-1. 开一个新 session，输入 `/architect`。可以直接带上问题，例如 `/architect M2 应该先做哪一块`。它会先读 OUTLINE、SCOPE、IDEAS 和 git，告诉你现在的状态，再回答。
-2. 在 architect 里讨论。想做的事定下来后，它先在聊天里给你看 task 草稿（goal、scope、验收标准），你同意了才写成 `tasks/NNN-slug.md`。
-3. 新开一个 session，输入 `/execute-task NNN`。executor 只知道 task 文件和仓库：它在 `task/NNN-slug` 分支上实现、验证、commit，把 Execution report 写进 task 文件。它不会 push，也不会开 PR。
-4. 再新开一个 session，输入 `/review-task NNN`。reviewer 先读验收标准，再自己读 diff、自己跑 Verification，最后才对照 Execution report。它不改仓库，只写 Review 和结论。
-5. 结论是 approved：你决定什么时候 push、开 PR、rebase and merge；合并后回 architect 说一声，它把 task 标成 done 并建议下一个。结论是 changes requested：回到第 3 步，用同一条 `/execute-task NNN`，executor 会读最新的 Review。
+1. Open a new session and type `/architect`, optionally with a question, for example `/architect what should M2 start with`. It reads OUTLINE, SCOPE, IDEAS and git first, tells you where things stand, then answers.
+2. Discuss in the architect session. Once the work is settled, it shows you a task draft in chat (goal, scope, acceptance criteria) and writes `tasks/NNN-slug.md` only after you agree.
+3. Open a new session and type `/execute-task NNN`. The executor knows only the task file and the repository: it implements, verifies and commits on branch `task/NNN-slug`, then writes the Execution report into the task file. It does not push or open a PR.
+4. Open another new session and type `/review-task NNN`. The reviewer reads the acceptance criteria first, then reads the diff and reruns the Verification itself, and only then compares with the Execution report. It does not change the repository; it writes the Review and a verdict.
+5. If the verdict is approved, you decide when to push, open the PR and rebase and merge; after merging, tell the architect, which marks the task done and suggests the next one. If the verdict is changes requested, go back to step 3 with the same `/execute-task NNN`; the executor reads the latest Review.
 
-## 为什么这样设计
+## Why it is built this way
 
-- **Reviewer 是新 session。** 它没有 executor 的上下文，先读合同（验收标准）、后读 executor 的说法，所以不会顺着 report 的思路走。
-- **一个 task 一个 PR**，和 OUTLINE 第 10 节一致。task 要小（约 1–4 小时），验收标准要能用命令或观察来检查。
-- **task 文件放在本地。** `tasks/` 被 gitignore，所有 session 都通过 git common dir 找到主 checkout 里的同一个目录，不管它们跑在主 checkout 还是 worktree 里，切分支也不会弄丢。代价是 task 不进 git 历史；要留痕的内容放进 PR 描述和 `docs/mN.md`。
+- **The reviewer is a new session.** It has none of the executor's context and reads the contract (acceptance criteria) before the executor's account, so it does not follow the report's line of thought.
+- **One task, one PR**, as in OUTLINE §10. Tasks are small (about 1–4 hours), and acceptance criteria must be checkable by a command or an observation.
+- **Task files stay local.** `tasks/` is gitignored, and every session finds the same directory in the main checkout through git's common dir, whether it runs in the main checkout or in a worktree, and switching branches never loses it. The cost is that tasks are not in git history; anything that should be kept goes into the PR description and `docs/mN.md`.
 
-## 限制
+## Limits
 
-- 角色边界是写在 prompt 里的约定，不是权限隔离：architect 不改代码、reviewer 不改仓库，靠指令，系统不会强制。
-- 几个 session 共用同一个 checkout 时，同一时间只让一个 executor 在跑。executor 开工前会检查工作区有没有不是它改的东西。
-- reviewer 和 executor 是同一个模型。独立的是上下文，不是能力，所以 reviewer 的结论仍然值得你自己扫一眼 diff。
+- Role boundaries are conventions written into prompts, not permission isolation: the architect not editing code and the reviewer not changing the repository rely on instructions, not on enforcement.
+- When several sessions share one checkout, only one executor runs at a time. The executor checks for changes it did not make before starting.
+- The reviewer and the executor are the same model. What is independent is the context, not the capability, so the reviewer's verdict still deserves a look at the diff from you.

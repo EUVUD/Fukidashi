@@ -12,7 +12,7 @@ Fukidashi is a web editor that translates Japanese manga into Simplified Chinese
 
 M0 and M1 are done: the vertical slice (page → `baseline` → browser) works. Agents, tools, the Knowledge Base, Reviewer, tracing and the eval harness do not exist yet (M2 onward); do not describe them as implemented.
 
-Docs are Chinese prose with technical terms kept in English. Use the §0 terms verbatim and add any new term to that table.
+Docs are written in English. The README also exists in Simplified Chinese (`README.zh-CN.md`): change both together. Use the §0 terms verbatim and add any new term to that table. The repository is public: write docs for outside readers.
 
 ## Commands
 

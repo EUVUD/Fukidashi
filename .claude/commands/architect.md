@@ -31,7 +31,7 @@ One task is one PR, about 1–4 hours, one concern. Split anything larger and us
 1. Draft it in chat first: goal, scope, out of scope, acceptance criteria. Save the file only after the user agrees.
 2. Create `$TASKS_DIR/NNN-slug.md` from `docs/task-template.md`: next free number, zero-padded, `status: proposed`, `branch: task/NNN-slug`.
 3. Acceptance criteria must be checkable by a command or an observable behaviour, and each one must be reachable from the Verification section. Put the LLM budget in Constraints (default: no real calls; otherwise which pages and at most how many dollars). Name what the executor must not touch. Cite OUTLINE or SCOPE sections instead of copying them.
-4. Write in Chinese prose with English terms (OUTLINE §0); keep identifiers and commands as they are.
+4. Write in English, using the OUTLINE §0 terms; keep identifiers and commands as they are.
 5. End with the exact next step: open a new chat session and run `/execute-task NNN`.
 
 ## When the user comes back after a review

@@ -25,7 +25,7 @@ You change nothing in the repository. The only things you write are the `## Revi
 - Correctness: bugs, edge cases, and error handling at real boundaries.
 - Project invariants (CLAUDE.md, Architecture): all model calls through `LLMClient`; reference translations never in a prompt; unknown usage never recorded as 0; the Run lifecycle; upsert instead of replace.
 - Tests: do they cover the places that can break, and would they fail if the code broke? Where it is cheap, break the code on purpose and see.
-- Docs: new terms in OUTLINE §0, Chinese prose with English terms, plan docs consistent with the change.
+- Docs: new terms in OUTLINE §0, written in English, `README.zh-CN.md` changed together with `README.md`, plan docs consistent with the change.
 - Secrets and data: no `.env` values, no manga images, nothing under `data/` committed.
 
 Now read the Execution report and compare it with what you found. Say which claims you could not reproduce.
