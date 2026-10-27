@@ -1,6 +1,6 @@
 # Fukidashi — Project Outline
 
-> v0.10 · 2026-10-27
+> v0.11 · 2026-10-27
 > **v0.2 (2026-10-22):** evaluation changed from a research-style controlled experiment to a standard evaluation framework plus a baseline comparison (plan B); see §4.
 > **v0.3 (2026-10-22):** M0 decisions recorded in §8: name Fukidashi, ja → zh-Hans, an OpenAI-compatible provider, a $100 budget cap.
 > **v0.4 (2026-10-24):** M1 added the term Run (§0).
@@ -10,6 +10,7 @@
 > **v0.8 (2026-10-26):** docs translated to English; the README also has a Simplified Chinese version (`README.zh-CN.md`).
 > **v0.9 (2026-10-26):** §8 decides the OpenCC config (`t2s`); §6 moves the eval library into `backend/fukidashi/evaluation/`, leaving the entry point and eval data in `eval/`.
 > **v0.10 (2026-10-27):** §8 records that the provider SDK's automatic retries are off; §3.5 and §3.6 note that a failed request is metered as unknown and is not resent, as implemented in M2.
+> **v0.11 (2026-10-27):** §8 decides the agent loop: LangChain v1 `create_agent`, with `LLMClient` as its model through an adapter; §5 adds it to the tech stack.
 > Convention: code, docs, commit messages and reports use the canonical terms in §0.
 
 ---
@@ -302,6 +303,7 @@ Every quality metric in both comparisons gets a paired bootstrap 95% CI. Primary
 | Backend | FastAPI + SQLite + SSE |
 | Runtime | Python 3.12, dependencies managed with uv |
 | LLM | OpenAI-compatible API through the `openai` Python SDK; provider and `LLM_MODEL` are configured in `.env` (template: `.env.example`); requires vision, tool calling and JSON output. Currently DeepSeek `deepseek-flash` |
+| Agents | LangChain v1 `create_agent` runs the tool-calling loop. Its model is a small adapter over our `LLMClient`, so metering and DeepSeek's `reasoning_content` stay ours; LangChain stays inside `agents/` |
 | Vision | manga-ocr, comic-text-detector (optional), OpenCV, LaMa (optional) |
 | Evaluation | sacreBLEU (chrF / BLEU), COMET / xCOMET (Unbabel), GEMBA-MQM (LLM-as-judge), paired bootstrap (Python), OpenCC (reference conversion) |
 | Observability | Langfuse or Arize Phoenix (tracing); metering is ours |
@@ -396,6 +398,7 @@ fukidashi/
 | API budget cap | M0 | **$100** for the whole project, judge calls included. `runs/usage.jsonl` logs every call; M4 estimates on 3 pages first | Decided (2026-10-22) |
 | OpenCC config | M2 | **`t2s`**: converts characters only and leaves the reference's wording as the translator wrote it. Taiwan and mainland vocabulary differences remain and lower reference-based metrics slightly (§4.9). `tw2sp` was rejected because it rewrites the human translation's wording | Decided (2026-10-26) |
 | Provider SDK retries | M2 | **Off** (`max_retries=0`). By default the `openai` SDK silently resends a request up to twice on connection errors, timeouts, 429 and 5xx; earlier attempts that may have been billed would never reach the Meter, and cost would be a partial sum. Now a 429 or 5xx fails the page and the user reruns it. An explicit retry for 429, which is rejected and not billed, can be added if 429s are common in M4 (`IDEAS.md`) | Decided (2026-10-26) |
+| Agent loop | M2 | **LangChain v1 `create_agent`** as the loop skeleton, customised through its model, tools and middleware (the Step limit is its `ModelCallLimitMiddleware`); start here and change it if the project needs to. Its model is a small custom chat model over `LLMClient`, not `ChatOpenAI` / `ChatDeepSeek`: those bypass the Meter and retry by default, and DeepSeek rejects tool-call turns that do not send `reasoning_content` back. LangChain stays inside `agents/`, behind a plain result type, so replacing it touches nothing else. The alternative was a hand-written loop | Decided (2026-10-27) |
 | Tracing tool | M2 | Langfuse or Arize Phoenix; Phoenix suggested (runs locally, lighter) | Open |
 | COMET checkpoint | M4 | Which COMET and xCOMET models, by license and memory | Open |
 | Judge model (GEMBA-MQM) | M5 | A strong model different from the translation model | Open |

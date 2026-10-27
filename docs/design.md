@@ -1,6 +1,6 @@
 # Design Diagrams
 
-> 2026-10-27 · Matches the code after M2's first four tasks: the eval harness v0, the Run status and cost fixes, and provider error handling. Diagrams are Mermaid and render on GitHub.
+> 2026-10-27 · Matches the code after M2's first five tasks: the eval harness v0, the Run status and cost fixes, and provider and malformed-response error handling. Diagrams are Mermaid and render on GitHub.
 > **Solid = implemented; dashed = planned** (milestones in [OUTLINE.md](../OUTLINE.md) §7). Terms follow OUTLINE §0.
 
 Fukidashi translates Japanese manga into Simplified Chinese (zh-Hans). Each page has several Segments (one line of dialogue in one oracle box); the model looks at the whole page image and translates them together, and the user checks the translations against the boxes in the browser.
@@ -121,10 +121,10 @@ sequenceDiagram
             C->>G: meter.record(), budget.charge()
             C-->>B: LLMResult
             B->>B: parse_translations()
-        else request raised (timeout, connection error, HTTP error)
-            C->>G: meter.record(usage unknown, error), budget.charge(unknown)
-            C-->>B: ProviderError
-            Note over B: no retry, the error goes on the Run
+        else request raised, or the response cannot be read
+            C->>G: meter.record(error, usage if the response had any), budget.charge()
+            C-->>B: ProviderError (with its CallRecord)
+            Note over B: no retry, the attempt and the error go on the Run
         end
     end
     B-->>U: BaselineResult (translations or error)
@@ -144,7 +144,7 @@ sequenceDiagram
 
 ## 4. Object Model
 
-The objects in the code and how they depend on each other (the actual structure after M2's first four tasks).
+The objects in the code and how they depend on each other (the actual structure after M2's first five tasks).
 
 ### 4.1 Backend
 
@@ -188,6 +188,7 @@ classDiagram
     class ProviderError:::llm {
         description
         status_code
+        record
     }
     class LLMConfig:::llm
     class Meter:::llm {
@@ -248,7 +249,7 @@ classDiagram
 - `EvalHarness` (`evaluation/harness.py`; CLI `eval/run.py`) calls `validate_page` for every page before the first model call, then `translate_page` page by page, and scores the stored Translations against references converted with OpenCC `t2s`. It writes `EvalOutputs` to `runs/eval/<id>/`; `scores.json` reports scored and failed Runs' cost separately, and any unknown cost makes a total `null`.
 - `PagesRouter` gets the SQLite connection, the dataset path and the `LLMClient` factory through FastAPI's `Depends` (`get_db`, `get_dataset_root`, `get_client_factory`). Tests swap them for a temporary DB and a fake `LLMClient`, so tests never make real requests.
 - `Runs` receives an `LLMClient` factory, not a client: every Run builds its own `LLMClient` and `Meter`, so each Run's usage is its own.
-- `llm/` (`LLMClient` and `describe_api_error`) is the only code that imports `openai`. `LLMClient` turns the SDK's automatic retries off, so every request sent is one call in the `Meter`. A request that raises is recorded with unknown usage and an `error`, then leaves `llm/` as `ProviderError`. `Baseline` puts that error on the Run without retrying (OUTLINE §3.6: a request that may have been billed is not resent automatically); it retries only empty or unparseable output.
+- `llm/` (`LLMClient` and `describe_api_error`) is the only code that imports `openai`. `LLMClient` turns the SDK's automatic retries off, so every request sent is one call in the `Meter`. A request that raises, or a response `LLMClient` cannot read (an HTML page, a body that is not JSON, no readable first choice), is recorded once with an `error`, with unknown usage unless the response carried some, then leaves `llm/` as `ProviderError` carrying that `CallRecord`. `Baseline` adds it to `attempts` and puts the error on the Run without retrying (OUTLINE §3.6: a request that may have been billed is not resent automatically), so a finished Run has one attempt per call; it retries only empty or unparseable output.
 - `Baseline` touches neither HTTP nor SQLite.
 
 ### 4.2 Frontend
