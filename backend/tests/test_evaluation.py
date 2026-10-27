@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
-from dataclasses import dataclass, field
 
 import pytest
-from conftest import FakeClient
+from conftest import CrashAfterCallClient, FakeClient, UsageClient
 from sacrebleu.metrics import BLEU, CHRF
 
 from fukidashi import config
@@ -16,8 +16,8 @@ from fukidashi.datasets.importer import import_openmantra
 from fukidashi.evaluation import harness, metrics
 from fukidashi.evaluation.manifest import git_state
 from fukidashi.evaluation.references import to_zh_hans
-from fukidashi.llm.client import LLMNotConfigured, LLMResult
-from fukidashi.llm.metering import CallRecord, Usage
+from fukidashi.llm.client import LLMNotConfigured
+from fukidashi.llm.metering import Usage
 
 # Page 1 and page 3 have text; page 2 has none. The references are Traditional, as in OpenMantra.
 PAGES = {
@@ -51,21 +51,6 @@ def root(tmp_path):
 def imported(conn, root):
     import_openmantra(conn, root)
     return conn
-
-
-@dataclass
-class UsageClient(FakeClient):
-    """Like FakeClient, but each call reports the usage listed in `usages` (None: the provider sent none)."""
-
-    usages: list[Usage | None] = field(default_factory=list)
-
-    def chat(self, messages, *, budget, max_tokens=4096, json_output=False):
-        usage = self.usages.pop(0)
-        rec = CallRecord(budget.page_id, "fake-model", "fake-model-1", usage, 0.01,
-                         None if usage is None else 0.0001)
-        self.meter.record(rec)
-        budget.charge(usage)
-        return LLMResult(text=self.replies.pop(0), finish_reason="stop", record=rec)
 
 
 class ExplodingClient(FakeClient):
@@ -116,7 +101,7 @@ def test_outputs_manifest_segments_and_scores(imported, root, tmp_path):
     _, chrf_signature, _, bleu_signature = sacrebleu_on(["这是测试"], ["这个测试"])
     assert manifest["sacrebleu_signatures"] == {"chrf": chrf_signature, "bleu": bleu_signature}
     assert "tok:zh" in manifest["sacrebleu_signatures"]["bleu"]
-    assert len(manifest["annotation_sha256"]) == 64
+    assert manifest["annotation_sha256"] == hashlib.sha256((root / "annotation.json").read_bytes()).hexdigest()
     assert manifest["started_at"] <= manifest["finished_at"]
     assert len(manifest["git_commit"]) == 40 and isinstance(manifest["git_dirty"], bool)
     assert manifest["eval_id"] == result.out_dir.name
@@ -145,8 +130,9 @@ def test_scores_equal_sacrebleu_on_the_same_lists(imported, root, tmp_path):
     assert (scores["chrf"]["score"], scores["chrf"]["signature"]) == (chrf, chrf_signature)
     assert (scores["bleu"]["score"], scores["bleu"]["signature"]) == (bleu, bleu_signature)
     assert (scores["pages_scored"], scores["segments_scored"]) == (2, 3)
+    no_failed_runs = {"total_usd": None, "per_page_usd": None, "unknown_cost_runs": 0, "unknown_usage_calls": 0}
     assert scores["cost"] == {"total_usd": 0.0002, "per_page_usd": 0.0001, "unknown_cost_runs": 0,
-                              "unknown_usage_calls": 0}
+                              "unknown_usage_calls": 0, "failed_runs": no_failed_runs}
     assert scores["latency"]["n"] == 2 and scores["latency"]["p50_s"] <= scores["latency"]["p95_s"]
     assert [p["cost_usd"] for p in scores["pages"]] == [0.0001, 0.0001]
 
@@ -191,10 +177,62 @@ def test_an_unexpected_error_fails_that_page_and_the_rest_still_run(imported, ro
     result = evaluate(imported, root, tmp_path, [ExplodingClient([]), FakeClient([reply(3)])], [1, 3])
 
     assert result.exit_code == 1
-    assert result.scores["failed_pages"][0]["error"] == "RuntimeError: provider exploded"
-    assert result.scores["failed_pages"][0]["run_id"] is None
+    crashed = result.scores["failed_pages"][0]
+    assert crashed["error"] == "RuntimeError: provider exploded"
+    run = imported.execute("SELECT id, status, error FROM runs ORDER BY id").fetchall()[0]
+    assert crashed["run_id"] == run["id"]  # the crashed Run is recorded, so the page points to it
+    assert (run["status"], run["error"]) == ("failed", "RuntimeError: provider exploded")
     assert result.scores["pages_scored"] == 1
-    assert imported.execute("SELECT status FROM runs ORDER BY id").fetchall()[0][0] == "failed"
+    assert result.manifest["pages"][0] == {"book": "book_e", "page_index": 1, "status": "failed", "run_id": run["id"]}
+
+
+def test_a_failed_run_cost_is_reported_apart_from_the_scored_cost(imported, root, tmp_path):
+    garbage = FakeClient(["not json", "still not json"])  # two priced calls, then a failed Run
+    result = evaluate(imported, root, tmp_path, [garbage, FakeClient([reply(3)])], [1, 3])
+
+    failed = result.scores["failed_pages"][0]
+    assert failed["run_id"] is not None and failed["cost_usd"] == 0.0002
+    assert result.scores["cost"]["failed_runs"] == {"total_usd": 0.0002, "per_page_usd": 0.0002,
+                                                    "unknown_cost_runs": 0, "unknown_usage_calls": 0}
+    # the scored-page fields keep their meaning: they cover the scored Run only
+    cost = result.scores["cost"]
+    assert (cost["total_usd"], cost["per_page_usd"], cost["unknown_cost_runs"]) == (0.0001, 0.0001, 0)
+    assert [(p["page_index"], p["cost_usd"]) for p in result.scores["pages"]] == [(3, 0.0001)]
+
+
+def test_a_crashed_page_is_listed_with_its_run_and_its_cost(imported, root, tmp_path):
+    crashed = CrashAfterCallClient([reply(1)])  # one priced call, then an unexpected exception
+    result = evaluate(imported, root, tmp_path, [crashed, FakeClient([reply(3)])], [1, 3])
+
+    entry = result.scores["failed_pages"][0]
+    run = imported.execute("SELECT id, status, cost_usd FROM runs ORDER BY id").fetchall()[0]
+    assert (entry["page_index"], entry["run_id"], entry["cost_usd"]) == (1, run["id"], 0.0001)
+    assert entry["error"] == "RuntimeError: crashed after the call"
+    assert (run["status"], run["cost_usd"]) == ("failed", 0.0001)
+    assert result.scores["cost"]["failed_runs"]["total_usd"] == 0.0001
+    assert result.scores["cost"]["total_usd"] == 0.0001  # page 3 alone
+    assert imported.execute("SELECT COUNT(*) FROM runs WHERE status = 'running'").fetchone()[0] == 0
+    assert result.exit_code == 1
+
+
+def test_failed_runs_cost_is_null_when_any_failed_run_has_unknown_cost(imported, root, tmp_path):
+    priced = UsageClient(["x", "y"], usages=[Usage(100, 20), Usage(100, 20)])  # fails, costs 0.0002
+    unknown = UsageClient(["x", "y"], usages=[None, Usage(100, 20)])  # fails, one call without usage
+    result = evaluate(imported, root, tmp_path, [priced, unknown], [1, 3])
+
+    assert [p["cost_usd"] for p in result.scores["failed_pages"]] == [0.0002, None]
+    assert result.scores["cost"]["failed_runs"] == {"total_usd": None, "per_page_usd": None,
+                                                    "unknown_cost_runs": 1, "unknown_usage_calls": 1}  # not 0.0002
+    assert result.scores["cost"]["total_usd"] is None and result.scores["pages_scored"] == 0
+
+
+def test_a_run_that_crashed_before_any_call_has_unknown_cost(imported, root, tmp_path):
+    result = evaluate(imported, root, tmp_path, [ExplodingClient([])], [1])
+
+    entry = result.scores["failed_pages"][0]
+    assert entry["run_id"] is not None and entry["cost_usd"] is None  # no call recorded: no cost to trust
+    assert result.scores["cost"]["failed_runs"] == {"total_usd": None, "per_page_usd": None,
+                                                    "unknown_cost_runs": 1, "unknown_usage_calls": 0}
 
 
 def test_an_unknown_page_or_missing_image_stops_before_any_model_call(imported, root, tmp_path):
@@ -245,13 +283,13 @@ def test_cost_is_null_when_any_scored_run_has_unknown_cost(imported, root, tmp_p
     assert result.scores["pages_scored"] == 2
 
 
-def test_a_run_with_one_unknown_call_is_not_trusted_even_if_the_meter_summed_the_rest(imported, root, tmp_path):
-    # First call has no usage and unparseable output; the retry is priced. Meter.summary() reports 0.0001
-    # for the Run (a partial sum); the harness must not add it up as if it were complete.
+def test_a_run_with_one_unknown_call_has_unknown_cost(imported, root, tmp_path):
+    # First call has no usage and unparseable output; the retry is priced. The Run's cost is NULL, not the
+    # partial 0.0001, and the harness reports it as unknown.
     client = UsageClient(["not json", reply(1)], usages=[None, Usage(100, 20)])
     result = evaluate(imported, root, tmp_path, [client], [1])
 
-    assert imported.execute("SELECT cost_usd, unknown_usage_calls FROM runs").fetchone()[:] == (0.0001, 1)
+    assert imported.execute("SELECT cost_usd, unknown_usage_calls FROM runs").fetchone()[:] == (None, 1)
     assert result.scores["cost"]["total_usd"] is None
     assert result.scores["pages"][0]["cost_usd"] is None
     assert result.scores["cost"]["unknown_usage_calls"] == 1
@@ -314,6 +352,40 @@ def test_score_corpus_refuses_mismatched_lists():
 
 def test_git_state_is_unknown_outside_a_repository(tmp_path):
     assert git_state(tmp_path) == {"commit": None, "dirty": None}
+
+
+def git(repo, *args):
+    done = subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", *args],
+        cwd=repo, capture_output=True, text=True, check=True)
+    return done.stdout.strip()
+
+
+def test_git_state_is_clean_then_dirty_in_a_temporary_repository(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    (repo / "tracked.txt").write_text("one\n")
+    git(repo, "add", "tracked.txt")
+    git(repo, "commit", "-q", "-m", "first")
+
+    assert git_state(repo) == {"commit": git(repo, "rev-parse", "HEAD"), "dirty": False}
+
+    (repo / "untracked.txt").write_text("new\n")
+    assert git_state(repo)["dirty"] is True  # an untracked file counts
+
+    (repo / "untracked.txt").unlink()
+    assert git_state(repo)["dirty"] is False
+
+    (repo / "tracked.txt").write_text("two\n")
+    assert git_state(repo)["dirty"] is True  # so does an uncommitted change
+
+
+def test_run_cost_distrusts_a_stored_partial_sum():
+    # Runs written before the Meter fix can hold a partial sum next to unknown_usage_calls > 0.
+    assert metrics.run_cost(0.0001, 1) is None
+    assert metrics.run_cost(None, 0) is None
+    assert metrics.run_cost(0.0001, 0) == 0.0001
 
 
 def run_cli(tmp_path, *args):

@@ -75,11 +75,13 @@ class Meter:
     def summary(self) -> dict:
         known = [r for r in self.records if r.usage is not None]
         costs = [r.cost_usd for r in known if r.cost_usd is not None]
+        # None when there are no calls, a call has no usage, or a call with usage has no price:
+        # a partial sum would understate spend
+        complete = bool(self.records) and len(known) == len(self.records) and len(costs) == len(known)
         return {
             "calls": len(self.records),
             "unknown_usage_calls": len(self.records) - len(known),
             "input_tokens": sum(r.usage.input_tokens for r in known),
             "output_tokens": sum(r.usage.output_tokens for r in known),
-            # None when any known call has no price: a partial sum would understate spend
-            "cost_usd": round(sum(costs), 6) if known and len(costs) == len(known) else None,
+            "cost_usd": round(sum(costs), 6) if complete else None,
         }

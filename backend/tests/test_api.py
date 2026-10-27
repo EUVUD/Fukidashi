@@ -75,3 +75,28 @@ def test_page_without_segments_is_not_sent_to_the_model(api):
 
     assert resp.status_code == 422
     assert fake.requests == []
+
+
+def test_a_region_id_that_is_not_on_the_page_is_retried_then_answers_502(api):
+    client, use_replies = api
+    bad = json.dumps({"translations": [{"id": i, "zh": "字"} for i in (0, 1, 7)]})
+    fake = use_replies(bad, bad)
+
+    resp = client.post("/api/pages/book_a/1/translate")
+
+    assert resp.status_code == 502
+    assert "Could not parse" in resp.json()["detail"] and "7" in resp.json()["detail"]
+    assert len(fake.requests) == 2
+    assert client.get("/api/pages/book_a/1").json()["run"] is None  # nothing succeeded, nothing stored
+
+
+def test_a_duplicate_region_id_is_retried_and_a_good_retry_succeeds(api):
+    client, use_replies = api
+    duplicate = json.dumps({"translations": [{"id": i, "zh": "字"} for i in (0, 1, 1)]})
+    fake = use_replies(duplicate, GOOD)
+
+    resp = client.post("/api/pages/book_a/1/translate")
+
+    assert resp.status_code == 200
+    assert len(fake.requests) == 2
+    assert [s["text_zh_hans"] for s in resp.json()["segments"]] == ["你好", "再见"]

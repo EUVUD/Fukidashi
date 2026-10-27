@@ -51,10 +51,23 @@ def parse_translations(text: str, ids: list[int]) -> dict[int, str]:
     if start == -1 or end == -1:
         raise ValueError("no JSON object in the response")
     data = json.loads(text[start : end + 1])
-    got = {int(t["id"]): str(t["zh"]) for t in data["translations"]}
-    missing = sorted(set(ids) - set(got))
-    if missing:
-        raise ValueError(f"missing region ids {missing}")
+    got: dict[int, str] = {}
+    duplicates: set[int] = set()
+    for t in data["translations"]:
+        region = int(t["id"])
+        if region in got:
+            duplicates.add(region)
+        got[region] = str(t["zh"])
+    # the ids must be exactly the page's, each once: an unknown id has no segment to land on
+    problems = []
+    if missing := sorted(set(ids) - set(got)):
+        problems.append(f"missing region ids {missing}")
+    if unknown := sorted(set(got) - set(ids)):
+        problems.append(f"region ids not on the page {unknown}")
+    if duplicates:
+        problems.append(f"duplicate region ids {sorted(duplicates)}")
+    if problems:
+        raise ValueError("; ".join(problems))
     return got
 
 
