@@ -54,14 +54,15 @@ def run_cost(cost_usd: float | None, unknown_usage_calls: int) -> float | None:
 def cost_summary(runs: Sequence[tuple[float | None, int]]) -> dict:
     """Total and per-page cost over Runs given as (cost_usd, unknown_usage_calls).
 
-    The total is None when any Run's cost is unknown, never a partial sum.
+    The total is None when any Run's cost is unknown, never a partial sum. No Runs cost 0.0 and have no
+    per-page cost.
     """
     costs = [run_cost(cost, unknown) for cost, unknown in runs]
     unknown_cost_runs = sum(c is None for c in costs)
-    total = None if unknown_cost_runs or not costs else round(sum(costs), 6)
+    total = None if unknown_cost_runs else round(sum(costs, 0.0), 6)
     return {
         "total_usd": total,
-        "per_page_usd": None if total is None else round(total / len(costs), 6),
+        "per_page_usd": None if total is None or not costs else round(total / len(costs), 6),
         "unknown_cost_runs": unknown_cost_runs,
         "unknown_usage_calls": sum(unknown for _, unknown in runs),
     }

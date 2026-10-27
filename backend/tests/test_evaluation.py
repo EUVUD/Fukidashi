@@ -11,7 +11,7 @@ import pytest
 from conftest import CrashAfterCallClient, FakeClient, UsageClient
 from sacrebleu.metrics import BLEU, CHRF
 
-from fukidashi import config
+from fukidashi import config, store
 from fukidashi.datasets.importer import import_openmantra
 from fukidashi.evaluation import harness, metrics
 from fukidashi.evaluation.manifest import git_state
@@ -130,7 +130,7 @@ def test_scores_equal_sacrebleu_on_the_same_lists(imported, root, tmp_path):
     assert (scores["chrf"]["score"], scores["chrf"]["signature"]) == (chrf, chrf_signature)
     assert (scores["bleu"]["score"], scores["bleu"]["signature"]) == (bleu, bleu_signature)
     assert (scores["pages_scored"], scores["segments_scored"]) == (2, 3)
-    no_failed_runs = {"total_usd": None, "per_page_usd": None, "unknown_cost_runs": 0, "unknown_usage_calls": 0}
+    no_failed_runs = {"total_usd": 0.0, "per_page_usd": None, "unknown_cost_runs": 0, "unknown_usage_calls": 0}
     assert scores["cost"] == {"total_usd": 0.0002, "per_page_usd": 0.0001, "unknown_cost_runs": 0,
                               "unknown_usage_calls": 0, "failed_runs": no_failed_runs}
     assert scores["latency"]["n"] == 2 and scores["latency"]["p50_s"] <= scores["latency"]["p95_s"]
@@ -223,16 +223,46 @@ def test_failed_runs_cost_is_null_when_any_failed_run_has_unknown_cost(imported,
     assert [p["cost_usd"] for p in result.scores["failed_pages"]] == [0.0002, None]
     assert result.scores["cost"]["failed_runs"] == {"total_usd": None, "per_page_usd": None,
                                                     "unknown_cost_runs": 1, "unknown_usage_calls": 1}  # not 0.0002
-    assert result.scores["cost"]["total_usd"] is None and result.scores["pages_scored"] == 0
+    assert result.scores["cost"]["total_usd"] == 0.0 and result.scores["pages_scored"] == 0  # no scored Runs
 
 
-def test_a_run_that_crashed_before_any_call_has_unknown_cost(imported, root, tmp_path):
+def test_a_run_that_crashed_before_any_call_cost_nothing(imported, root, tmp_path):
     result = evaluate(imported, root, tmp_path, [ExplodingClient([])], [1])
 
     entry = result.scores["failed_pages"][0]
-    assert entry["run_id"] is not None and entry["cost_usd"] is None  # no call recorded: no cost to trust
-    assert result.scores["cost"]["failed_runs"] == {"total_usd": None, "per_page_usd": None,
-                                                    "unknown_cost_runs": 1, "unknown_usage_calls": 0}
+    assert entry["run_id"] is not None and entry["cost_usd"] == 0.0  # no call was made, so nothing was spent
+    assert result.scores["cost"]["failed_runs"] == {"total_usd": 0.0, "per_page_usd": 0.0,
+                                                    "unknown_cost_runs": 0, "unknown_usage_calls": 0}
+
+
+def test_a_clean_eval_reports_zero_failed_run_cost_in_scores_json(imported, root, tmp_path):
+    result = evaluate(imported, root, tmp_path, [FakeClient([reply(1)])], [1])
+
+    assert result.failed_pages == []
+    on_disk = json.loads((result.out_dir / "scores.json").read_text(encoding="utf-8"))
+    failed_cost = on_disk["cost"]["failed_runs"]
+    assert failed_cost["total_usd"] == 0.0 and isinstance(failed_cost["total_usd"], float)  # not null, not 0
+    assert failed_cost["per_page_usd"] is None  # there is no failed page to average over
+
+
+def test_a_run_that_cannot_be_marked_failed_is_listed_with_its_run_id(imported, root, tmp_path, monkeypatch):
+    def broken_finish_run(*args, **kwargs):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(store, "finish_run", broken_finish_run)
+    result = evaluate(imported, root, tmp_path, [FakeClient([reply(1)]), FakeClient([reply(3)])], [1, 3])
+
+    stuck = imported.execute("SELECT id, status FROM runs ORDER BY id").fetchall()
+    assert [r["status"] for r in stuck] == ["running", "running"]  # nothing could be written
+    assert [(p["page_index"], p["run_id"]) for p in result.scores["failed_pages"]] == [(1, stuck[0]["id"]),
+                                                                                       (3, stuck[1]["id"])]
+    assert all("marking the Run failed also failed" in p["error"] for p in result.scores["failed_pages"])
+    assert [p["cost_usd"] for p in result.scores["failed_pages"]] == [None, None]  # the spend was never stored
+    assert result.scores["cost"]["failed_runs"]["unknown_cost_runs"] == 2
+    assert result.scores["cost"]["failed_runs"]["total_usd"] is None
+    assert [(p["status"], p["run_id"]) for p in result.manifest["pages"]] == [("failed", stuck[0]["id"]),
+                                                                              ("failed", stuck[1]["id"])]
+    assert result.exit_code == 1
 
 
 def test_an_unknown_page_or_missing_image_stops_before_any_model_call(imported, root, tmp_path):
@@ -326,8 +356,46 @@ def test_nothing_scored_gives_null_scores_not_a_crash(imported, root, tmp_path):
     assert result.scores["chrf"] == {"score": None, "signature": None}
     assert result.scores["bleu"] == {"score": None, "signature": None}
     assert result.manifest["sacrebleu_signatures"] == {"chrf": None, "bleu": None}
-    assert result.scores["cost"]["total_usd"] is None
+    assert result.scores["cost"]["total_usd"] == 0.0  # no scored Runs; the failed one is under failed_runs
     assert "n/a" in harness.format_summary(result)
+
+
+def test_summary_prints_the_cost_of_the_failed_runs(imported, root, tmp_path):
+    result = evaluate(imported, root, tmp_path, [FakeClient(["x", "y"]), FakeClient([reply(3)])], [1, 3])
+
+    text = harness.format_summary(result)
+    run_id = result.scores["failed_pages"][0]["run_id"]
+    assert f"FAILED  book_e/1 (run {run_id}):" in text
+    assert "failed runs cost  total $0.000200 (unknown-cost runs 0, unknown_usage_calls 0)" in text
+    assert "cost  total $0.000100, $0.000100 per page" in text  # the scored cost line is unchanged
+
+
+def test_summary_says_unknown_when_a_failed_run_has_unknown_cost(imported, root, tmp_path):
+    unknown = UsageClient(["x", "y"], usages=[None, Usage(100, 20)])
+    result = evaluate(imported, root, tmp_path, [unknown], [1])
+
+    assert "failed runs cost  total $n/a (unknown-cost runs 1, unknown_usage_calls 1)" in harness.format_summary(result)
+
+
+def test_summary_says_no_run_for_a_page_that_failed_before_a_run_existed(imported, root, tmp_path):
+    def broken_client():
+        raise RuntimeError("cannot build the client")
+
+    result = harness.run_eval(imported, config="baseline", book="book_e", page_indexes=[1], make_client=broken_client,
+                              dataset_root=root, out_root=tmp_path / "out", repo_root=config.ROOT)
+
+    assert result.scores["failed_pages"][0]["run_id"] is None
+    text = harness.format_summary(result)
+    assert "FAILED  book_e/1 (no Run): RuntimeError: cannot build the client" in text
+    assert "run None" not in text
+    assert "failed runs cost  total $0.000000 (unknown-cost runs 0, unknown_usage_calls 0)" in text  # no Run, no spend
+
+
+def test_summary_has_no_failed_cost_line_when_every_page_was_scored(imported, root, tmp_path):
+    result = evaluate(imported, root, tmp_path, [FakeClient([reply(1)])], [1])
+
+    text = harness.format_summary(result)
+    assert "FAILED" not in text and "failed runs cost" not in text
 
 
 def test_t2s_converts_characters_and_keeps_the_wording():
@@ -386,6 +454,15 @@ def test_run_cost_distrusts_a_stored_partial_sum():
     assert metrics.run_cost(0.0001, 1) is None
     assert metrics.run_cost(None, 0) is None
     assert metrics.run_cost(0.0001, 0) == 0.0001
+
+
+def test_cost_summary_over_no_runs_costs_nothing_but_an_unknown_run_still_makes_it_unknown():
+    no_runs = metrics.cost_summary([])
+    assert no_runs == {"total_usd": 0.0, "per_page_usd": None, "unknown_cost_runs": 0, "unknown_usage_calls": 0}
+    assert isinstance(no_runs["total_usd"], float)
+    assert metrics.cost_summary([(0.0, 0)])["per_page_usd"] == 0.0  # a Run that made no call cost 0.0
+    for runs in ([(0.0001, 0), (None, 0)], [(0.0001, 1)], [(None, 0)]):
+        assert metrics.cost_summary(runs)["total_usd"] is None
 
 
 def run_cli(tmp_path, *args):
