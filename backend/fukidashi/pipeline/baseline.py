@@ -99,6 +99,9 @@ def run_baseline(
             result.error = f"Stopped: {e}"
             return result
         except ProviderError as e:
+            # a failed request is an attempt too: the Run keeps one per call, as the Meter does
+            result.attempts.append({"attempt": attempt, "error": e.description,
+                                    "record": asdict(e.record) if e.record is not None else None})
             result.error = e.description
             return result
         result.attempts.append({"attempt": attempt, "finish_reason": reply.finish_reason, "raw": reply.text,

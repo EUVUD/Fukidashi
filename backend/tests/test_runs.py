@@ -31,6 +31,11 @@ def translate(conn, dataset, client, page_index=1):
     return runs.translate_page(conn, "book_a", page_index, make_client=lambda: client, dataset_root=dataset)
 
 
+def translate_with_budget(conn, dataset, client, *, page_budget):
+    return runs.translate_page(conn, "book_a", 1, make_client=lambda: client, dataset_root=dataset,
+                               page_budget=page_budget)
+
+
 def test_translate_page_records_a_run_without_http(imported, dataset):
     outcome = translate(imported, dataset, FakeClient([GOOD]))
 
@@ -255,3 +260,103 @@ def test_run_crashed_still_carries_the_run_id_when_the_recovery_write_fails_too(
     assert f"write {len(writes)} failed" in message  # the recovery write's own error
     assert crashed.value.error == message
     assert not isinstance(crashed.value, runs.TranslateError)
+
+
+def html_page(request):
+    return httpx.Response(200, text="<html>gateway</html>", headers={"content-type": "text/html"})
+
+
+def not_json(request):
+    return httpx.Response(200, content=b"{nope", headers={"content-type": "application/json"})
+
+
+def null_message(request):
+    body = json.loads(completion("ok").content)
+    body["choices"][0]["message"] = None
+    return httpx.Response(200, json=body)
+
+
+@pytest.mark.parametrize("handler, mentions", [(html_page, "LLM_BASE_URL"), (not_json, "not valid JSON")],
+                         ids=["html-body", "invalid-json-body"])
+def test_a_body_that_is_not_a_completion_is_a_failed_run_with_unknown_cost(imported, dataset, handler, mentions):
+    outcome = translate(imported, dataset, mock_llm_client(handler))  # returns: no RunCrashed
+
+    assert not outcome.result.ok
+    run = store.get_run(imported, outcome.run_id)
+    assert (run["status"], run["calls"], run["unknown_usage_calls"], run["cost_usd"]) == ("failed", 1, 1, None)
+    assert (run["input_tokens"], run["output_tokens"]) == (None, None)
+    assert mentions in run["error"] and run["error"] == outcome.result.error
+    assert imported.execute("SELECT COUNT(*) FROM translations").fetchone()[0] == 0
+
+
+def test_a_first_choice_that_cannot_be_read_is_a_failed_run_that_keeps_its_usage(imported, dataset):
+    outcome = translate(imported, dataset, mock_llm_client(null_message))
+
+    assert not outcome.result.ok
+    run = store.get_run(imported, outcome.run_id)
+    assert (run["status"], run["calls"], run["unknown_usage_calls"]) == ("failed", 1, 0)
+    assert (run["input_tokens"], run["output_tokens"]) == (100, 20)
+    assert run["cost_usd"] == pytest.approx(0.00014)
+    assert "cannot be read" in run["error"]
+
+
+def test_a_failed_request_is_an_attempt_on_the_run(imported, dataset):
+    outcome = translate(imported, dataset, mock_llm_client(upstream_500))
+
+    run = store.get_run(imported, outcome.run_id)
+    (attempt,) = json.loads(run["attempts_json"])
+    assert attempt["attempt"] == 1 and attempt["error"] == run["error"]
+    assert attempt["record"]["usage"] is None and attempt["record"]["error"] == run["error"]
+    assert "raw" not in attempt and "finish_reason" not in attempt  # nothing came back
+    assert len(json.loads(run["attempts_json"])) == run["calls"]
+
+
+def test_a_failed_request_after_an_empty_reply_is_the_second_attempt(imported, dataset):
+    replies = iter([completion(""), upstream_500(None)])
+
+    outcome = translate(imported, dataset, mock_llm_client(lambda request: next(replies)))
+
+    run = store.get_run(imported, outcome.run_id)
+    first, second = json.loads(run["attempts_json"])
+    assert len(json.loads(run["attempts_json"])) == run["calls"] == 2
+    assert (first["attempt"], first["raw"], first["finish_reason"]) == (1, "", "stop")  # as before
+    assert "no JSON object" in first["parse_error"] and "error" not in first
+    assert first["record"]["usage"]["input_tokens"] == 100
+    assert second["attempt"] == 2 and second["error"] == run["error"] and "API error 500" in second["error"]
+    assert second["record"]["usage"] is None
+
+
+def test_a_response_that_could_not_be_read_keeps_its_usage_in_the_attempt(imported, dataset):
+    outcome = translate(imported, dataset, mock_llm_client(lambda request: completion(choices=False)))
+
+    run = store.get_run(imported, outcome.run_id)
+    (attempt,) = json.loads(run["attempts_json"])
+    assert attempt["error"] == run["error"] and "returned no choices" in attempt["error"]
+    assert attempt["record"]["usage"] == {"input_tokens": 100, "output_tokens": 20, "cached_input_tokens": None}
+
+
+def test_attempts_of_a_run_that_returned_have_no_error_key(imported, dataset):
+    ok = translate(imported, dataset, mock_llm_client(lambda request: completion(GOOD)))
+    parse_failure = translate(imported, dataset, mock_llm_client(lambda request: completion("not json")))
+
+    assert ok.result.ok and not parse_failure.result.ok
+    for outcome in (ok, parse_failure):
+        for attempt in json.loads(store.get_run(imported, outcome.run_id)["attempts_json"]):
+            assert "error" not in attempt and attempt["raw"] is not None
+            assert set(attempt) - {"parse_error"} == {"attempt", "finish_reason", "raw", "record"}
+
+
+def test_a_budget_stop_adds_no_attempt(imported, dataset):
+    sent = []
+
+    def handler(request):
+        sent.append(request)
+        return completion("")  # 120 tokens: over the 100-token page budget; the retry must not be sent
+
+    outcome = translate_with_budget(imported, dataset, mock_llm_client(handler), page_budget=100)
+
+    run = store.get_run(imported, outcome.run_id)
+    assert (run["status"], run["calls"], len(sent)) == ("failed", 1, 1)
+    assert run["error"].startswith("Stopped:")
+    (attempt,) = json.loads(run["attempts_json"])  # the one call that returned, nothing for the one not sent
+    assert attempt["attempt"] == 1 and "parse_error" in attempt and "error" not in attempt

@@ -30,6 +30,18 @@ from fukidashi.pipeline.baseline import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def cost_line(summary: dict, config: LLMConfig) -> str:
+    """`summary` is `Meter.summary()`. The cost is None for two reasons that can both apply: say which."""
+    if summary["cost_usd"] is not None:
+        return f"Cost: ${summary['cost_usd']:.4f}"
+    reasons = []
+    if n := summary["unknown_usage_calls"]:
+        reasons.append(f"unknown ({n} call{'s' if n != 1 else ''} returned no usage)")
+    if config.price_input_per_m is None or config.price_output_per_m is None:
+        reasons.append("not computed (set LLM_PRICE_INPUT_PER_M / LLM_PRICE_OUTPUT_PER_M in .env)")
+    return "Cost: " + ("; ".join(reasons) or "unknown")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="M0 first real call on one OpenMantra page.")
     ap.add_argument("--book", default="tojime_no_siora", help="book_title slug")
@@ -92,8 +104,7 @@ def main() -> None:
     print(f"Model (as returned by the API): {', '.join(out['response_models'])}")
     print(f"Calls: {m['calls']}  input tokens: {m['input_tokens']}  output tokens: {m['output_tokens']}"
           f"  unknown-usage calls: {m['unknown_usage_calls']}")
-    print("Cost: " + (f"${m['cost_usd']:.4f}" if m["cost_usd"] is not None
-                      else "not computed (set LLM_PRICE_INPUT_PER_M / LLM_PRICE_OUTPUT_PER_M in .env)"))
+    print(cost_line(m, config))
     for seg in out["segments"]:
         print(f"\n[{seg['id']}] ja : {seg['ja']}\n    out: {seg['zh_hans_output']}\n    ref: {seg['zh_hant_reference']}")
     print(f"\nSaved {out_path.relative_to(ROOT)}")

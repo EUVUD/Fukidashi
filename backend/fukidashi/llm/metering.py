@@ -30,7 +30,9 @@ class CallRecord:
     usage: Usage | None  # None means the provider returned no usage: unknown, not zero
     latency_s: float
     cost_usd: float | None
-    error: str | None = None  # set when the request raised: it was sent, so its cost is unknown
+    # set when the call failed: the request raised (it was sent, so its cost is unknown) or the response could
+    # not be read (usage is still the response's own, if it had one)
+    error: str | None = None
 
 
 class BudgetExceeded(RuntimeError):
