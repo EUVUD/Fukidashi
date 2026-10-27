@@ -1,8 +1,20 @@
-"""Readable messages for provider errors, shared by the CLI scripts and the API."""
+"""Provider errors: `ProviderError` is what leaves `llm/`; `describe_api_error` words it (CLI scripts and API)."""
 
 from __future__ import annotations
 
 import openai
+
+
+class ProviderError(RuntimeError):
+    """A provider request failed. The call is already in the Meter, with unknown usage.
+
+    `description` is readable and never contains the API key; `status_code` is None when there was no HTTP response.
+    """
+
+    def __init__(self, description: str, status_code: int | None = None):
+        super().__init__(description)
+        self.description = description
+        self.status_code = status_code
 
 
 def describe_api_error(e: openai.OpenAIError, base_url: str | None = None) -> str:

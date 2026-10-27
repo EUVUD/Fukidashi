@@ -10,11 +10,9 @@ import base64
 import json
 from dataclasses import asdict, dataclass, field
 
-import openai
-
 from ..datasets.openmantra import Page
 from ..llm.client import LLMClient
-from ..llm.errors import describe_api_error
+from ..llm.errors import ProviderError
 from ..llm.metering import BudgetExceeded, PageBudget
 
 CONFIG_NAME = "baseline"
@@ -100,8 +98,8 @@ def run_baseline(
         except BudgetExceeded as e:
             result.error = f"Stopped: {e}"
             return result
-        except openai.OpenAIError as e:
-            result.error = describe_api_error(e, client.config.base_url)
+        except ProviderError as e:
+            result.error = e.description
             return result
         result.attempts.append({"attempt": attempt, "finish_reason": reply.finish_reason, "raw": reply.text,
                                 "record": asdict(reply.record)})

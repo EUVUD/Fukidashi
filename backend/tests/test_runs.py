@@ -2,8 +2,9 @@
 
 import json
 
+import httpx
 import pytest
-from conftest import CrashAfterCallClient, FakeClient, UsageClient
+from conftest import CrashAfterCallClient, FakeClient, UsageClient, completion, mock_llm_client
 
 from fukidashi import runs, store
 from fukidashi.datasets.importer import import_openmantra
@@ -147,6 +148,52 @@ def test_a_crash_after_a_priced_call_keeps_the_spend_on_the_failed_run(imported,
 
     run = store.get_run(imported, crashed.value.run_id)
     assert (run["status"], run["calls"], run["cost_usd"]) == ("failed", 1, 0.0001)
+
+
+def upstream_500(request):
+    return httpx.Response(500, json={"error": {"message": "upstream exploded"}})
+
+
+def test_a_provider_error_is_a_failed_run_with_unknown_cost(imported, dataset):
+    sent = []
+
+    def handler(request):
+        sent.append(request)
+        return upstream_500(request)
+
+    outcome = translate(imported, dataset, mock_llm_client(handler))  # the real LLMClient on a mock provider
+
+    assert not outcome.result.ok
+    run = store.get_run(imported, outcome.run_id)
+    assert (run["status"], run["calls"], run["unknown_usage_calls"], run["cost_usd"]) == ("failed", 1, 1, None)
+    assert (run["input_tokens"], run["output_tokens"]) == (None, None)  # unknown, not 0
+    assert "API error 500" in run["error"] and "upstream exploded" in run["error"]
+    assert run["error"] == outcome.result.error
+    assert len(sent) == 1  # the SDK did not resend it
+    assert imported.execute("SELECT COUNT(*) FROM translations").fetchone()[0] == 0
+
+
+def test_a_failed_request_after_a_priced_call_makes_the_whole_cost_unknown(imported, dataset):
+    replies = iter([completion(""), upstream_500(None)])  # empty content is retried; the retry fails at the provider
+
+    outcome = translate(imported, dataset, mock_llm_client(lambda request: next(replies)))
+
+    run = store.get_run(imported, outcome.run_id)
+    assert (run["status"], run["calls"], run["unknown_usage_calls"]) == ("failed", 2, 1)
+    assert run["cost_usd"] is None  # not the partial 0.00014
+    assert (run["input_tokens"], run["output_tokens"]) == (100, 20)  # the known call's tokens stay
+    assert "API error 500" in run["error"]
+
+
+def test_a_response_without_choices_is_a_failed_run_not_a_crash(imported, dataset):
+    outcome = translate(imported, dataset, mock_llm_client(lambda request: completion(choices=False)))
+
+    assert not outcome.result.ok  # translate_page returned: no RunCrashed
+    run = store.get_run(imported, outcome.run_id)
+    assert (run["status"], run["calls"], run["unknown_usage_calls"]) == ("failed", 1, 0)
+    assert (run["input_tokens"], run["output_tokens"]) == (100, 20)  # the call was recorded with its real usage
+    assert run["cost_usd"] == pytest.approx(0.00014)
+    assert "mock-model returned no choices" in run["error"]
 
 
 def test_a_region_id_the_parser_let_through_cannot_leave_the_run_running(imported, dataset, monkeypatch):

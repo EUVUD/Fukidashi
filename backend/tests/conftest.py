@@ -5,13 +5,14 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from fukidashi.api.deps import get_client_factory, get_dataset_root, get_db
 from fukidashi.datasets.importer import import_openmantra
 from fukidashi.db import connect, init_db
-from fukidashi.llm.client import LLMConfig, LLMResult
+from fukidashi.llm.client import LLMClient, LLMConfig, LLMResult
 from fukidashi.llm.metering import CallRecord, Meter, Usage
 from fukidashi.main import app
 
@@ -88,6 +89,29 @@ class CrashAfterCallClient(FakeClient):
     def chat(self, messages, **kwargs):
         super().chat(messages, **kwargs)
         raise RuntimeError("crashed after the call")
+
+
+def completion(text: str = "ok", *, choices: bool = True, usage: bool = True) -> httpx.Response:
+    """A chat.completion reply as an OpenAI-compatible provider sends it: 100 input and 20 output tokens."""
+    body: dict = {
+        "id": "cmpl-1", "object": "chat.completion", "created": 0, "model": "mock-model-1",
+        "choices": ([{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": text}}]
+                    if choices else []),
+    }
+    if usage:
+        body["usage"] = {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}
+    return httpx.Response(200, json=body)
+
+
+def mock_llm_client(handler, *, meter: Meter | None = None, api_key: str = "test-key") -> LLMClient:
+    """The real LLMClient (and the real openai SDK) talking to `handler` through httpx.MockTransport: no network.
+
+    Priced at $1 / $2 per million tokens, so `completion()` costs $0.00014.
+    """
+    config = LLMConfig("http://provider.test/v1", api_key, "mock-model",
+                       price_input_per_m=1.0, price_output_per_m=2.0)
+    return LLMClient(config, meter if meter is not None else Meter(),
+                     http_client=httpx.Client(transport=httpx.MockTransport(handler)))
 
 
 @pytest.fixture

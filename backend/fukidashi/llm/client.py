@@ -5,11 +5,16 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import openai
 from openai.types import CompletionUsage
 
+from .errors import ProviderError, describe_api_error
 from .metering import CallRecord, Meter, PageBudget, Usage
+
+if TYPE_CHECKING:
+    import httpx
 
 
 class LLMNotConfigured(RuntimeError):
@@ -55,10 +60,14 @@ class LLMResult:
 
 
 class LLMClient:
-    def __init__(self, config: LLMConfig, meter: Meter):
+    def __init__(self, config: LLMConfig, meter: Meter, *, http_client: httpx.Client | None = None):
         self.config = config
         self.meter = meter
-        self._client = openai.OpenAI(base_url=config.base_url, api_key=config.api_key)
+        # max_retries=0: the SDK would resend a failed request up to twice, and the earlier attempts, which may
+        # have been billed, would never reach the Meter. Every request sent is one call the Meter sees.
+        self._client = openai.OpenAI(
+            base_url=config.base_url, api_key=config.api_key, max_retries=0, http_client=http_client
+        )
 
     def chat(
         self,
@@ -78,7 +87,27 @@ class LLMClient:
             kwargs["response_format"] = {"type": "json_object"}
 
         start = time.monotonic()
-        resp = self._client.chat.completions.create(**kwargs)
+        try:
+            resp = self._client.chat.completions.create(**kwargs)
+        except Exception as e:
+            # The request may have reached the provider and been billed (a timeout, a 5xx): unknown, not zero.
+            is_provider_error = isinstance(e, openai.OpenAIError)
+            description = self._redact(describe_api_error(e, self.config.base_url) if is_provider_error
+                                       else f"{type(e).__name__}: {e}")
+            rec = CallRecord(
+                page_id=budget.page_id,
+                requested_model=self.config.model,
+                response_model=None,
+                usage=None,
+                latency_s=round(time.monotonic() - start, 3),
+                cost_usd=None,
+                error=description,
+            )
+            self.meter.record(rec)
+            budget.charge(None)
+            if not is_provider_error:
+                raise
+            raise ProviderError(description, getattr(e, "status_code", None)) from e
         latency = time.monotonic() - start
 
         usage = usage_from_api(resp.usage)
@@ -94,9 +123,14 @@ class LLMClient:
         budget.charge(usage)
 
         if not resp.choices:
-            raise RuntimeError(f"{self.config.model} returned no choices")
+            raise ProviderError(f"{self.config.model} returned no choices")  # already recorded, with its usage
         choice = resp.choices[0]
         return LLMResult(text=choice.message.content or "", finish_reason=choice.finish_reason, record=rec)
+
+    def _redact(self, text: str) -> str:
+        # A provider may echo the key back in an error body; neither the ledger nor a Run may keep it.
+        key = self.config.api_key
+        return text.replace(key, "***") if key else text
 
     def _cost(self, usage: Usage | None) -> float | None:
         c = self.config

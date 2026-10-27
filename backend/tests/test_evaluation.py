@@ -7,8 +7,9 @@ import json
 import subprocess
 import sys
 
+import httpx
 import pytest
-from conftest import CrashAfterCallClient, FakeClient, UsageClient
+from conftest import CrashAfterCallClient, FakeClient, UsageClient, mock_llm_client
 from sacrebleu.metrics import BLEU, CHRF
 
 from fukidashi import config, store
@@ -230,9 +231,26 @@ def test_a_run_that_crashed_before_any_call_cost_nothing(imported, root, tmp_pat
     result = evaluate(imported, root, tmp_path, [ExplodingClient([])], [1])
 
     entry = result.scores["failed_pages"][0]
-    assert entry["run_id"] is not None and entry["cost_usd"] == 0.0  # no call was made, so nothing was spent
+    assert entry["run_id"] is not None and entry["cost_usd"] == 0.0  # the fake client crashes before any request is sent
     assert result.scores["cost"]["failed_runs"] == {"total_usd": 0.0, "per_page_usd": 0.0,
                                                     "unknown_cost_runs": 0, "unknown_usage_calls": 0}
+
+
+def test_a_provider_error_makes_the_page_cost_unknown_not_zero(imported, root, tmp_path):
+    def upstream_500(request):
+        return httpx.Response(500, json={"error": {"message": "upstream exploded"}})
+
+    result = evaluate(imported, root, tmp_path, [mock_llm_client(upstream_500), FakeClient([reply(3)])], [1, 3])
+
+    (entry,) = result.scores["failed_pages"]
+    run = imported.execute("SELECT id, status, calls, unknown_usage_calls, cost_usd FROM runs ORDER BY id").fetchall()[0]
+    assert (entry["page_index"], entry["run_id"], entry["cost_usd"]) == (1, run["id"], None)  # not 0.0
+    assert entry["error"].startswith("API error 500")  # a failed Run, not a crash ("ProviderError: ...")
+    assert tuple(run)[1:] == ("failed", 1, 1, None)
+    assert result.scores["cost"]["failed_runs"] == {"total_usd": None, "per_page_usd": None,
+                                                    "unknown_cost_runs": 1, "unknown_usage_calls": 1}
+    assert result.scores["cost"]["total_usd"] == 0.0001  # page 3 alone
+    assert result.exit_code == 1
 
 
 def test_a_clean_eval_reports_zero_failed_run_cost_in_scores_json(imported, root, tmp_path):
