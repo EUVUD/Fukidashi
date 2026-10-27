@@ -4,13 +4,14 @@ English | [简体中文](README.zh-CN.md)
 
 A multi-agent manga translation editor (Japanese → Simplified Chinese), evaluated on the [OpenMantra](https://github.com/mantra-inc/open-mantra-dataset) dataset against a single-call baseline with a standard MT evaluation framework.
 
-> **Status (2026-10-27):** M0 and M1 are done. The vertical slice works end to end: import OpenMantra, translate a page with one model call, and check every line against its box in the browser. M2 is in progress: an eval harness scores `baseline` with chrF / BLEU, and a tool-calling agent loop runs on our metered client. The Translator Agent, the Knowledge Base, the Reviewer and tracing do not exist yet.
+> **Status (2026-10-27):** M0 and M1 are done. The vertical slice works end to end: import OpenMantra, translate a page with one model call, and check every line against its box in the browser. M2 is in progress: an eval harness scores configs with chrF / BLEU, and a first Translator Agent runs as the `translator` config on a tool-calling loop over our metered client. The Knowledge Base, the Reviewer and tracing do not exist yet.
 
 ## What it does
 
 - **Translate a page in context.** The model sees the whole page image together with the Japanese text and box of every speech bubble, and returns a Simplified Chinese line for each box.
 - **Check it where it belongs.** The editor draws each box on the page and lists source, translation and reference side by side.
-- **Planned (M2–M3):** a Translator Agent that looks up a Glossary and Character Profiles through tools, a Reviewer Agent that checks the result in an independent context, and a Curator Agent that is the only writer of the per-book Knowledge Base.
+- **A first Translator Agent (M2).** The `translator` config gives the model the same page plus a tool that reads the earlier pages; a bad answer is repaired once, and otherwise the page falls back to `baseline`, visibly.
+- **Planned (M3):** tools for a Glossary and Character Profiles, a Reviewer Agent that checks the result in an independent context, and a Curator Agent that is the only writer of the per-book Knowledge Base.
 
 ## How it is evaluated
 
@@ -48,10 +49,11 @@ npm run dev --prefix frontend                   # http://localhost:5173/tojime_n
 Pick a page and click Translate: the backend runs `baseline` on that page (one call, no tools, no KB) and stores the Run and its zh-Hans translations in SQLite. Translate makes a real call to the model configured in `.env`. `FUKIDASHI_DB` overrides the DB path.
 
 ```bash
-uv run python eval/run.py --config baseline --book tojime_no_siora --pages 2,3,4   # real calls: one per page
+uv run python eval/run.py --config baseline --book tojime_no_siora --pages 2,3,4     # real calls: one per page
+uv run python eval/run.py --config translator --book tojime_no_siora --pages 2,3,4   # the Translator Agent: a few calls per page
 ```
 
-The eval harness translates those pages through the same code path as the editor (each page leaves a Run in SQLite), converts the zh-Hant reference translations to zh-Hans with OpenCC (`t2s`), and prints chrF and BLEU with their sacreBLEU signatures, plus cost per page and latency. The Manifest, per-Segment outputs and scores go to `runs/eval/<id>/`. The exit code is non-zero if a page failed or the harness could not start.
+The eval harness translates those pages through the same code path as the editor (each page leaves a Run in SQLite), converts the zh-Hant reference translations to zh-Hans with OpenCC (`t2s`), and prints chrF and BLEU with their sacreBLEU signatures, plus cost per page and latency; for `translator` it also counts the pages that fell back to `baseline`. The Manifest, per-Segment outputs and scores go to `runs/eval/<id>/`. The exit code is non-zero if a page failed or the harness could not start.
 
 ```bash
 uv run pytest                                       # no network, no real LLM calls

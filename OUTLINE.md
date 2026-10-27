@@ -1,6 +1,6 @@
 # Fukidashi — Project Outline
 
-> v0.12 · 2026-10-27
+> v0.13 · 2026-10-27
 > **v0.2 (2026-10-22):** evaluation changed from a research-style controlled experiment to a standard evaluation framework plus a baseline comparison (plan B); see §4.
 > **v0.3 (2026-10-22):** M0 decisions recorded in §8: name Fukidashi, ja → zh-Hans, an OpenAI-compatible provider, a $100 budget cap.
 > **v0.4 (2026-10-24):** M1 added the term Run (§0).
@@ -12,6 +12,7 @@
 > **v0.10 (2026-10-27):** §8 records that the provider SDK's automatic retries are off; §3.5 and §3.6 note that a failed request is metered as unknown and is not resent, as implemented in M2.
 > **v0.11 (2026-10-27):** §8 decides the agent loop: LangChain v1 `create_agent`, with `LLMClient` as its model through an adapter; §5 adds it to the tech stack.
 > **v0.12 (2026-10-27):** after M2's tool-calling loop: §0 adds Agent loop, Step and Stop reason; §3.4 records the guardrails as built and the smoke findings; §9 records that `deepseek-flash` can call tools.
+> **v0.13 (2026-10-27):** after the Translator Agent: §0 adds `translator`, Repair and Fallback; §3.2, §3.4 and §4.2 record the Translator Agent as built (`flag_uncertain` moves to M3); §8 decides the tracing tool (Arize Phoenix, local).
 > Convention: code, docs, commit messages and reports use the canonical terms in §0.
 
 ---
@@ -48,12 +49,15 @@ Use the English term in the left column everywhere, in code and in docs. The Chi
 | Stop reason | 停止原因 | Why an agent run ended: `final`, `step_limit`, `incomplete`, `budget` or `provider_error` |
 | Metering | 计量 | Written in-house; unknown usage is counted separately, never recorded as 0 |
 | Trace | 执行轨迹 | Recorded by the tracing tool since v0.2, no longer custom JSONL |
-| Tracing tool | tracing 工具 | Langfuse or Arize Phoenix, chosen in M2 |
+| Tracing tool | tracing 工具 | Arize Phoenix, run locally (§8) |
 | Manifest | 运行清单 | Data hash, model ID, config, seed, git commit |
 | Evaluation framework | 评测框架 | The standard metrics and tools listed in §4.4 |
 | Eval harness | 评测执行器 | `eval/run.py`: runs configs, scores them, writes the manifest |
 | Eval protocol | 评测规程 | One-page `eval/PROTOCOL.md`, written before the freeze; replaces the earlier `PREREG.md` |
 | Baseline (`baseline`) | 基线 | Formerly C0: one call per page, no tools, no KB |
+| Translator (`translator`) | 翻译 agent 配置 | M2's smoke config: the Translator Agent alone, no KB, no Reviewer; not a reported config (§4.2) |
+| Repair | 修复调用 | One extra call that sends the model its unparseable answer's error and asks for valid JSON (§3.4) |
+| Fallback | 回退到 baseline | When an agent run ends without a usable answer, the page is translated by `baseline` instead; the Run records it and the eval counts it (§3.4) |
 | Full system (`full`) | 完整系统 | Translator + Reviewer + Curator / KB |
 | KB ablation (`full_no_kb`) | KB 消融 | Identical to `full` except the KB is off |
 | Primary / Secondary metric | 主指标 / 次要指标 | Primary metrics are written into the eval protocol before the freeze |
@@ -159,7 +163,7 @@ Fukidashi is a product, so it is evaluated with general, objective metrics rathe
                                                           │   typesetter · PNG export             │
                                                           └───────────────────────────────────────┘
                      eval/run.py ──▶ the same Orchestrator (oracle path) ──▶ manifest + scores + trace IDs
-                     tracing ──▶ Langfuse or Arize Phoenix
+                     tracing ──▶ Arize Phoenix (local)
 ```
 
 ### 3.2 Agents, Tools, Permissions
@@ -170,6 +174,8 @@ Fukidashi is a product, so it is evaluated with general, objective metrics rathe
 | Reviewer Agent | **Independent context:** sees the source, the translation and the KB, not the Translator's reasoning | `lookup_term`, `lookup_character` (read-only) | Read |
 | Curator Agent | Proposal Queue + current KB | Merges or rejects proposals; sends names and conflicts to the Human Review Queue | **Sole agent writer** |
 | Human (editor user) | Editor UI | Approves or rejects proposals; renaming a term updates the whole book | Write (through the Curator's path) |
+
+**As built in M2:** the Translator Agent has one tool, `get_previous_context`: the Japanese text of up to 2 earlier pages and their latest `translator` translations, read before the run starts, never reference translations. `flag_uncertain` moves to M3, because a flag needs somewhere to be stored and someone to read it (the Reviewer in M3, the editor in M7). The KB tools arrive with the KB in M3.
 
 **Review loop:** the Reviewer sends a page back at most twice. This is fixed; since v0.2 it is not tuned for cost parity.
 
@@ -187,14 +193,14 @@ Fukidashi is a product, so it is evaluated with general, objective metrics rathe
 
 - Step limit; per-page token budget; duplicate tool call detection; tool errors are passed back to the agent as they are. **Built in M2** (`agents/loop.py`): the Step limit is `max_steps` model calls (default 6); a duplicate is the same tool with the same validated arguments; the model's mistakes (an unknown tool, arguments that fail the tool's pydantic model, a handler that raises) go back as the tool's result. Nothing in the loop retries: a provider error ends the run (§3.6).
 - A reply that ended for any reason other than `stop` or `tool_calls` is never taken as the answer (stop reason `incomplete`): with thinking on, reasoning can use up `max_tokens` and leave an empty, truncated reply. Further checks (no progress, a cap on tool calls, near-duplicates, a wall-clock deadline) wait for traces that show a need (`IDEAS.md`).
-- Structured output: validate against a JSON schema, retry once on a parse failure, then **fall back visibly** to `baseline` (one call per page).
+- Structured output: validate against a JSON schema, retry once on a parse failure, then **fall back visibly** to `baseline` (one call per page). **Built in M2** (`agents/translator.py`): the answer must pass `parse_translations`; a bad one gets one Repair call (the history plus the parse error, JSON output, no tools); `step_limit`, `incomplete` or a failed Repair fall back to `baseline` with a budget of its own. The Run keeps config `translator`, its attempts say why, and the eval harness counts the pages that fell back. `provider_error` and `budget` never fall back (§3.6).
 - The prompt keeps a stable prefix for prompt caching: `system → tool definitions → glossary → page`.
 - **Two DeepSeek rules:** with tools, the `reasoning_content` of every turn must be passed back unchanged in later requests (done by `LLMClientChatModel` since M2; `deepseek-flash` sends `""` on its final turn, which goes back as it is); JSON output occasionally comes back empty, which the retry above covers. Thinking is switched in `extra_body`; effort is `reasoning_effort` (`low` / `high` / `max`). The M2 smoke runs (2026-10-27, text only) also showed that `response_format: json_object` is accepted together with tools.
 
 ### 3.5 Metering & Tracing
 
 - **Metering is ours:** every LLM call records the model ID, input / output / cached tokens and cost. When the provider returns no usage, including a request that failed or timed out, the call is recorded as **unknown** and counted separately, never as 0. Cost per page comes from this data.
-- **Tracing uses an off-the-shelf tool:** Langfuse or Arize Phoenix (chosen in M2), replacing custom trace JSONL. One trace per page; agent steps, tool calls and review rounds are spans. Eval results store the trace ID, so a score links straight to its trace.
+- **Tracing uses an off-the-shelf tool:** Arize Phoenix, run locally (§8), replacing custom trace JSONL. LangSmith is never used: `run_agent` refuses to start while its tracing variables are on. One trace per page; agent steps, tool calls and review rounds are spans. Eval results store the trace ID, so a score links straight to its trace.
 - **Choosing:** Phoenix runs locally as one Python process, which is light on an 8 GB Mac. Self-hosting Langfuse needs more components, and Langfuse Cloud sends traces to a third party.
 - The editor's live agent trace (SSE) is a **product feature** and separate from the tracing tool: the first is for users, the second for development and evaluation.
 
@@ -239,6 +245,8 @@ Every vision component is a swappable **adapter**.
 | `baseline` | Formerly C0: one call per page, no tools, no KB |
 | `full` | Full system: Translator Agent (tools) + Reviewer Agent (at most 2 rounds) + Curator Agent / KB |
 | `full_no_kb` | KB ablation: identical to `full` except the KB is off |
+
+**`translator` (M2):** the Translator Agent alone, without KB or Reviewer, run on the M2 smoke pages. It is not one of the reported configs; M3 builds `full` and `full_no_kb` on top of it.
 
 **KB off means:** no KB snippets in the prompt; `lookup_term`, `lookup_character` and `propose_entry` disabled; the Curator does not run; the Reviewer does not see the KB either. The Translator, the Reviewer, `get_previous_context` and the token budget are the same as in `full`.
 
@@ -311,7 +319,7 @@ Every quality metric in both comparisons gets a paired bootstrap 95% CI. Primary
 | Agents | LangChain v1 `create_agent` runs the tool-calling loop. Its model is a small adapter over our `LLMClient`, so metering and DeepSeek's `reasoning_content` stay ours; LangChain stays inside `agents/` |
 | Vision | manga-ocr, comic-text-detector (optional), OpenCV, LaMa (optional) |
 | Evaluation | sacreBLEU (chrF / BLEU), COMET / xCOMET (Unbabel), GEMBA-MQM (LLM-as-judge), paired bootstrap (Python), OpenCC (reference conversion) |
-| Observability | Langfuse or Arize Phoenix (tracing); metering is ours |
+| Observability | Arize Phoenix, run locally, fed through OpenTelemetry with OpenInference instrumentation, so the backend can change (tracing); metering is ours |
 | Protocol demo | A minimal MCP server that exposes only `lookup_term` |
 
 ---
@@ -337,13 +345,13 @@ fukidashi/
 │   │   ├── datasets/      # OpenMantra loader and importer
 │   │   ├── pipeline/      # baseline (M1); from M2 the orchestrator takes over and baseline stays as a config
 │   │   ├── orchestrator/  # translate → review → finalize
-│   │   ├── agents/        # loop.py + model.py (the agent loop, M2); translator.py, reviewer.py, curator.py
+│   │   ├── agents/        # loop.py + model.py (the agent loop), translator.py (M2); reviewer.py, curator.py (M3)
 │   │   ├── tools/         # lookup_term, lookup_character, ...
 │   │   ├── kb/            # Glossary, Character Profiles, Proposal Queue
 │   │   ├── llm/           # client, metering, token budget
 │   │   ├── vision/        # detector / ocr / inpainter / typesetter adapters
 │   │   ├── evaluation/    # eval library, importable by tests: OpenCC references, metrics (sacreBLEU, later COMET, GEMBA-MQM, term accuracy), manifest, bootstrap
-│   │   └── tracing/       # Langfuse / Phoenix integration
+│   │   └── tracing/       # OpenTelemetry + OpenInference setup; the backend (Phoenix) is one exporter
 │   └── tests/             # focused on KB write permissions and orchestration
 ├── frontend/              # React + react-konva editor
 ├── eval/                  # entry point and eval data; the logic lives in backend/fukidashi/evaluation/
@@ -366,7 +374,7 @@ fukidashi/
 |---|---|---|---|---|
 | **M0** Decisions & first call | 1 | 10/16–10/18 | 2.5 | 4 decisions; `SCOPE.md`; download and check OpenMantra (fields in `annotation.json`, book title spelling, page and text-region counts); first real model output (model ID and token usage recorded). **Done 2026-10-24**, see `docs/m0.md` |
 | **M1** Vertical slice | 2 | 10/19–10/25 | 3.5 | M1-a: FastAPI + SQLite + OpenMantra import (oracle boxes + source text); M1-b: C0 → the frontend shows the page image, boxes and a translation list. **Checkpoint 10/25: a real translation of one page in the browser.** **Done 2026-10-24**, see `docs/m1.md` |
-| **M2** Agent layer & eval harness | 3 | 10/26–11/1 | 3.5 | Tool-calling loop + guardrails; Translator Agent; metering; tracing tool (Langfuse or Phoenix, chosen in M2); eval harness: `eval/run.py` + manifest + sacreBLEU (chrF / BLEU, with signature); `baseline` scored on 3 pages, Translator Agent runs on the same 3 pages (smoke test, not a reported config) |
+| **M2** Agent layer & eval harness | 3 | 10/26–11/1 | 3.5 | Tool-calling loop + guardrails; Translator Agent; metering; tracing tool (Phoenix, §8); eval harness: `eval/run.py` + manifest + sacreBLEU (chrF / BLEU, with signature); `baseline` scored on 3 pages, Translator Agent runs on the same 3 pages (smoke test, not a reported config). **Progress 2026-10-27:** all done except tracing (#8–#18); `translator` scored chrF 10.67 on the 3 pages, inside `baseline`'s run-to-run spread (11.17–12.87), at about $0.0016 per page |
 | **M3** KB & Reviewer | 4 | 11/2–11/8 | 3 | KB + Curator + Proposal Queue + unit tests for KB write permissions; Reviewer Agent in the full system (at most 2 rounds, fixed); gold glossary for the dev split; `baseline` / `full` / `full_no_kb` each run on 1 page |
 | **M4** Dev evaluation | 5 | 11/9–11/15 | 3 | Estimate tokens and cost on 3 pages first (judge calls included) against the budget cap; set up COMET / xCOMET (Windows GPU if the Mac cannot run it) and check checkpoint licenses and memory; run all 3 configs on the dev split. **11/15: first dev numbers** (chrF / BLEU, COMET, term accuracy, cost, latency) |
 | **M5** Freeze | 6 | 11/16–11/22 | 3 | Term accuracy / consistency; GEMBA-MQM + human agreement check on about 30 segments; tune prompts and tools from the MQM error breakdown; gold glossary for the test split; one-page `eval/PROTOCOL.md`. **11/22 freeze, tag `exp-frozen`** |
@@ -404,7 +412,7 @@ fukidashi/
 | OpenCC config | M2 | **`t2s`**: converts characters only and leaves the reference's wording as the translator wrote it. Taiwan and mainland vocabulary differences remain and lower reference-based metrics slightly (§4.9). `tw2sp` was rejected because it rewrites the human translation's wording | Decided (2026-10-26) |
 | Provider SDK retries | M2 | **Off** (`max_retries=0`). By default the `openai` SDK silently resends a request up to twice on connection errors, timeouts, 429 and 5xx; earlier attempts that may have been billed would never reach the Meter, and cost would be a partial sum. Now a 429 or 5xx fails the page and the user reruns it. An explicit retry for 429, which is rejected and not billed, can be added if 429s are common in M4 (`IDEAS.md`) | Decided (2026-10-26) |
 | Agent loop | M2 | **LangChain v1 `create_agent`** as the loop skeleton, customised through its model, tools and middleware (the Step limit is its `ModelCallLimitMiddleware`); start here and change it if the project needs to. Its model is a small custom chat model over `LLMClient`, not `ChatOpenAI` / `ChatDeepSeek`: those bypass the Meter and retry by default, and DeepSeek rejects tool-call turns that do not send `reasoning_content` back. LangChain stays inside `agents/`, behind a plain result type, so replacing it touches nothing else. The alternative was a hand-written loop | Decided (2026-10-27) |
-| Tracing tool | M2 | Langfuse or Arize Phoenix; Phoenix suggested (runs locally, lighter) | Open |
+| Tracing tool | M2 | **Arize Phoenix, run locally** (`phoenix serve` or Docker): one process, no account, no cost, and traces kept as long as we like, so the report's trace links (§3.5) still work in January. Hosted free tiers keep traces 14 days (LangSmith) or 30 days (Langfuse Cloud), and self-hosting Langfuse needs several services. Traces stay on this machine by default; that is a choice, not a licence requirement. **Kept replaceable:** the code uses only OpenTelemetry and OpenInference, and the backend is one exporter in `tracing/`, so moving to Langfuse or another OTLP backend later changes that exporter, not the instrumentation (`IDEAS.md`). The Phoenix server is not a project dependency | Decided (2026-10-27) |
 | COMET checkpoint | M4 | Which COMET and xCOMET models, by license and memory | Open |
 | Judge model (GEMBA-MQM) | M5 | A strong model different from the translation model | Open |
 

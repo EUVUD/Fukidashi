@@ -1,6 +1,6 @@
 # Design Diagrams
 
-> 2026-10-27 · Matches the code after M2's first six tasks: the eval harness v0, the Run status and cost fixes, provider and malformed-response error handling, and the tool-calling loop. Diagrams are Mermaid and render on GitHub.
+> 2026-10-27 · Matches the code after M2's first seven tasks: the eval harness v0, the Run status and cost fixes, provider and malformed-response error handling, the tool-calling loop and the Translator Agent. Diagrams are Mermaid and render on GitHub.
 > **Solid = implemented; dashed = planned** (milestones in [OUTLINE.md](../OUTLINE.md) §7). Terms follow OUTLINE §0.
 
 Fukidashi translates Japanese manga into Simplified Chinese (zh-Hans). Each page has several Segments (one line of dialogue in one oracle box); the model looks at the whole page image and translates them together, and the user checks the translations against the boxes in the browser.
@@ -59,7 +59,7 @@ classDiagram
 
 - A page has many **Segments**. Every click on Translate creates a **Run**, and the Run gives each Segment one **Translation**. The page shows its latest successful Run.
 - **Reference translations** (OpenMantra's zh-Hant and en translations) belong to the Segment and are used only for comparison and evaluation, never in a prompt.
-- `Run.config` is only `baseline` for now (one call per page, no tools, no KB); `full` and `full_no_kb` arrive in M2–M3.
+- `Run.config` is `baseline` (one call per page, no tools, no KB) or `translator` (the Translator Agent alone, M2's smoke config); `full` and `full_no_kb` arrive in M3.
 - The dashed **KnowledgeBase** (M3) and **ReviewComment** (M3) do not exist yet.
 
 ---
@@ -140,7 +140,7 @@ sequenceDiagram
     Note over G: Meter appends every call to runs/usage.jsonl
 ```
 
-**The agent loop.** `run_agent` (`agents/loop.py`) runs a model through tool calls. `Runs` does not call it yet (the Translator Agent, M2, will); today only `scripts/m2_tool_smoke.py` does. One run:
+**The agent loop.** `run_agent` (`agents/loop.py`) runs a model through tool calls. The Translator Agent calls it for config `translator`, and `scripts/m2_tool_smoke.py` calls it with a toy tool. One run:
 
 ```mermaid
 sequenceDiagram
@@ -173,11 +173,28 @@ sequenceDiagram
     Note over A,C: Step limit, BudgetExceeded and ProviderError end the run as step_limit, budget or provider_error, without a retry
 ```
 
+**The Translator Agent** (`translate_page` with config `translator`) wraps that loop: the agent's answer is checked, repaired once, or replaced by `baseline`, and the Run records which (OUTLINE §3.4, §3.6).
+
+```mermaid
+flowchart TD
+    P["runs.previous_pages: up to 2 earlier pages' Japanese and latest translator translations"] --> A
+    A["run_agent: page image and regions, tool get_previous_context, JSON output"] --> S{stop reason}
+    S -- final --> C{"parse_translations passes?"}
+    C -- yes --> OK["succeeded, fallback null"]
+    C -- no --> R["one repair call: history plus the parse error, JSON output, no tools"]
+    R --> C2{"parses?"}
+    C2 -- yes --> OK
+    C2 -- no --> F["fall back: run_baseline with its own budget"]
+    S -- step_limit or incomplete --> F
+    F --> FB["Run stays translator, attempts record the reason, eval counts it"]
+    S -- provider_error or budget --> X["failed Run, nothing more is sent"]
+```
+
 ---
 
 ## 4. Object Model
 
-The objects in the code and how they depend on each other (the actual structure after M2's first six tasks).
+The objects in the code and how they depend on each other (the actual structure after M2's first seven tasks).
 
 ### 4.1 Backend
 
@@ -213,6 +230,10 @@ classDiagram
         translations
         attempts
         error
+    }
+    class Translator:::agent {
+        run_translator()
+        get_previous_context
     }
     class AgentLoop:::agent {
         run_agent()
@@ -269,7 +290,10 @@ classDiagram
     EvalHarness ..> Store : reads Runs, Translations
     EvalHarness ..> EvalOutputs : writes
     Runs ..> Store : Runs, Translations
-    Runs ..> Baseline : run_baseline
+    Runs ..> Baseline : config baseline
+    Runs ..> Translator : config translator
+    Translator ..> AgentLoop : run_agent
+    Translator ..> Baseline : fallback
     Runs ..> Page : builds
     Baseline ..> Page : reads
     Baseline ..> LLMClient : chat
@@ -304,7 +328,8 @@ classDiagram
 - `Runs` receives an `LLMClient` factory, not a client: every Run builds its own `LLMClient` and `Meter`, so each Run's usage is its own.
 - `llm/` (`LLMClient` and `describe_api_error`) is the only code that imports `openai`. `LLMClient` turns the SDK's automatic retries off, so every request sent is one call in the `Meter`. A request that raises, or a response `LLMClient` cannot read (an HTML page, a body that is not JSON, no readable first choice), is recorded once with an `error`, with unknown usage unless the response carried some, then leaves `llm/` as `ProviderError` carrying that `CallRecord`. `Baseline` adds it to `attempts` and puts the error on the Run without retrying (OUTLINE §3.6: a request that may have been billed is not resent automatically), so a finished Run has one attempt per call; it retries only empty or unparseable output.
 - `Baseline` touches neither HTTP nor SQLite.
-- `AgentLoop` (`agents/loop.py`) is LangChain's `create_agent` with `LLMClientChatModel` as its model, so every agent call goes through `LLMClient` and is metered once; nothing in the loop retries. Its guardrails are the Step limit (`ModelCallLimitMiddleware`), a check that a reply ending for any reason other than `stop` or `tool_calls` is never an answer, and a tool guard that validates arguments against the `Tool`'s pydantic model, passes the model's mistakes back as the tool's result and does not run a duplicate call again. LangChain stays inside `agents/`: callers get an `AgentResult` of plain values with one step per model call. `Runs` does not use it yet.
+- `AgentLoop` (`agents/loop.py`) is LangChain's `create_agent` with `LLMClientChatModel` as its model, so every agent call goes through `LLMClient` and is metered once; nothing in the loop retries. Its guardrails are the Step limit (`ModelCallLimitMiddleware`), a check that a reply ending for any reason other than `stop` or `tool_calls` is never an answer, and a tool guard that validates arguments against the `Tool`'s pydantic model, passes the model's mistakes back as the tool's result and does not run a duplicate call again. LangChain stays inside `agents/`: callers get an `AgentResult` of plain values with one step per model call. The Translator Agent is its one caller in the code (`scripts/m2_tool_smoke.py` is the other).
+- `Translator` (`agents/translator.py`) is the `translator` config: it gives `AgentLoop` the page (the same user message as `Baseline`) and `get_previous_context`, whose data `Runs` reads from `Store` before the run, so the tool touches no database in LangGraph's worker threads. It checks the answer with `parse_translations`, repairs it once, and otherwise falls back to `Baseline` with a budget of its own; after a provider error or a spent budget it sends nothing more. The Run's `attempts_json` holds the agent's steps, the repair and the fallback, and `EvalHarness` reports the pages that fell back.
 
 ### 4.2 Frontend
 
@@ -347,11 +372,11 @@ classDiagram
 | Page | `pages` | `Page` | `PageSummary`, `PageDetail` |
 | Segment | `segments` | `Segment` | `SegmentOut` / `Segment` |
 | Run | `runs` | No class of its own: `Runs.translate_page` writes the row through `Store.start_run` / `finish_run`, using `Meter.summary()` and `BaselineResult` | `RunOut` / `Run` |
-| Translation | `translations` | `BaselineResult.translations` | `Segment.text_zh_hans` |
+| Translation | `translations` | `BaselineResult.translations` or `TranslatorResult.translations` | `Segment.text_zh_hans` |
 | Manifest | none (`runs/eval/<id>/manifest.json`) | written by `run_eval` | none |
 
 ### 4.4 Where later milestones plug in
 
-- **M2:** the Translator Agent, built on `AgentLoop`, joins `Baseline`, and later an Orchestrator (`orchestrator/` in OUTLINE §6). `LLMClient`, `Meter` and `PageBudget` stay as they are, and every agent call goes through them; `Runs.translate_page` picks Baseline or the Orchestrator by `config`, and `EvalHarness` accepts each config as it arrives (`CONFIGS` in `evaluation/harness.py`).
+- **M2:** done except tracing: the Translator Agent, built on `AgentLoop`, runs beside `Baseline`; the tracing tool (OUTLINE §3.5) is next. An Orchestrator (`orchestrator/` in OUTLINE §6) comes with the Reviewer in M3. `LLMClient`, `Meter` and `PageBudget` stay as they are, and every agent call goes through them; `Runs.translate_page` picks Baseline or the Orchestrator by `config`, and `EvalHarness` accepts each config as it arrives (`CONFIGS` in `evaluation/harness.py`).
 - **M3:** the `KB` (Glossary, Character Profiles, Proposal Queue) and the Reviewer / Curator Agents; `runs.config` gains `full` and `full_no_kb`.
 - **M7:** the frontend adds a canvas and editing to `PageView`, plus SSE, which adds an event subscription to the `api` module.

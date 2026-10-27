@@ -4,13 +4,14 @@
 
 多 agent 漫画翻译编辑器（日 → 简体中文）。在 [OpenMantra](https://github.com/mantra-inc/open-mantra-dataset) 数据集上，用标准的 MT evaluation framework 和单次调用的 baseline 做对比。
 
-> **现状（2026-10-27）：** M0 和 M1 已完成，vertical slice 已经跑通：导入 OpenMantra，对一页做一次模型调用完成翻译，在浏览器里逐句对照图上的 box 检查译文。M2 进行中：eval harness 已经能用 chrF / BLEU 给 `baseline` 打分，调用工具的 agent loop 也已经跑在带计量的 client 上。Translator Agent、Knowledge Base、Reviewer 和 tracing 还没有实现。
+> **现状（2026-10-27）：** M0 和 M1 已完成，vertical slice 已经跑通：导入 OpenMantra，对一页做一次模型调用完成翻译，在浏览器里逐句对照图上的 box 检查译文。M2 进行中：eval harness 已经能用 chrF / BLEU 给各个 config 打分，第一版 Translator Agent 也以 `translator` config 的形式跑在调用工具的 agent loop 上，底下是带计量的 client。Knowledge Base、Reviewer 和 tracing 还没有实现。
 
 ## 它做什么
 
 - **带上下文翻译一页。** 模型同时看到整页图片和每个气泡的日文原文、box，为每个 box 返回一句简体中文。
 - **在原位检查。** 编辑器在页面上画出每个 box，并把原文、译文和参考译文并排列出。
-- **计划中（M2–M3）：** Translator Agent 通过 tools 查 Glossary 和 Character Profiles；Reviewer Agent 在 independent context 里检查结果；Curator Agent 是每本书 Knowledge Base 唯一的写者。
+- **第一版 Translator Agent（M2）。** `translator` config 给模型同样的一页，外加一个读取前几页的工具；答案不合格时修复一次，仍不行就回退到 `baseline`，并且会明确记录下来。
+- **计划中（M3）：** 查 Glossary 和 Character Profiles 的 tools；Reviewer Agent 在 independent context 里检查结果；Curator Agent 是每本书 Knowledge Base 唯一的写者。
 
 ## 怎么评测
 
@@ -48,10 +49,11 @@ npm run dev --prefix frontend                   # http://localhost:5173/tojime_n
 选一页点 Translate：后端对这一页跑一次 `baseline`（一次调用，不用 tools 和 KB），把 Run 和 zh-Hans 译文存进 SQLite。Translate 会真实调用 `.env` 里配置的模型。DB 路径可以用环境变量 `FUKIDASHI_DB` 改。
 
 ```bash
-uv run python eval/run.py --config baseline --book tojime_no_siora --pages 2,3,4   # 真实调用：每页一次
+uv run python eval/run.py --config baseline --book tojime_no_siora --pages 2,3,4     # 真实调用：每页一次
+uv run python eval/run.py --config translator --book tojime_no_siora --pages 2,3,4   # Translator Agent：每页几次调用
 ```
 
-Eval harness（评测执行器）走和编辑器相同的代码路径翻译这几页（每页在 SQLite 里留下一个 Run），用 OpenCC（`t2s`）把 zh-Hant 参考译文转成 zh-Hans，然后打印 chrF 和 BLEU 及其 sacreBLEU 签名，以及每页成本和延迟。运行清单（Manifest）、逐 Segment 的输出和分数写入 `runs/eval/<id>/`。有页面失败或 harness 无法启动时，退出码非零。
+Eval harness（评测执行器）走和编辑器相同的代码路径翻译这几页（每页在 SQLite 里留下一个 Run），用 OpenCC（`t2s`）把 zh-Hant 参考译文转成 zh-Hans，然后打印 chrF 和 BLEU 及其 sacreBLEU 签名，以及每页成本和延迟；跑 `translator` 时还会统计回退到 `baseline` 的页数。运行清单（Manifest）、逐 Segment 的输出和分数写入 `runs/eval/<id>/`。有页面失败或 harness 无法启动时，退出码非零。
 
 ```bash
 uv run pytest                                       # 不联网，不发真实 LLM 请求
