@@ -72,3 +72,7 @@ uv run python scripts/m0_first_call.py --dry-run    # 打印 M0 的请求内容�
 ## 数据与署名
 
 OpenMantra 来自 Hinami et al., *Towards Fully Automated Manga Translation*（AAAI 2021），许可为 **CC BY-NC 4.0**。图片不在本仓库里，请按上面的命令另外 clone。文档里为了举例引用了其中几句短文本。数据笔记：[docs/openmantra.md](docs/openmantra.md)（英文）。
+
+## 许可
+
+本仓库的代码以 [MIT License](LICENSE) 发布。该许可不覆盖 OpenMantra：数据集本身不在本仓库里分发，文档中引用的原文仍适用 CC BY-NC 4.0，使用数据集须遵守该许可。

@@ -72,3 +72,7 @@ Most of the code is written by AI coding agents (Claude Code) through an archite
 ## Data and attribution
 
 OpenMantra is by Hinami et al., *Towards Fully Automated Manga Translation* (AAAI 2021), licensed **CC BY-NC 4.0**. The images are not part of this repository; clone the dataset separately as shown above. The docs quote a few short lines of its text for illustration. Data notes: [docs/openmantra.md](docs/openmantra.md).
+
+## License
+
+The code in this repository is released under the [MIT License](LICENSE). The license does not cover OpenMantra: the dataset is not distributed here, and the lines of its text quoted in the docs remain under CC BY-NC 4.0, so any use of the dataset must follow that license.
