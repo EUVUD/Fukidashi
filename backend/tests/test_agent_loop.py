@@ -423,6 +423,16 @@ def test_arguments_are_compared_after_validation():
     assert handled == [("a", 1)] and result.steps[1]["tool_calls"][0]["duplicate"] is True
 
 
+def test_arguments_of_the_earlier_call_are_compared_after_validation_too():
+    handled = []
+    provider = Provider(ask(call("call_1", {"term": "a", "n": "1", "extra": True})),  # "1" reads as 1, extra is dropped
+                        ask(call("call_2", {"term": "a", "n": 1})), answer())
+
+    result, _ = run(provider, [make_tool(handled)])
+
+    assert handled == [("a", 1)] and result.steps[1]["tool_calls"][0]["duplicate"] is True
+
+
 def test_different_arguments_are_not_duplicates():
     handled = []
     provider = Provider(ask(call("call_1", {"term": "a", "n": 1})), ask(call("call_2", {"term": "a", "n": 2})),
@@ -477,6 +487,45 @@ def test_an_unknown_tool_or_malformed_arguments_are_not_remembered_as_calls():
     result, _ = run(provider, [make_tool([])])
 
     assert all("not a JSON object" in s["tool_calls"][0]["error"] for s in result.steps[:2])
+
+
+# --- LangSmith ------------------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("name", ["LANGSMITH_TRACING", "LANGCHAIN_TRACING_V2", "LANGCHAIN_TRACING"])
+@pytest.mark.parametrize("value", ["true", "True", "1"])
+def test_tracing_switched_on_refuses_the_run_before_any_request(monkeypatch, name, value):
+    monkeypatch.setenv(name, value)
+    provider = Provider(answer())
+
+    with pytest.raises(loop.TracingEnabled) as refused:
+        run(provider)
+
+    assert name in str(refused.value) and name in loop.TRACING_VARIABLES
+    assert provider.bodies == []
+
+
+def test_the_refusal_names_the_variable_and_never_its_value(monkeypatch):
+    monkeypatch.setenv("LANGSMITH_TRACING", "sentinel-value")
+    monkeypatch.setenv("LANGCHAIN_TRACING_V2", "true")
+
+    with pytest.raises(loop.TracingEnabled) as refused:
+        run(Provider(answer()))
+
+    message = str(refused.value)
+    assert "LANGSMITH_TRACING" in message and "LANGCHAIN_TRACING_V2" in message
+    assert "sentinel-value" not in message
+
+
+@pytest.mark.parametrize("value", [None, "false", "False", "0", ""])
+def test_tracing_unset_or_false_runs(monkeypatch, value):
+    for name in loop.TRACING_VARIABLES:
+        if value is not None:
+            monkeypatch.setenv(name, value)
+    provider = Provider(answer("ok"))
+
+    result, _ = run(provider)
+
+    assert (result.stop_reason, len(provider.bodies)) == ("final", 1)
 
 
 # --- the adapter ----------------------------------------------------------------------------------------------------

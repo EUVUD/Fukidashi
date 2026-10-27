@@ -125,6 +125,12 @@ def main() -> None:
         sys.exit(str(e))
     meter = Meter(ledger_path=ROOT / "runs" / "usage.jsonl")
     result = run_agent(LLMClient(config, meter), budget, **options)
+    # LLMClient sends response_format only in JSON mode, so `--json-output` alone proves nothing about the provider
+    response_format_sent = args.json_output and config.json_mode == "json_object"
+    first = result.steps[0] if result.steps else None
+    accepted = first is not None and not first["error"]
+    json_with_tools = (None if not args.json_output else "not tested" if not response_format_sent
+                       else "accepted" if accepted else "not accepted")
 
     summary = meter.summary()
     models = sorted({s["record"]["response_model"] for s in result.steps if s["record"] and s["record"]["response_model"]})
@@ -135,6 +141,9 @@ def main() -> None:
         "requested_model": config.model,
         "response_models": models,
         "json_output": args.json_output,
+        "json_mode": config.json_mode,
+        "response_format_sent": response_format_sent,
+        "json_output_with_tools": json_with_tools,  # accepted, not accepted, not tested (no response_format sent) or null
         "line": LINE,
         "uses_glossary": uses_glossary(result.text),
         "meter": summary,
@@ -153,10 +162,12 @@ def main() -> None:
         print(f"Final answer: {result.text}")
         print(f"Uses the glossary rendering {list(GLOSSARY.values())[0]}: {'yes' if out['uses_glossary'] else 'no'}")
     if args.json_output:
-        first = result.steps[0] if result.steps else None
-        accepted = first is not None and not first["error"]
-        print("JSON output together with tools: " + ("accepted by the provider" if accepted else
-              f"not accepted ({first['error'] if first else 'no request was made'})"))
+        if not response_format_sent:
+            print(f"JSON output together with tools: not tested (LLM_JSON_MODE={config.json_mode}, "
+                  "so response_format was not sent)")
+        else:
+            print("JSON output together with tools: " + ("accepted by the provider" if accepted else
+                  f"not accepted ({first['error'] if first else 'no request was made'})") + "; response_format was sent")
     cost = f"${summary['cost_usd']:.4f}" if summary["cost_usd"] is not None else "unknown"
     print(f"Calls: {summary['calls']}  input tokens: {summary['input_tokens']}  output tokens: {summary['output_tokens']}"
           f"  unknown-usage calls: {summary['unknown_usage_calls']}  Cost: {cost}")

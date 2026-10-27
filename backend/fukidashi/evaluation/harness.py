@@ -14,13 +14,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .. import runs, store
+from ..agents import translator
+from ..agents.loop import DEFAULT_MAX_STEPS
 from ..llm.client import LLMClient, LLMNotConfigured
 from ..pipeline import baseline
 from . import manifest as manifest_facts
 from .metrics import cost_summary, latency_summary, run_cost, score_corpus
 from .references import OPENCC_CONFIG, to_zh_hans
 
-CONFIGS = (baseline.CONFIG_NAME,)  # `full` and `full_no_kb` arrive with the orchestrator
+CONFIGS = runs.CONFIGS  # `full` and `full_no_kb` arrive with the orchestrator
 
 
 class EvalAborted(Exception):
@@ -63,7 +65,9 @@ def run_eval(
 
     Raises `EvalAborted` before any model call when a page does not exist or its image is missing. A page
     without text regions is skipped. A failed or crashed Run is listed under `failed_pages` and left out of
-    the scores; its cost is reported apart, under `cost.failed_runs`.
+    the scores; its cost is reported apart, under `cost.failed_runs`. A `translator` Run that fell back to
+    `baseline` is scored like any other, and flagged: per page (`fell_back`, `fallback_reason`) and as a count
+    over the scored pages (`fallback_pages`).
     """
     if config not in CONFIGS:
         raise ValueError(f"unknown config {config!r}; expected one of {CONFIGS}")
@@ -71,6 +75,8 @@ def run_eval(
         raise ValueError(f"duplicate pages in {page_indexes}")
     started_at = _now()
     params = {"page_budget": baseline.DEFAULT_PAGE_BUDGET, "max_tokens": baseline.DEFAULT_MAX_TOKENS}
+    if config == translator.CONFIG_NAME:
+        params |= {"agent_budget": translator.DEFAULT_PAGE_BUDGET, "max_steps": DEFAULT_MAX_STEPS}
 
     to_translate: list[int] = []
     skipped: list[dict] = []
@@ -100,7 +106,7 @@ def run_eval(
         outcome = None
         try:
             outcome = runs.translate_page(
-                conn, book, page_index, make_client=make_client, dataset_root=dataset_root, **params
+                conn, book, page_index, make_client=make_client, dataset_root=dataset_root, config=config, **params
             )
         except LLMNotConfigured:
             raise  # raised before any Run exists, and it would be the same for every page
@@ -116,10 +122,12 @@ def run_eval(
             run_rows.append(run)
         cost = None if run is None else run_cost(run["cost_usd"], run["unknown_usage_calls"])
         ok = outcome is not None and outcome.result.ok
+        fallback_reason = _fallback_reason(run)
         page_entries[page_index] = {"book": book, "page_index": page_index,
                                     "status": "scored" if ok else "failed", "run_id": run_id}
         if not ok:
             failed.append({"book": book, "page_index": page_index, "run_id": run_id, "error": error,
+                           "fell_back": fallback_reason is not None, "fallback_reason": fallback_reason,
                            "latency_s": round(latency, 3), "cost_usd": cost})
             if run is not None:
                 failed_runs.append(run)
@@ -135,6 +143,7 @@ def run_eval(
         scored_runs.append(run)
         scored.append({"book": book, "page_index": page_index, "run_id": outcome.run_id, "segments": len(rows),
                        "calls": run["calls"], "unknown_usage_calls": run["unknown_usage_calls"],
+                       "fell_back": fallback_reason is not None, "fallback_reason": fallback_reason,
                        "cost_usd": cost, "latency_s": round(latency, 3)})
         log(f"  run {outcome.run_id}: {len(rows)} segments, {latency:.1f}s")
     for entry in skipped:
@@ -147,6 +156,7 @@ def run_eval(
         "book": book,
         "pages_scored": len(scored),
         "segments_scored": len(segment_lines),
+        "fallback_pages": sum(p["fell_back"] for p in scored),  # scored pages whose Run fell back to baseline
         "chrf": {"score": corpus.chrf, "signature": corpus.chrf_signature},
         "bleu": {"score": corpus.bleu, "signature": corpus.bleu_signature},
         "cost": cost_summary([(r["cost_usd"], r["unknown_usage_calls"]) for r in scored_runs])
@@ -166,7 +176,7 @@ def run_eval(
         "started_at": started_at,
         "finished_at": finished_at,
         "config_name": config,
-        "config_params": params,
+        "config_params": runs.run_params(config, **params),  # as the Runs record them
         "book": book,
         "pages": [page_entries[i] for i in page_indexes],
         "annotation_sha256": manifest_facts.file_sha256(dataset_root / "annotation.json"),
@@ -186,6 +196,15 @@ def run_eval(
         for line in segment_lines:
             f.write(json.dumps(line, ensure_ascii=False) + "\n")
     return EvalResult(out_dir, manifest, scores, failed)
+
+
+def _fallback_reason(run: sqlite3.Row | None) -> str | None:
+    """Why the Run fell back to `baseline`, read from what it stored; None when it did not (or has no record)."""
+    if run is None or not run["attempts_json"]:
+        return None
+    attempts = json.loads(run["attempts_json"])
+    fallback = attempts.get("fallback") if isinstance(attempts, dict) else None  # baseline stores a list
+    return None if fallback is None else fallback["reason"]
 
 
 def _free_id(out_root: Path, base: str) -> str:
@@ -220,11 +239,17 @@ def format_summary(result: EvalResult) -> str:
         f" (unknown-cost runs {cost['unknown_cost_runs']}, unknown_usage_calls {cost['unknown_usage_calls']})",
         f"latency per page  p50 {num(lat['p50_s'], '.1f')}s  p95 {num(lat['p95_s'], '.1f')}s",
     ]
+    if s["config"] != baseline.CONFIG_NAME:
+        lines.insert(2, f"fallback to baseline  {s['fallback_pages']} of {s['pages_scored']} scored pages")
+    for p in s["pages"]:
+        if p["fell_back"]:
+            lines.append(f"FELL BACK  {p['book']}/{p['page_index']} (run {p['run_id']}): {p['fallback_reason']}")
     for p in s["skipped_pages"]:
         lines.append(f"skipped {p['book']}/{p['page_index']}: {p['reason']}")
     for p in s["failed_pages"]:
         run = "no Run" if p["run_id"] is None else f"run {p['run_id']}"
-        lines.append(f"FAILED  {p['book']}/{p['page_index']} ({run}): {p['error']}")
+        lines.append(f"FAILED  {p['book']}/{p['page_index']} ({run}): {p['error']}"
+                     + (f"  (after falling back: {p['fallback_reason']})" if p["fell_back"] else ""))
     if s["failed_pages"]:
         failed = cost["failed_runs"]
         lines.append(f"failed runs cost  total ${num(failed['total_usd'], '.6f')}"

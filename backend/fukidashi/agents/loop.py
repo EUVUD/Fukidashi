@@ -14,6 +14,7 @@ LangChain stays inside this package: `run_agent` returns an `AgentResult` of pla
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -41,6 +42,14 @@ PROVIDER_ERROR = "provider_error"
 
 # Any other finish reason (length, content_filter, insufficient_system_resource, None) means the reply was cut off.
 ANSWER_FINISH_REASONS = ("stop", "tool_calls")
+
+# `langsmith` comes with `langchain-core` and sends every prompt and reply to LangSmith when one of these is on.
+TRACING_VARIABLES = ("LANGSMITH_TRACING", "LANGSMITH_TRACING_V2", "LANGCHAIN_TRACING_V2", "LANGCHAIN_TRACING")
+_OFF_VALUES = ("", "0", "false")  # what langchain-core itself reads as off; anything else may switch tracing on
+
+
+class TracingEnabled(RuntimeError):
+    """A LangSmith tracing variable is on. The message names the variables, never their values."""
 
 
 @dataclass(frozen=True)
@@ -77,7 +86,11 @@ def run_agent(
     json_output: bool = False,
     max_steps: int = DEFAULT_MAX_STEPS,
 ) -> AgentResult:
-    """Run the model through tool calls to a final answer. Provider failures and spent budgets end up in the result."""
+    """Run the model through tool calls to a final answer. Provider failures and spent budgets end up in the result.
+
+    Raises `TracingEnabled`, before any request, when LangSmith tracing is switched on in the environment.
+    """
+    _refuse_tracing()
     if max_steps < 1:
         raise ValueError("max_steps must be at least 1")
     lc_tools = [_langchain_tool(t) for t in tools]
@@ -122,6 +135,15 @@ def run_agent(
     text = messages[-1].content if stop_reason == FINAL else None
     history = [{"role": "system", "content": system_prompt}, *to_openai_messages(messages)]
     return AgentResult(text=text, stop_reason=stop_reason, error=error, steps=steps, messages=history)
+
+
+def _refuse_tracing() -> None:
+    on = [name for name in TRACING_VARIABLES if os.environ.get(name, "").strip().lower() not in _OFF_VALUES]
+    if on:
+        raise TracingEnabled(
+            f"{' and '.join(on)} {'is' if len(on) == 1 else 'are'} set, which would send prompts and page images to "
+            "LangSmith. Unset it (check .env too) before running an agent."
+        )
 
 
 def _langchain_tool(t: Tool | BaseTool) -> BaseTool:
