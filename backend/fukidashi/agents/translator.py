@@ -116,9 +116,9 @@ def run_translator(
     """Translate one page. Never raises for provider errors or bad output: they end up in `error`.
 
     The attempts record: {"config": "translator",
-      "agent": {"stop_reason", "error", "steps", "answer_parse_error"},   # the last is set when the answer did not parse
-      "repair": null | {"error", "record", "raw", "parse_error"},         # the one repair call, an attempt like baseline's
-      "fallback": null | {"reason", "attempts"}}                          # `attempts` are run_baseline's
+      "agent": {"stop_reason", "error", "steps", "answer_parse_error"},  # the last: why the final answer did not parse
+      "repair": null | {"error", "record", "raw", "parse_error"},        # the one repair call, an attempt
+      "fallback": null | {"reason", "attempts"}}                         # `attempts` are run_baseline's
     The agent and its repair share one budget of `agent_budget` tokens; the fallback gets its own.
     """
     ids = [s.index for s in page.segments]

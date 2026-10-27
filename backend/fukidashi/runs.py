@@ -100,7 +100,9 @@ def run_params(
     return {"page_budget": page_budget, "max_tokens": max_tokens}
 
 
-def previous_pages(conn: sqlite3.Connection, book_title: str, page_index: int, config: str) -> list[translator.PreviousPage]:
+def previous_pages(
+    conn: sqlite3.Connection, book_title: str, page_index: int, config: str
+) -> list[translator.PreviousPage]:
     """The pages before this one (up to `translator.MAX_PAGES_BACK`), oldest first: each region's Japanese text and
     its zh-Hans from the page's latest succeeded Run of `config`, if there is one.
 

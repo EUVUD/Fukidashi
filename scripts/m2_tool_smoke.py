@@ -166,8 +166,9 @@ def main() -> None:
             print(f"JSON output together with tools: not tested (LLM_JSON_MODE={config.json_mode}, "
                   "so response_format was not sent)")
         else:
-            print("JSON output together with tools: " + ("accepted by the provider" if accepted else
-                  f"not accepted ({first['error'] if first else 'no request was made'})") + "; response_format was sent")
+            verdict = ("accepted by the provider" if accepted else
+                       f"not accepted ({first['error'] if first else 'no request was made'})")
+            print(f"JSON output together with tools: {verdict}; response_format was sent")
     cost = f"${summary['cost_usd']:.4f}" if summary["cost_usd"] is not None else "unknown"
     print(f"Calls: {summary['calls']}  input tokens: {summary['input_tokens']}  output tokens: {summary['output_tokens']}"
           f"  unknown-usage calls: {summary['unknown_usage_calls']}  Cost: {cost}")
