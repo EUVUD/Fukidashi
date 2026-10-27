@@ -1,11 +1,15 @@
 """The CLI scripts that carry a little logic of their own. Nothing here sends a request."""
 
 import importlib.util
+import json
+import sys
 
+import httpx
 import pytest
 
 from fukidashi import config
-from fukidashi.llm.client import LLMConfig
+from fukidashi.datasets.openmantra import get_page
+from fukidashi.llm.client import LLMClient, LLMConfig
 
 spec = importlib.util.spec_from_file_location("m0_first_call", config.ROOT / "scripts" / "m0_first_call.py")
 m0 = importlib.util.module_from_spec(spec)
@@ -42,3 +46,44 @@ def test_both_reasons_are_shown_when_both_apply():
     line = m0.cost_line(summary(calls=2, unknown=1), UNPRICED)
 
     assert "unknown (1 call returned no usage)" in line and HINT in line
+
+
+# --- the script end to end, on a mock provider ------------------------------------------------------------
+
+def run_main(monkeypatch, tmp_path, dataset, handler, capsys, *, prices=True):
+    """`main()` with the real LLMClient on `handler`; nothing is read from .env and nothing leaves the process."""
+    monkeypatch.setattr(sys, "argv", ["m0_first_call.py", "--book", "book_a", "--page", "1"])
+    monkeypatch.setattr(m0, "load_dotenv", lambda path: None)
+    monkeypatch.setattr(m0, "ROOT", tmp_path)  # the ledger and the output file go here, not into runs/
+    monkeypatch.setattr(m0, "get_page", lambda book, index: get_page(book, index, dataset))
+    monkeypatch.setattr(m0, "LLMClient", lambda config, meter: LLMClient(
+        config, meter, http_client=httpx.Client(transport=httpx.MockTransport(handler))))
+    env = {"LLM_BASE_URL": "http://provider.test/v1", "LLM_API_KEY": "sk-test", "LLM_MODEL": "mock-model",
+           "LLM_PRICE_INPUT_PER_M": "1.0" if prices else "", "LLM_PRICE_OUTPUT_PER_M": "2.0" if prices else ""}
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    with pytest.raises(SystemExit) as exited:
+        m0.main()
+    return exited.value.code, capsys.readouterr().out
+
+
+def html_page(request):
+    return httpx.Response(200, text="<html>gateway</html>", headers={"content-type": "text/html"})
+
+
+def test_main_says_the_cost_is_unknown_when_a_response_could_not_be_read(monkeypatch, tmp_path, dataset, capsys):
+    code, out = run_main(monkeypatch, tmp_path, dataset, html_page, capsys)
+
+    assert code == 1  # the Run failed
+    assert "Failed: The response from http://provider.test/v1 is not a chat completion" in out
+    assert "unknown-usage calls: 1" in out
+    assert "Cost: unknown (1 call returned no usage)" in out and "LLM_PRICE" not in out
+    (saved,) = (tmp_path / "runs" / "m0").glob("*.json")
+    attempts = json.loads(saved.read_text(encoding="utf-8"))["attempts"]
+    assert len(attempts) == 1 and attempts[0]["error"] and attempts[0]["record"]["usage"] is None
+
+
+def test_main_keeps_the_price_hint_when_the_price_is_missing(monkeypatch, tmp_path, dataset, capsys):
+    _, out = run_main(monkeypatch, tmp_path, dataset, html_page, capsys, prices=False)
+
+    assert "Cost: unknown (1 call returned no usage); not computed (set LLM_PRICE_INPUT_PER_M" in out
