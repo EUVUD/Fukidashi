@@ -1,6 +1,6 @@
 # Design Diagrams
 
-> 2026-10-24 · Matches the code after M1, once Run handling moved from the router into a service layer. Diagrams are Mermaid and render on GitHub.
+> 2026-10-26 · Matches the code after M2's first two tasks: the eval harness v0 and the Run status and cost fixes. Diagrams are Mermaid and render on GitHub.
 > **Solid = implemented; dashed = planned** (milestones in [OUTLINE.md](../OUTLINE.md) §7). Terms follow OUTLINE §0.
 
 Fukidashi translates Japanese manga into Simplified Chinese (zh-Hans). Each page has several Segments (one line of dialogue in one oracle box); the model looks at the whole page image and translates them together, and the user checks the translations against the boxes in the browser.
@@ -112,7 +112,7 @@ sequenceDiagram
     U->>D: INSERT Run (status running)
     U->>B: run_baseline(page, client, budget)
     B->>B: build_messages (image, ja, boxes only)
-    loop up to 2 attempts (retry only if the output is empty or unparseable)
+    loop up to 2 attempts (retry only if the output is empty, unparseable, or its region ids are not exactly the page's)
         B->>C: chat(messages, budget)
         C->>G: budget.check()
         C->>M: chat.completions.create
@@ -130,6 +130,7 @@ sequenceDiagram
     else failed
         R-->>V: 502 error detail
     end
+    Note over U,D: Unexpected exception after INSERT Run: UPDATE Run (failed), raise RunCrashed(run_id), router answers 500
     Note over G: Meter appends every call to runs/usage.jsonl
 ```
 
@@ -137,11 +138,11 @@ sequenceDiagram
 
 ## 4. Object Model
 
-The objects in the code and how they depend on each other (the actual M1 structure).
+The objects in the code and how they depend on each other (the actual structure after M2's first two tasks).
 
 ### 4.1 Backend
 
-Colors mark layers: blue = API, pink = service, green = pipeline, orange = LLM, purple = data.
+Colors mark layers: blue = API, teal = eval, pink = service, green = pipeline, orange = LLM, purple = data.
 
 ```mermaid
 classDiagram
@@ -154,7 +155,16 @@ classDiagram
         translate_page()
     }
     class PageDetail:::api
+    class EvalHarness:::eval {
+        run_eval()
+    }
+    class EvalOutputs:::eval {
+        manifest.json
+        segments.jsonl
+        scores.json
+    }
     class Runs:::service {
+        validate_page()
         translate_page()
     }
     class Baseline:::pipeline {
@@ -177,6 +187,7 @@ classDiagram
     class Segment:::data
     class Store:::data {
         find_page()
+        get_run()
         start_run()
         finish_run()
     }
@@ -194,6 +205,9 @@ classDiagram
     PagesRouter ..> PageDetail : returns
     PagesRouter ..> Runs : translate
     PagesRouter ..> Store : reads
+    EvalHarness ..> Runs : validate, translate
+    EvalHarness ..> Store : reads Runs, Translations
+    EvalHarness ..> EvalOutputs : writes
     Runs ..> Store : Runs, Translations
     Runs ..> Baseline : run_baseline
     Runs ..> Page : builds
@@ -209,6 +223,7 @@ classDiagram
     Importer ..> SQLite : fills
 
     classDef api fill:#e8f0fe,stroke:#4a78d0,color:#222
+    classDef eval fill:#e0f4f4,stroke:#2a9d9d,color:#222
     classDef service fill:#fde8f1,stroke:#c4527f,color:#222
     classDef pipeline fill:#e6f4ea,stroke:#3a9d5d,color:#222
     classDef llm fill:#fff4e0,stroke:#d08a2a,color:#222
@@ -216,7 +231,8 @@ classDiagram
 ```
 
 - `PagesRouter` only parses parameters, maps errors to status codes and shapes responses; it has no SQL. "Translate a page and record a Run" lives in `Runs.translate_page`, and the SQL lives in `Store`.
-- `Runs.translate_page` does not depend on HTTP, so the eval harness can call it directly (OUTLINE §1.3, Same code path). An invalid page raises `PageNotFound` and similar errors, which the router maps to 404 / 422; a failed model call is not an exception but a `failed` Run.
+- `Runs.translate_page` does not depend on HTTP, so the eval harness calls it directly (OUTLINE §1.3, Same code path). An invalid page raises `PageNotFound` or another `TranslateError` before any Run exists, which the router maps to 404 / 422. A failed model call or unparseable output is not an exception but a `failed` Run (502). An unexpected exception after the Run row exists marks that Run failed and is raised as `RunCrashed` with its `run_id` (500).
+- `EvalHarness` (`evaluation/harness.py`; CLI `eval/run.py`) calls `validate_page` for every page before the first model call, then `translate_page` page by page, and scores the stored Translations against references converted with OpenCC `t2s`. It writes `EvalOutputs` to `runs/eval/<id>/`; `scores.json` reports scored and failed Runs' cost separately, and any unknown cost makes a total `null`.
 - `PagesRouter` gets the SQLite connection, the dataset path and the `LLMClient` factory through FastAPI's `Depends` (`get_db`, `get_dataset_root`, `get_client_factory`). Tests swap them for a temporary DB and a fake `LLMClient`, so tests never make real requests.
 - `Runs` receives an `LLMClient` factory, not a client: every Run builds its own `LLMClient` and `Meter`, so each Run's usage is its own.
 - `Baseline` touches neither HTTP nor SQLite.
@@ -263,9 +279,10 @@ classDiagram
 | Segment | `segments` | `Segment` | `SegmentOut` / `Segment` |
 | Run | `runs` | No class of its own: `Runs.translate_page` writes the row through `Store.start_run` / `finish_run`, using `Meter.summary()` and `BaselineResult` | `RunOut` / `Run` |
 | Translation | `translations` | `BaselineResult.translations` | `Segment.text_zh_hans` |
+| Manifest | none (`runs/eval/<id>/manifest.json`) | written by `run_eval` | none |
 
 ### 4.4 Where later milestones plug in
 
-- **M2:** an Orchestrator and the Translator Agent (a tool loop; directories `orchestrator/` and `agents/` in OUTLINE §6) join `Baseline`. `LLMClient`, `Meter` and `PageBudget` stay as they are, and every agent call goes through them; `Runs.translate_page` picks Baseline or the Orchestrator by `config`.
+- **M2:** an Orchestrator and the Translator Agent (a tool loop; directories `orchestrator/` and `agents/` in OUTLINE §6) join `Baseline`. `LLMClient`, `Meter` and `PageBudget` stay as they are, and every agent call goes through them; `Runs.translate_page` picks Baseline or the Orchestrator by `config`, and `EvalHarness` accepts each config as it arrives (`CONFIGS` in `evaluation/harness.py`).
 - **M3:** the `KB` (Glossary, Character Profiles, Proposal Queue) and the Reviewer / Curator Agents; `runs.config` gains `full` and `full_no_kb`.
 - **M7:** the frontend adds a canvas and editing to `PageView`, plus SSE, which adds an event subscription to the `api` module.
