@@ -62,7 +62,8 @@ def run_eval(
     """Translate the pages one after another, score the succeeded ones, and write the outputs.
 
     Raises `EvalAborted` before any model call when a page does not exist or its image is missing. A page
-    without text regions is skipped. A failed Run is listed under `failed_pages` and left out of the scores.
+    without text regions is skipped. A failed or crashed Run is listed under `failed_pages` and left out of
+    the scores; its cost is reported apart, under `cost.failed_runs`.
     """
     if config not in CONFIGS:
         raise ValueError(f"unknown config {config!r}; expected one of {CONFIGS}")
@@ -92,31 +93,36 @@ def run_eval(
     segment_lines: list[dict] = []
     run_rows: list[sqlite3.Row] = []  # every Run that was started and recorded, failed ones included
     scored_runs: list[sqlite3.Row] = []
+    failed_runs: list[sqlite3.Row] = []  # failed or crashed; they cost money even though they are not scored
     for page_index in to_translate:
         log(f"translating {book}/{page_index} ...")
         start = time.monotonic()
+        outcome = None
         try:
             outcome = runs.translate_page(
                 conn, book, page_index, make_client=make_client, dataset_root=dataset_root, **params
             )
         except LLMNotConfigured:
             raise  # raised before any Run exists, and it would be the same for every page
-        except Exception as e:  # translate_page already marked the Run failed; keep the other pages
-            failed.append({"book": book, "page_index": page_index, "run_id": None,
-                           "error": f"{type(e).__name__}: {e}", "latency_s": round(time.monotonic() - start, 3),
-                           "cost_usd": None})
-            page_entries[page_index] = {"book": book, "page_index": page_index, "status": "failed", "run_id": None}
-            continue
+        except runs.RunCrashed as e:  # the Run exists and is marked failed; keep the other pages
+            run_id, error = e.run_id, e.error
+        except Exception as e:  # no Run exists: translate_page marks every Run it starts; keep the other pages
+            run_id, error = None, f"{type(e).__name__}: {e}"
+        else:
+            run_id, error = outcome.run_id, outcome.result.error
         latency = time.monotonic() - start
-        run = store.get_run(conn, outcome.run_id)
-        run_rows.append(run)
-        cost = run_cost(run["cost_usd"], run["unknown_usage_calls"])
-        status = "scored" if outcome.result.ok else "failed"
-        page_entries[page_index] = {"book": book, "page_index": page_index, "status": status,
-                                    "run_id": outcome.run_id}
-        if not outcome.result.ok:
-            failed.append({"book": book, "page_index": page_index, "run_id": outcome.run_id,
-                           "error": outcome.result.error, "latency_s": round(latency, 3), "cost_usd": cost})
+        run = None if run_id is None else store.get_run(conn, run_id)
+        if run is not None:
+            run_rows.append(run)
+        cost = None if run is None else run_cost(run["cost_usd"], run["unknown_usage_calls"])
+        ok = outcome is not None and outcome.result.ok
+        page_entries[page_index] = {"book": book, "page_index": page_index,
+                                    "status": "scored" if ok else "failed", "run_id": run_id}
+        if not ok:
+            failed.append({"book": book, "page_index": page_index, "run_id": run_id, "error": error,
+                           "latency_s": round(latency, 3), "cost_usd": cost})
+            if run is not None:
+                failed_runs.append(run)
             continue
         page_row = store.find_page(conn, book, page_index)
         rows = store.segments_with_translations(conn, page_row["id"], outcome.run_id)
@@ -143,7 +149,8 @@ def run_eval(
         "segments_scored": len(segment_lines),
         "chrf": {"score": corpus.chrf, "signature": corpus.chrf_signature},
         "bleu": {"score": corpus.bleu, "signature": corpus.bleu_signature},
-        "cost": cost_summary([(r["cost_usd"], r["unknown_usage_calls"]) for r in scored_runs]),
+        "cost": cost_summary([(r["cost_usd"], r["unknown_usage_calls"]) for r in scored_runs])
+        | {"failed_runs": cost_summary([(r["cost_usd"], r["unknown_usage_calls"]) for r in failed_runs])},
         "latency": latency_summary([s["latency_s"] for s in scored]),
         "pages": scored,
         "failed_pages": failed,

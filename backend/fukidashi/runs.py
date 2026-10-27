@@ -34,6 +34,19 @@ class ImageMissing(TranslateError):
     pass
 
 
+class RunCrashed(RuntimeError):
+    """An unexpected exception after the Run row existed. The Run is marked failed; `run_id` says which.
+
+    Not a `TranslateError`: those mean no Run was recorded. The message is the error stored on the Run, and
+    the original exception is the `__cause__`.
+    """
+
+    def __init__(self, run_id: int, error: str):
+        super().__init__(error)
+        self.run_id = run_id
+        self.error = error
+
+
 @dataclass(frozen=True)
 class Outcome:
     run_id: int
@@ -79,7 +92,8 @@ def translate_page(
     `make_client` is a factory so that every Run gets its own client and Meter, and its usage is its own.
     It is called after the page is validated and before the Run row exists, so a client that cannot be
     built (missing .env) leaves no Run behind. A failed model call or unparseable output is not an
-    exception: it is a failed Run, reported in `Outcome.result`.
+    exception: it is a failed Run, reported in `Outcome.result`. Once the Run row exists, any other exception
+    marks that Run failed and is raised as `RunCrashed`, so no Run is left `running`.
     """
     valid = validate_page(conn, book_title, page_index, dataset_root)
     page_row = valid.row
@@ -107,9 +121,11 @@ def translate_page(
         result = baseline.run_baseline(
             page, client, PageBudget(page.page_id, page_budget), max_tokens=max_tokens
         )
+        by_segment = (None if result.translations is None
+                      else {segment_ids[i]: t for i, t in result.translations.items()})
+        finish(by_segment, result.error, result.attempts)
     except Exception as e:  # unexpected: don't leave the run 'running'
-        finish(None, f"{type(e).__name__}: {e}", [])
-        raise
-    by_segment = None if result.translations is None else {segment_ids[i]: t for i, t in result.translations.items()}
-    finish(by_segment, result.error, result.attempts)
+        error = f"{type(e).__name__}: {e}"
+        finish(None, error, [])
+        raise RunCrashed(run_id, error) from e
     return Outcome(run_id, result)

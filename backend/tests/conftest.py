@@ -67,6 +67,29 @@ class FakeClient:
         return LLMResult(text=self.replies.pop(0), finish_reason="stop", record=rec)
 
 
+@dataclass
+class UsageClient(FakeClient):
+    """Like FakeClient, but each call reports the usage listed in `usages` (None: the provider sent none)."""
+
+    usages: list[Usage | None] = field(default_factory=list)
+
+    def chat(self, messages, *, budget, max_tokens=4096, json_output=False):
+        usage = self.usages.pop(0)
+        rec = CallRecord(budget.page_id, "fake-model", "fake-model-1", usage, 0.01,
+                         None if usage is None else 0.0001)
+        self.meter.record(rec)
+        budget.charge(usage)
+        return LLMResult(text=self.replies.pop(0), finish_reason="stop", record=rec)
+
+
+class CrashAfterCallClient(FakeClient):
+    """Makes one priced call, then raises: a crash that happens after money was spent."""
+
+    def chat(self, messages, **kwargs):
+        super().chat(messages, **kwargs)
+        raise RuntimeError("crashed after the call")
+
+
 @pytest.fixture
 def api(dataset, db_path, conn):
     import_openmantra(conn, dataset)
