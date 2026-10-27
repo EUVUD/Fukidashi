@@ -1,6 +1,6 @@
 # Design Diagrams
 
-> 2026-10-26 · Matches the code after M2's first two tasks: the eval harness v0 and the Run status and cost fixes. Diagrams are Mermaid and render on GitHub.
+> 2026-10-27 · Matches the code after M2's first four tasks: the eval harness v0, the Run status and cost fixes, and provider error handling. Diagrams are Mermaid and render on GitHub.
 > **Solid = implemented; dashed = planned** (milestones in [OUTLINE.md](../OUTLINE.md) §7). Terms follow OUTLINE §0.
 
 Fukidashi translates Japanese manga into Simplified Chinese (zh-Hans). Each page has several Segments (one line of dialogue in one oracle box); the model looks at the whole page image and translates them together, and the user checks the translations against the boxes in the browser.
@@ -115,11 +115,17 @@ sequenceDiagram
     loop up to 2 attempts (retry only if the output is empty, unparseable, or its region ids are not exactly the page's)
         B->>C: chat(messages, budget)
         C->>G: budget.check()
-        C->>M: chat.completions.create
-        M-->>C: content + usage
-        C->>G: meter.record(), budget.charge()
-        C-->>B: LLMResult
-        B->>B: parse_translations()
+        C->>M: chat.completions.create (SDK retries off)
+        alt response
+            M-->>C: content + usage
+            C->>G: meter.record(), budget.charge()
+            C-->>B: LLMResult
+            B->>B: parse_translations()
+        else request raised (timeout, connection error, HTTP error)
+            C->>G: meter.record(usage unknown, error), budget.charge(unknown)
+            C-->>B: ProviderError
+            Note over B: no retry, the error goes on the Run
+        end
     end
     B-->>U: BaselineResult (translations or error)
     U->>D: UPDATE Run (usage, cost, status), INSERT Translations
@@ -138,7 +144,7 @@ sequenceDiagram
 
 ## 4. Object Model
 
-The objects in the code and how they depend on each other (the actual structure after M2's first two tasks).
+The objects in the code and how they depend on each other (the actual structure after M2's first four tasks).
 
 ### 4.1 Backend
 
@@ -177,6 +183,11 @@ classDiagram
     }
     class LLMClient:::llm {
         chat()
+        SDK max_retries=0
+    }
+    class ProviderError:::llm {
+        description
+        status_code
     }
     class LLMConfig:::llm
     class Meter:::llm {
@@ -214,6 +225,8 @@ classDiagram
     Baseline ..> Page : reads
     Baseline ..> LLMClient : chat
     Baseline ..> BaselineResult : returns
+    Baseline ..> ProviderError : catches
+    LLMClient ..> ProviderError : raises
     LLMClient *-- LLMConfig
     LLMClient o-- Meter
     LLMClient ..> PageBudget : check, charge
@@ -235,6 +248,7 @@ classDiagram
 - `EvalHarness` (`evaluation/harness.py`; CLI `eval/run.py`) calls `validate_page` for every page before the first model call, then `translate_page` page by page, and scores the stored Translations against references converted with OpenCC `t2s`. It writes `EvalOutputs` to `runs/eval/<id>/`; `scores.json` reports scored and failed Runs' cost separately, and any unknown cost makes a total `null`.
 - `PagesRouter` gets the SQLite connection, the dataset path and the `LLMClient` factory through FastAPI's `Depends` (`get_db`, `get_dataset_root`, `get_client_factory`). Tests swap them for a temporary DB and a fake `LLMClient`, so tests never make real requests.
 - `Runs` receives an `LLMClient` factory, not a client: every Run builds its own `LLMClient` and `Meter`, so each Run's usage is its own.
+- `llm/` (`LLMClient` and `describe_api_error`) is the only code that imports `openai`. `LLMClient` turns the SDK's automatic retries off, so every request sent is one call in the `Meter`. A request that raises is recorded with unknown usage and an `error`, then leaves `llm/` as `ProviderError`. `Baseline` puts that error on the Run without retrying (OUTLINE §3.6: a request that may have been billed is not resent automatically); it retries only empty or unparseable output.
 - `Baseline` touches neither HTTP nor SQLite.
 
 ### 4.2 Frontend

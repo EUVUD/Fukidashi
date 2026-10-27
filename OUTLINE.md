@@ -1,6 +1,6 @@
 # Fukidashi — Project Outline
 
-> v0.9 · 2026-10-26
+> v0.10 · 2026-10-27
 > **v0.2 (2026-10-22):** evaluation changed from a research-style controlled experiment to a standard evaluation framework plus a baseline comparison (plan B); see §4.
 > **v0.3 (2026-10-22):** M0 decisions recorded in §8: name Fukidashi, ja → zh-Hans, an OpenAI-compatible provider, a $100 budget cap.
 > **v0.4 (2026-10-24):** M1 added the term Run (§0).
@@ -9,6 +9,7 @@
 > **v0.7 (2026-10-24):** §7 marks M1 done.
 > **v0.8 (2026-10-26):** docs translated to English; the README also has a Simplified Chinese version (`README.zh-CN.md`).
 > **v0.9 (2026-10-26):** §8 decides the OpenCC config (`t2s`); §6 moves the eval library into `backend/fukidashi/evaluation/`, leaving the entry point and eval data in `eval/`.
+> **v0.10 (2026-10-27):** §8 records that the provider SDK's automatic retries are off; §3.5 and §3.6 note that a failed request is metered as unknown and is not resent, as implemented in M2.
 > Convention: code, docs, commit messages and reports use the canonical terms in §0.
 
 ---
@@ -186,7 +187,7 @@ Fukidashi is a product, so it is evaluated with general, objective metrics rathe
 
 ### 3.5 Metering & Tracing
 
-- **Metering is ours:** every LLM call records the model ID, input / output / cached tokens and cost. When the provider returns no usage, the call is recorded as **unknown** and counted separately, never as 0. Cost per page comes from this data.
+- **Metering is ours:** every LLM call records the model ID, input / output / cached tokens and cost. When the provider returns no usage, including a request that failed or timed out, the call is recorded as **unknown** and counted separately, never as 0. Cost per page comes from this data.
 - **Tracing uses an off-the-shelf tool:** Langfuse or Arize Phoenix (chosen in M2), replacing custom trace JSONL. One trace per page; agent steps, tool calls and review rounds are spans. Eval results store the trace ID, so a score links straight to its trace.
 - **Choosing:** Phoenix runs locally as one Python process, which is light on an 8 GB Mac. Self-hosting Langfuse needs more components, and Langfuse Cloud sends traces to a third party.
 - The editor's live agent trace (SSE) is a **product feature** and separate from the tracing tool: the first is for users, the second for development and evaluation.
@@ -195,7 +196,7 @@ Fukidashi is a product, so it is evaluated with general, objective metrics rathe
 
 - **The page is the retry unit;** task state is persisted in SQLite.
 - LLM calls have no side effects and are safe to retry; the KB write, which does have side effects, happens once, at finalize, by the Curator.
-- When a result is unknown (for example a timeout that may still have been billed), it is not resent automatically; the user decides.
+- When a result is unknown (for example a timeout that may still have been billed), it is not resent automatically; the user decides. Since M2, `LLMClient` turns off the provider SDK's own retries (§8) and records a failed request as a call with unknown usage, and `baseline` fails the Run instead of resending.
 - SSE events carry an increasing `seq`; after a disconnect the client reconnects with `Last-Event-ID` and the server replays what was missed.
 
 ### 3.7 Vision Pipeline
@@ -394,6 +395,7 @@ fukidashi/
 | Model | M0 | **DeepSeek `deepseek-flash`** (DeepSeek-V4.1-Flash-1017), OpenAI-compatible, base URL `https://api.deepseek.com`. Supports image input and JSON output; thinking is on by default (effort `high`). Per 1M tokens: $0.15 input, $0.60 output off-peak, double at peak; `.env` logs spend at peak prices | Decided (2026-10-24); tool calling to be tested in M2 |
 | API budget cap | M0 | **$100** for the whole project, judge calls included. `runs/usage.jsonl` logs every call; M4 estimates on 3 pages first | Decided (2026-10-22) |
 | OpenCC config | M2 | **`t2s`**: converts characters only and leaves the reference's wording as the translator wrote it. Taiwan and mainland vocabulary differences remain and lower reference-based metrics slightly (§4.9). `tw2sp` was rejected because it rewrites the human translation's wording | Decided (2026-10-26) |
+| Provider SDK retries | M2 | **Off** (`max_retries=0`). By default the `openai` SDK silently resends a request up to twice on connection errors, timeouts, 429 and 5xx; earlier attempts that may have been billed would never reach the Meter, and cost would be a partial sum. Now a 429 or 5xx fails the page and the user reruns it. An explicit retry for 429, which is rejected and not billed, can be added if 429s are common in M4 (`IDEAS.md`) | Decided (2026-10-26) |
 | Tracing tool | M2 | Langfuse or Arize Phoenix; Phoenix suggested (runs locally, lighter) | Open |
 | COMET checkpoint | M4 | Which COMET and xCOMET models, by license and memory | Open |
 | Judge model (GEMBA-MQM) | M5 | A strong model different from the translation model | Open |
