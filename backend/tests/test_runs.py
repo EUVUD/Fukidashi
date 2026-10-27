@@ -360,3 +360,47 @@ def test_a_budget_stop_adds_no_attempt(imported, dataset):
     assert run["error"].startswith("Stopped:")
     (attempt,) = json.loads(run["attempts_json"])  # the one call that returned, nothing for the one not sent
     assert attempt["attempt"] == 1 and "parse_error" in attempt and "error" not in attempt
+
+
+# --- response shapes that used to escape LLMClient unmetered (task 005 Review, finding 1) ------------------------
+
+def good_body(**overrides):
+    body = json.loads(completion(GOOD).content)
+    body.update(overrides)
+    return body
+
+
+def test_choices_that_are_an_object_are_a_failed_run_that_counts_its_call(imported, dataset):
+    handler = lambda request: httpx.Response(200, json=good_body(choices={"a": 1}))  # noqa: E731
+
+    outcome = translate(imported, dataset, mock_llm_client(handler))  # returns: no RunCrashed
+
+    assert not outcome.result.ok
+    run = store.get_run(imported, outcome.run_id)
+    assert (run["status"], run["calls"], run["unknown_usage_calls"]) == ("failed", 1, 0)  # the request was sent
+    assert (run["input_tokens"], run["output_tokens"]) == (100, 20)
+    assert "cannot be read" in run["error"]
+
+
+def test_token_counts_that_are_strings_are_a_succeeded_run_with_unknown_usage(imported, dataset):
+    usage = {"prompt_tokens": "100", "completion_tokens": "20"}
+    handler = lambda request: httpx.Response(200, json=good_body(usage=usage))  # noqa: E731
+
+    outcome = translate(imported, dataset, mock_llm_client(handler))
+
+    assert outcome.result.ok
+    run = store.get_run(imported, outcome.run_id)
+    assert (run["status"], run["calls"], run["unknown_usage_calls"], run["cost_usd"]) == ("succeeded", 1, 1, None)
+    assert (run["input_tokens"], run["output_tokens"]) == (None, None)  # unknown, not 0
+
+
+def test_prompt_token_details_that_are_a_string_are_a_succeeded_run_that_keeps_its_usage(imported, dataset):
+    usage = {"prompt_tokens": 100, "completion_tokens": 20, "prompt_tokens_details": "lots"}
+    handler = lambda request: httpx.Response(200, json=good_body(usage=usage))  # noqa: E731
+
+    outcome = translate(imported, dataset, mock_llm_client(handler))
+
+    assert outcome.result.ok
+    run = store.get_run(imported, outcome.run_id)
+    assert (run["status"], run["calls"], run["unknown_usage_calls"]) == ("succeeded", 1, 0)
+    assert (run["input_tokens"], run["output_tokens"]) == (100, 20) and run["cost_usd"] == pytest.approx(0.00014)

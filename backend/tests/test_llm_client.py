@@ -7,6 +7,7 @@ import openai
 import pytest
 from conftest import completion, mock_llm_client
 
+from fukidashi.llm.client import LLMClient, LLMConfig
 from fukidashi.llm.errors import ProviderError, describe_api_error
 from fukidashi.llm.metering import Meter, PageBudget, Usage
 
@@ -315,3 +316,182 @@ def test_a_response_validation_error_out_of_the_sdk_is_a_provider_error_with_its
     assert raised.value.status_code == 200 and "LLM_BASE_URL" in raised.value.description
     (rec,) = meter.records
     assert raised.value.record is rec and rec.usage is None
+
+
+# --- tools, tool calls and reasoning_content (task 006) ---------------------------------------------------------
+
+WEATHER = {"type": "function", "function": {"name": "weather", "description": "Weather in a city.", "parameters": {
+    "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}
+
+
+def tool_call(call_id="call_1", name="weather", arguments='{"city": "Kyoto"}'):
+    return {"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}
+
+
+def tool_reply(*calls, content=None, finish_reason="tool_calls", **extra):
+    """A completion whose first choice asks for `calls`; `extra` are more message fields, like reasoning_content."""
+    message = {"role": "assistant", "content": content, "tool_calls": list(calls), **extra}
+    return httpx.Response(200, json=body(choices=[{"index": 0, "finish_reason": finish_reason, "message": message}]))
+
+
+def sent_bodies(handler):
+    """(handler that records the JSON body of each request, the list it records into)."""
+    bodies = []
+
+    def recording(request):
+        bodies.append(json.loads(request.content))
+        return handler(request)
+
+    return recording, bodies
+
+
+def test_tools_reach_the_provider_as_given():
+    recording, bodies = sent_bodies(lambda request: completion("ok"))
+
+    mock_llm_client(recording).chat(MESSAGES, budget=PageBudget("book/001", 10_000), tools=[WEATHER])
+
+    assert bodies[0]["tools"] == [WEATHER]
+
+
+@pytest.mark.parametrize("tools", [None, []], ids=["none", "empty-list"])
+def test_without_tools_no_tools_key_is_sent(tools):
+    recording, bodies = sent_bodies(lambda request: completion("ok"))
+
+    mock_llm_client(recording).chat(MESSAGES, budget=PageBudget("book/001", 10_000), tools=tools)  # [] would be a 400
+
+    assert "tools" not in bodies[0]
+
+
+def test_two_tool_calls_and_reasoning_content_come_back_in_order():
+    first = tool_call("call_a", "weather", '{"city": "Kyoto"}')
+    second = tool_call("call_b", "weather", '{ "city" : "Osaka" ')  # not valid JSON: handed over as the model sent it
+    client = mock_llm_client(lambda request: tool_reply(first, second, reasoning_content="needs the weather"))
+
+    reply = client.chat(MESSAGES, budget=PageBudget("book/001", 10_000), tools=[WEATHER])
+
+    assert [(c.id, c.name, c.arguments) for c in reply.tool_calls] == [
+        ("call_a", "weather", '{"city": "Kyoto"}'), ("call_b", "weather", '{ "city" : "Osaka" ')]
+    assert (reply.reasoning_content, reply.text, reply.finish_reason) == ("needs the weather", "", "tool_calls")
+
+
+def test_a_reply_without_tool_calls_or_reasoning_has_empty_ones():
+    reply = mock_llm_client(lambda request: completion("你好")).chat(MESSAGES, budget=PageBudget("book/001", 10_000))
+
+    assert (reply.tool_calls, reply.reasoning_content) == ([], None)
+
+
+# --- responses the client reads wrongly: one call, the right error or a reply (task 005 Review, finding 1) ----------
+
+def test_choices_that_are_an_object_are_one_call_and_a_provider_error():
+    meter = Meter()
+    client = mock_llm_client(lambda request: httpx.Response(200, json=body(choices={"a": 1})), meter=meter)
+
+    with pytest.raises(ProviderError, match="first choice that cannot be read") as raised:
+        client.chat(MESSAGES, budget=PageBudget("book/001", 10_000))  # was a KeyError, with no call recorded
+
+    (rec,) = meter.records
+    assert raised.value.record is rec and rec.usage == Usage(100, 20, None)
+
+
+@pytest.mark.parametrize("usage", [{"prompt_tokens": "100", "completion_tokens": "20"},
+                                   {"prompt_tokens": [100], "completion_tokens": {"n": 20}},
+                                   {"prompt_tokens": True, "completion_tokens": 20},
+                                   {"prompt_tokens": 100.5, "completion_tokens": 20},
+                                   {"prompt_tokens": -1, "completion_tokens": 20}],
+                         ids=["strings", "containers", "bool", "float", "negative"])
+def test_token_counts_that_are_not_integers_are_unknown_and_the_reply_is_used(usage):
+    meter = Meter()
+    budget = PageBudget("book/001", 10_000)
+    client = mock_llm_client(lambda request: httpx.Response(200, json=body(usage=usage)), meter=meter)
+
+    reply = client.chat(MESSAGES, budget=budget)  # was a TypeError in the cost, with no call recorded
+
+    assert reply.text == "ok"
+    (rec,) = meter.records
+    assert (rec.usage, rec.cost_usd, rec.error) == (None, None, None)
+    assert (budget.unknown_calls, budget.used_tokens) == (1, 0)
+
+
+@pytest.mark.parametrize("details, cached", [("lots", None), ([1], None), ({"cached_tokens": [256]}, None),
+                                             ({"cached_tokens": 256}, 256), (None, None)],
+                         ids=["string", "list", "list-count", "integer-count", "null"])
+def test_cached_tokens_that_cannot_be_read_are_none_and_the_usage_is_kept(details, cached):
+    usage = {"prompt_tokens": 100, "completion_tokens": 20, "prompt_tokens_details": details}
+    meter = Meter()
+    client = mock_llm_client(lambda request: httpx.Response(200, json=body(usage=usage)), meter=meter)
+
+    reply = client.chat(MESSAGES, budget=PageBudget("book/001", 10_000))  # was an AttributeError, with no call recorded
+
+    assert reply.text == "ok"
+    (rec,) = meter.records
+    assert rec.usage == Usage(100, 20, cached) and rec.cost_usd == pytest.approx(0.00014) and rec.error is None
+
+
+@pytest.mark.parametrize(
+    "bad_call",
+    [{"id": "call_1", "type": "function", "function": {"arguments": "{}"}},
+     {"id": "call_1", "type": "function", "function": {"name": "", "arguments": "{}"}},
+     {"id": "call_1", "type": "function"},
+     {"type": "function", "function": {"name": "weather", "arguments": "{}"}},
+     {"id": "call_1", "type": "function", "function": {"name": "weather", "arguments": {"city": "Kyoto"}}},
+     "weather"],
+    ids=["no-function-name", "empty-function-name", "no-function", "no-id", "arguments-not-a-string", "not-an-object"],
+)
+def test_a_tool_call_that_cannot_be_read_is_one_call_that_keeps_its_usage(bad_call):
+    meter = Meter()
+    budget = PageBudget("book/001", 10_000)
+    client = mock_llm_client(lambda request: tool_reply(tool_call(), bad_call), meter=meter)
+
+    with pytest.raises(ProviderError, match="mock-model returned a tool call that cannot be read") as raised:
+        client.chat(MESSAGES, budget=budget, tools=[WEATHER])
+
+    (rec,) = meter.records
+    assert raised.value.record is rec and rec.error == raised.value.description
+    assert rec.usage == Usage(100, 20, None)  # billed, and known
+    assert (budget.used_tokens, budget.unknown_calls) == (120, 0)
+
+
+def test_tool_calls_that_are_not_a_list_are_one_call_and_a_provider_error():
+    meter = Meter()
+    reply = httpx.Response(200, json=body(choices=first_choice({"role": "assistant", "content": None, "tool_calls": "x"})))
+
+    with pytest.raises(ProviderError, match="tool call that cannot be read"):
+        mock_llm_client(lambda request: reply, meter=meter).chat(MESSAGES, budget=PageBudget("book/001", 10_000))
+
+    assert len(meter.records) == 1
+
+
+# --- the call's error and the exception's description are one redacted string (task 005 Review, finding 4) ---------
+
+def key_in_the_model_name(handler, meter):
+    """A client whose model name contains the API key, so that the message of an unreadable response does too."""
+    config = LLMConfig("http://provider.test/v1", KEY, f"model-{KEY}")
+    return LLMClient(config, meter, http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+
+
+def reply_with(**overrides):
+    return lambda request: httpx.Response(200, json=body(**overrides))
+
+
+FAILURE_PATHS = [
+    pytest.param(refuse, id="connection-error"),
+    pytest.param(upstream_500, id="http-500"),
+    pytest.param(html_page, id="html-body"),
+    pytest.param(not_json, id="invalid-json-body"),
+    pytest.param(lambda request: completion(choices=False), id="no-choices"),
+    pytest.param(reply_with(choices=first_choice(None)), id="unreadable-choice"),
+    pytest.param(reply_with(choices="text"), id="unreadable-choices"),
+    pytest.param(lambda request: tool_reply({"id": "c"}), id="unreadable-tool-call"),
+]
+
+
+@pytest.mark.parametrize("handler", FAILURE_PATHS)
+def test_the_call_error_is_the_provider_error_description_in_every_failure_path(handler):
+    meter = Meter()
+
+    with pytest.raises(ProviderError) as raised:
+        key_in_the_model_name(handler, meter).chat(MESSAGES, budget=PageBudget("book/001", 10_000))
+
+    (rec,) = meter.records
+    assert rec.error == raised.value.description and raised.value.record is rec
+    assert KEY not in rec.error  # the same string, and redacted
