@@ -54,9 +54,10 @@ def test_cost_is_none_for_a_single_call_without_usage():
     assert meter.summary()["cost_usd"] is None
 
 
-def test_cost_is_none_when_there_are_no_calls():
+def test_cost_is_zero_when_there_are_no_calls():
     s = Meter().summary()
-    assert (s["calls"], s["unknown_usage_calls"], s["cost_usd"]) == (0, 0, None)
+    assert (s["calls"], s["unknown_usage_calls"], s["cost_usd"]) == (0, 0, 0.0)  # nothing was spent
+    assert isinstance(s["cost_usd"], float)
 
 
 def test_cost_is_the_sum_when_every_call_has_usage_and_a_price():

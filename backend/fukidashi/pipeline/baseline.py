@@ -107,6 +107,7 @@ def run_baseline(
                                 "record": asdict(reply.record)})
         try:
             result.translations = parse_translations(reply.text, ids)
+            result.error = None  # the first attempt's parse error stays in `attempts`, not on a good Run
             return result
         except (ValueError, KeyError, TypeError) as e:
             result.attempts[-1]["parse_error"] = str(e)

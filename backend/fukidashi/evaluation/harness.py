@@ -104,9 +104,9 @@ def run_eval(
             )
         except LLMNotConfigured:
             raise  # raised before any Run exists, and it would be the same for every page
-        except runs.RunCrashed as e:  # the Run exists and is marked failed; keep the other pages
+        except runs.RunCrashed as e:  # the Run exists: failed, or still running if the database failed too
             run_id, error = e.run_id, e.error
-        except Exception as e:  # no Run exists: translate_page marks every Run it starts; keep the other pages
+        except Exception as e:  # no Run row exists yet (make_client or start_run raised); keep the other pages
             run_id, error = None, f"{type(e).__name__}: {e}"
         else:
             run_id, error = outcome.run_id, outcome.result.error
@@ -223,5 +223,11 @@ def format_summary(result: EvalResult) -> str:
     for p in s["skipped_pages"]:
         lines.append(f"skipped {p['book']}/{p['page_index']}: {p['reason']}")
     for p in s["failed_pages"]:
-        lines.append(f"FAILED  {p['book']}/{p['page_index']} (run {p['run_id']}): {p['error']}")
+        run = "no Run" if p["run_id"] is None else f"run {p['run_id']}"
+        lines.append(f"FAILED  {p['book']}/{p['page_index']} ({run}): {p['error']}")
+    if s["failed_pages"]:
+        failed = cost["failed_runs"]
+        lines.append(f"failed runs cost  total ${num(failed['total_usd'], '.6f')}"
+                     f" (unknown-cost runs {failed['unknown_cost_runs']},"
+                     f" unknown_usage_calls {failed['unknown_usage_calls']})")
     return "\n".join(lines)

@@ -105,6 +105,29 @@ def test_a_bad_region_id_twice_is_a_failed_run_that_names_the_id(imported, datas
     assert imported.execute("SELECT COUNT(*) FROM runs WHERE status = 'running'").fetchone()[0] == 0
 
 
+@pytest.mark.parametrize("bad", ["not json", UNKNOWN_ID, DUPLICATE_ID], ids=["not-json", "unknown-id", "duplicate-id"])
+def test_a_run_that_succeeds_on_its_retry_stores_no_error(imported, dataset, bad):
+    outcome = translate(imported, dataset, FakeClient([bad, GOOD]))
+
+    assert outcome.result.ok and outcome.result.error is None
+    run = store.get_run(imported, outcome.run_id)
+    assert (run["status"], run["error"], run["calls"]) == ("succeeded", None, 2)
+    first, second = json.loads(run["attempts_json"])
+    assert first["parse_error"]  # the first attempt's parse error stays in the attempts
+    assert "parse_error" not in second
+
+
+def test_two_bad_replies_are_still_a_failed_run_with_the_error_of_the_last_attempt(imported, dataset):
+    outcome = translate(imported, dataset, FakeClient(["not json", UNKNOWN_ID]))
+
+    run = store.get_run(imported, outcome.run_id)
+    assert (run["status"], run["calls"]) == ("failed", 2)
+    assert run["error"].startswith("Could not parse the model response after 2 attempt(s)")
+    assert "region ids not on the page [7]" in run["error"]
+    first, second = json.loads(run["attempts_json"])
+    assert "no JSON object" in first["parse_error"] and "[7]" in second["parse_error"]
+
+
 def test_an_unexpected_exception_raises_run_crashed_with_the_run_id(imported, dataset):
     with pytest.raises(runs.RunCrashed) as crashed:
         translate(imported, dataset, ExplodingClient([]))
@@ -157,3 +180,31 @@ def test_a_failure_while_finishing_the_run_still_marks_it_failed(imported, datas
     (run,) = run_rows(imported)
     assert (run["status"], run["error"]) == ("failed", "RuntimeError: database is locked")
     assert imported.execute("SELECT COUNT(*) FROM translations").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "client, original",
+    [(ExplodingClient([]), "provider exploded"), (FakeClient([GOOD]), "write 1 failed")],
+    ids=["client-raises", "saving-the-result-raises"],
+)
+def test_run_crashed_still_carries_the_run_id_when_the_recovery_write_fails_too(imported, dataset, monkeypatch, client, original):
+    writes = []
+
+    def broken_finish_run(*args, **kwargs):
+        writes.append(kwargs["error"])
+        raise RuntimeError(f"write {len(writes)} failed")
+
+    monkeypatch.setattr(store, "finish_run", broken_finish_run)
+
+    with pytest.raises(runs.RunCrashed) as crashed:
+        translate(imported, dataset, client)
+
+    (run,) = run_rows(imported)
+    assert crashed.value.run_id == run["id"]
+    assert run["status"] == "running"  # nothing could be written: the Run is left as it was
+    assert isinstance(crashed.value.__cause__, RuntimeError) and str(crashed.value.__cause__) == original
+    message = str(crashed.value)
+    assert original in message and "marking the Run failed also failed" in message
+    assert f"write {len(writes)} failed" in message  # the recovery write's own error
+    assert crashed.value.error == message
+    assert not isinstance(crashed.value, runs.TranslateError)

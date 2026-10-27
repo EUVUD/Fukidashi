@@ -38,7 +38,8 @@ class RunCrashed(RuntimeError):
     """An unexpected exception after the Run row existed. The Run is marked failed; `run_id` says which.
 
     Not a `TranslateError`: those mean no Run was recorded. The message is the error stored on the Run, and
-    the original exception is the `__cause__`.
+    the original exception is the `__cause__`. When the write that marks the Run failed raised too, the Run
+    stays `running`, nothing was stored, and the message says so.
     """
 
     def __init__(self, run_id: int, error: str):
@@ -93,7 +94,9 @@ def translate_page(
     It is called after the page is validated and before the Run row exists, so a client that cannot be
     built (missing .env) leaves no Run behind. A failed model call or unparseable output is not an
     exception: it is a failed Run, reported in `Outcome.result`. Once the Run row exists, any other exception
-    marks that Run failed and is raised as `RunCrashed`, so no Run is left `running`.
+    marks that Run failed and is raised as `RunCrashed`. The one case that leaves a Run `running` is a
+    database that fails the write marking it failed too: `RunCrashed` is still raised, with the `run_id`
+    and a message that says the Run was not marked.
     """
     valid = validate_page(conn, book_title, page_index, dataset_root)
     page_row = valid.row
@@ -126,6 +129,11 @@ def translate_page(
         finish(by_segment, result.error, result.attempts)
     except Exception as e:  # unexpected: don't leave the run 'running'
         error = f"{type(e).__name__}: {e}"
-        finish(None, error, [])
+        try:
+            finish(None, error, [])
+        except Exception as recovery:  # the database is failing: the Run stays 'running', the caller still gets its id
+            raise RunCrashed(
+                run_id, f"{error} (marking the Run failed also failed: {type(recovery).__name__}: {recovery})"
+            ) from e
         raise RunCrashed(run_id, error) from e
     return Outcome(run_id, result)
