@@ -1,6 +1,6 @@
 # Fukidashi — Project Outline
 
-> v0.8 · 2026-10-26
+> v0.9 · 2026-10-26
 > **v0.2 (2026-10-22):** evaluation changed from a research-style controlled experiment to a standard evaluation framework plus a baseline comparison (plan B); see §4.
 > **v0.3 (2026-10-22):** M0 decisions recorded in §8: name Fukidashi, ja → zh-Hans, an OpenAI-compatible provider, a $100 budget cap.
 > **v0.4 (2026-10-24):** M1 added the term Run (§0).
@@ -8,6 +8,7 @@
 > **v0.6 (2026-10-24):** §6 updated to the actual M1 layout: Python package `fukidashi`, plus `runs.py`, `store.py`, `pipeline/`.
 > **v0.7 (2026-10-24):** §7 marks M1 done.
 > **v0.8 (2026-10-26):** docs translated to English; the README also has a Simplified Chinese version (`README.zh-CN.md`).
+> **v0.9 (2026-10-26):** §8 decides the OpenCC config (`t2s`); §6 moves the eval library into `backend/fukidashi/evaluation/`, leaving the entry point and eval data in `eval/`.
 > Convention: code, docs, commit messages and reports use the canonical terms in §0.
 
 ---
@@ -219,7 +220,7 @@ Every vision component is a swappable **adapter**.
 ### 4.1 Data
 
 - **OpenMantra:** Japanese source text with professional English and Chinese translations and bounding boxes; **CC BY-NC 4.0**. Fields and statistics in `docs/openmantra.md`.
-- **The references are zh-Hant:** before evaluation, OpenCC converts `text_zh` to zh-Hans, and the gold glossary is built from the converted references. The OpenCC config (`t2s` or `tw2sp`) is chosen in M2.
+- **The references are zh-Hant:** before evaluation, OpenCC converts `text_zh` to zh-Hans, and the gold glossary is built from the converted references. The OpenCC config is `t2s` (§8).
 - Split by book: **dev = 2 books** (for tuning prompts and tools), **test = 3 books** (run once, after the freeze).
 - Metrics are computed per segment; the paired bootstrap resamples pages.
 - The public repository holds no OpenMantra images, only eval scripts, the gold glossary and attribution.
@@ -333,19 +334,19 @@ fukidashi/
 │   │   ├── kb/            # Glossary, Character Profiles, Proposal Queue
 │   │   ├── llm/           # client, metering, token budget
 │   │   ├── vision/        # detector / ocr / inpainter / typesetter adapters
+│   │   ├── evaluation/    # eval library, importable by tests: OpenCC references, metrics (sacreBLEU, later COMET, GEMBA-MQM, term accuracy), manifest, bootstrap
 │   │   └── tracing/       # Langfuse / Phoenix integration
 │   └── tests/             # focused on KB write permissions and orchestration
 ├── frontend/              # React + react-konva editor
-├── eval/
-│   ├── run.py             # eval harness entry point
+├── eval/                  # entry point and eval data; the logic lives in backend/fukidashi/evaluation/
+│   ├── run.py             # eval harness entry point (CLI)
 │   ├── configs/           # baseline.yaml, full.yaml, full_no_kb.yaml
-│   ├── metrics/           # sacrebleu, comet, gemba_mqm, term_accuracy
 │   ├── gold_glossary/
 │   ├── mqm_human/         # human MQM annotation of about 30 segments
-│   ├── analysis/          # bootstrap, MQM error breakdown, plots
+│   ├── analysis/          # MQM error breakdown tables, plots
 │   └── PROTOCOL.md        # one-page eval protocol, written before the freeze
 ├── mcp/                   # lookup_term MCP server
-├── runs/                  # run outputs and the usage.jsonl cost ledger (gitignored)
+├── runs/                  # Run outputs, eval outputs (runs/eval/) and the usage.jsonl cost ledger (gitignored)
 └── data/                  # OpenMantra (gitignored)
 ```
 
@@ -392,6 +393,7 @@ fukidashi/
 | Translation direction | M0 | **ja → zh-Hans.** OpenMantra's references are zh-Hant and are converted to Simplified Chinese with OpenCC before evaluation; the demo is in Simplified Chinese | Decided (2026-10-22) |
 | Model | M0 | **DeepSeek `deepseek-flash`** (DeepSeek-V4.1-Flash-1017), OpenAI-compatible, base URL `https://api.deepseek.com`. Supports image input and JSON output; thinking is on by default (effort `high`). Per 1M tokens: $0.15 input, $0.60 output off-peak, double at peak; `.env` logs spend at peak prices | Decided (2026-10-24); tool calling to be tested in M2 |
 | API budget cap | M0 | **$100** for the whole project, judge calls included. `runs/usage.jsonl` logs every call; M4 estimates on 3 pages first | Decided (2026-10-22) |
+| OpenCC config | M2 | **`t2s`**: converts characters only and leaves the reference's wording as the translator wrote it. Taiwan and mainland vocabulary differences remain and lower reference-based metrics slightly (§4.9). `tw2sp` was rejected because it rewrites the human translation's wording | Decided (2026-10-26) |
 | Tracing tool | M2 | Langfuse or Arize Phoenix; Phoenix suggested (runs locally, lighter) | Open |
 | COMET checkpoint | M4 | Which COMET and xCOMET models, by license and memory | Open |
 | Judge model (GEMBA-MQM) | M5 | A strong model different from the translation model | Open |
