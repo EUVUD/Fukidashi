@@ -1,17 +1,17 @@
 # Design Diagrams
 
-> 2026-10-24 · 对应 M1 完成、并把 Run 的逻辑从 router 抽到 service 层之后的代码。图用 Mermaid 写，GitHub 上直接渲染。
-> **实线 = 已实现；虚线 = 计划中**（里程碑见 [OUTLINE.md](../OUTLINE.md) 第 7 节）。术语沿用 OUTLINE 第 0 节。
+> 2026-10-24 · Matches the code after M1, once Run handling moved from the router into a service layer. Diagrams are Mermaid and render on GitHub.
+> **Solid = implemented; dashed = planned** (milestones in [OUTLINE.md](../OUTLINE.md) §7). Terms follow OUTLINE §0.
 
-Fukidashi 把日文漫画翻成简体中文（zh-Hans）：每一页有若干个 Segment（一个 oracle box 里的一句台词），模型看着整页图片把它们一起翻译，用户在浏览器里对照图上的 box 检查译文。
+Fukidashi translates Japanese manga into Simplified Chinese (zh-Hans). Each page has several Segments (one line of dialogue in one oracle box); the model looks at the whole page image and translates them together, and the user checks the translations against the boxes in the browser.
 
-**怎么读：** 图 1、2 回答「这个系统是什么、用户怎么用它」，一分钟能看完；图 3、4 回答「里面是怎么实现的」，要改代码时再看。
+**How to read this:** diagrams 1 and 2 answer "what is this system and how is it used" in about a minute; diagrams 3 and 4 answer "how is it built", for when you change code.
 
 ---
 
-## 1. Domain Model（领域模型）
+## 1. Domain Model
 
-只画问题领域里的概念和它们的关系，不涉及代码。
+Only the concepts of the problem domain and their relationships; no code.
 
 ```mermaid
 classDiagram
@@ -57,16 +57,16 @@ classDiagram
     classDef planned fill:#f4f4f4,stroke:#999,stroke-dasharray:5 5,color:#777
 ```
 
-- 一页有多个 **Segment**；每次点 Translate 产生一个 **Run**，Run 给每个 Segment 一条 **Translation**。页面显示最新一次成功的 Run。
-- **Reference translations**（OpenMantra 的 zh-Hant 和 en 参考译文）属于 Segment，只用来对照和评测，不进 prompt。
-- `Run.config` 现在只有 `baseline`（整页一次调用，不用 tools 和 KB）；`full`、`full_no_kb` 在 M2–M3 加入。
-- 虚线的 **KnowledgeBase**（M3）和 **ReviewComment**（M3）还没有实现。
+- A page has many **Segments**. Every click on Translate creates a **Run**, and the Run gives each Segment one **Translation**. The page shows its latest successful Run.
+- **Reference translations** (OpenMantra's zh-Hant and en translations) belong to the Segment and are used only for comparison and evaluation, never in a prompt.
+- `Run.config` is only `baseline` for now (one call per page, no tools, no KB); `full` and `full_no_kb` arrive in M2–M3.
+- The dashed **KnowledgeBase** (M3) and **ReviewComment** (M3) do not exist yet.
 
 ---
 
-## 2. System Sequence Diagram（系统顺序图）
+## 2. System Sequence Diagram
 
-把系统当成一个黑盒：用户发出什么请求，系统回什么，中间用到哪个外部系统。
+The system as a black box: what the user asks for, what comes back, and which external system is involved.
 
 ```mermaid
 sequenceDiagram
@@ -89,9 +89,9 @@ sequenceDiagram
 
 ---
 
-## 3. Object Interaction Diagram（对象交互图）
+## 3. Object Interaction Diagram
 
-系统内部：一次 `translate` 请求经过哪些对象，按什么顺序（对应 `api/pages.py` 的 `translate_page` 和 `runs.py` 的 `translate_page`）。
+Inside the system: which objects one `translate` request passes through, and in what order (`translate_page` in `api/pages.py` and `translate_page` in `runs.py`).
 
 ```mermaid
 sequenceDiagram
@@ -135,13 +135,13 @@ sequenceDiagram
 
 ---
 
-## 4. Object Model（对象模型）
+## 4. Object Model
 
-代码里的对象和它们的依赖关系（M1 的实际结构）。
+The objects in the code and how they depend on each other (the actual M1 structure).
 
 ### 4.1 Backend
 
-颜色表示层：蓝 = API，粉 = Service，绿 = Pipeline，橙 = LLM，紫 = Data。
+Colors mark layers: blue = API, pink = service, green = pipeline, orange = LLM, purple = data.
 
 ```mermaid
 classDiagram
@@ -215,11 +215,11 @@ classDiagram
     classDef data fill:#f1e9fb,stroke:#8a5fc4,color:#222
 ```
 
-- `PagesRouter` 只做参数解析、错误码映射和响应整形，里面没有 SQL。「翻译一页并记一个 Run」在 `Runs.translate_page`，SQL 在 `Store`。
-- `Runs.translate_page` 不依赖 HTTP，eval harness 可以直接调它（OUTLINE 第 1.3 节的 Same code path）。页面无效时它抛 `PageNotFound` 等异常，由 router 映射成 404 / 422；模型调用失败不是异常，是一个 `failed` 的 Run。
-- `PagesRouter` 通过 FastAPI 的 `Depends` 拿到 SQLite 连接、数据集路径和 `LLMClient` 的工厂（`get_db`、`get_dataset_root`、`get_client_factory`）。测试里把它们换成临时 DB 和 fake `LLMClient`，所以测试不会发真实请求。
-- 传给 `Runs` 的是 `LLMClient` 的工厂，不是 client：每个 Run 新建一个 `LLMClient` 和 `Meter`，一个 Run 的 usage 只算它自己的。
-- `Baseline` 不碰 HTTP 也不碰 SQLite。
+- `PagesRouter` only parses parameters, maps errors to status codes and shapes responses; it has no SQL. "Translate a page and record a Run" lives in `Runs.translate_page`, and the SQL lives in `Store`.
+- `Runs.translate_page` does not depend on HTTP, so the eval harness can call it directly (OUTLINE §1.3, Same code path). An invalid page raises `PageNotFound` and similar errors, which the router maps to 404 / 422; a failed model call is not an exception but a `failed` Run.
+- `PagesRouter` gets the SQLite connection, the dataset path and the `LLMClient` factory through FastAPI's `Depends` (`get_db`, `get_dataset_root`, `get_client_factory`). Tests swap them for a temporary DB and a fake `LLMClient`, so tests never make real requests.
+- `Runs` receives an `LLMClient` factory, not a client: every Run builds its own `LLMClient` and `Meter`, so each Run's usage is its own.
+- `Baseline` touches neither HTTP nor SQLite.
 
 ### 4.2 Frontend
 
@@ -254,18 +254,18 @@ classDiagram
     api ..> FastAPI : HTTP
 ```
 
-### 4.3 概念 → 表 → 对象
+### 4.3 Concept → table → object
 
 | Domain concept | SQLite table | Backend object | API / frontend type |
 |---|---|---|---|
-| Book | `books` | `book_title`（字符串） | `PageSummary.book_title` |
-| Page | `pages` | `Page` | `PageSummary`、`PageDetail` |
+| Book | `books` | `book_title` (string) | `PageSummary.book_title` |
+| Page | `pages` | `Page` | `PageSummary`, `PageDetail` |
 | Segment | `segments` | `Segment` | `SegmentOut` / `Segment` |
-| Run | `runs` | 没有单独的类：`Runs.translate_page` 用 `Meter.summary()` 和 `BaselineResult`，经 `Store.start_run` / `finish_run` 写这一行 | `RunOut` / `Run` |
+| Run | `runs` | No class of its own: `Runs.translate_page` writes the row through `Store.start_run` / `finish_run`, using `Meter.summary()` and `BaselineResult` | `RunOut` / `Run` |
 | Translation | `translations` | `BaselineResult.translations` | `Segment.text_zh_hans` |
 
-### 4.4 后面的里程碑接在哪里
+### 4.4 Where later milestones plug in
 
-- **M2：** `Baseline` 旁边加 Orchestrator 和 Translator Agent（tool loop，目录见 OUTLINE 第 6 节的 `orchestrator/`、`agents/`）。`LLMClient`、`Meter`、`PageBudget` 不变，Agent 的每次调用照样走它们；`Runs.translate_page` 改成按 `config` 选 Baseline 还是 Orchestrator。
-- **M3：** 加 `KB`（Glossary、Character Profiles、Proposal Queue）和 Reviewer / Curator Agent；`runs.config` 多出 `full` 和 `full_no_kb`。
-- **M7：** Frontend 在 `PageView` 里加 canvas 和编辑功能；加 SSE，`api` 模块多一个订阅 event 的入口。
+- **M2:** an Orchestrator and the Translator Agent (a tool loop; directories `orchestrator/` and `agents/` in OUTLINE §6) join `Baseline`. `LLMClient`, `Meter` and `PageBudget` stay as they are, and every agent call goes through them; `Runs.translate_page` picks Baseline or the Orchestrator by `config`.
+- **M3:** the `KB` (Glossary, Character Profiles, Proposal Queue) and the Reviewer / Curator Agents; `runs.config` gains `full` and `full_no_kb`.
+- **M7:** the frontend adds a canvas and editing to `PageView`, plus SSE, which adds an event subscription to the `api` module.
