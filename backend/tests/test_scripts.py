@@ -185,3 +185,64 @@ def test_the_smoke_script_with_json_output_reports_whether_the_provider_accepted
     assert exited.value.code == 1 and "Stop reason: provider_error" in out
     assert "JSON output together with tools: not accepted (Bad request:" in out
     assert "response_format is not supported with tools" in out
+
+
+def smoke_run(monkeypatch, tmp_path, capsys, *args, json_mode=None):
+    """The smoke script on a mock provider that calls the tool and then answers. Returns (output, saved file, request bodies)."""
+    bodies = []
+    replies = iter([
+        httpx.Response(200, json={"id": "c", "object": "chat.completion", "created": 0, "model": "mock-model-1",
+                                  "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                                      "role": "assistant", "content": None,
+                                      "tool_calls": [{"id": "call_1", "type": "function", "function": {
+                                          "name": "lookup_term", "arguments": '{"term": "カゲミザワ"}'}}]}}],
+                                  "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}}),
+        httpx.Response(200, json={"id": "c", "object": "chat.completion", "created": 0, "model": "mock-model-1",
+                                  "choices": [{"index": 0, "finish_reason": "stop", "message": {
+                                      "role": "assistant", "content": '{"zh": "阴泽前辈"}'}}],
+                                  "usage": {"prompt_tokens": 150, "completion_tokens": 10, "total_tokens": 160}}),
+    ])
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return next(replies)
+
+    monkeypatch.setattr(sys, "argv", ["m2_tool_smoke.py", *args])
+    monkeypatch.setattr(m2, "load_dotenv", lambda path: None)
+    monkeypatch.setattr(m2, "ROOT", tmp_path)
+    monkeypatch.setattr(m2, "LLMClient", lambda config, meter: LLMClient(
+        config, meter, http_client=httpx.Client(transport=httpx.MockTransport(handler))))
+    env = {"LLM_BASE_URL": "http://provider.test/v1", "LLM_API_KEY": "sk-test", "LLM_MODEL": "mock-model"}
+    if json_mode is not None:
+        env["LLM_JSON_MODE"] = json_mode
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    m2.main()
+    (saved,) = (tmp_path / "runs" / "m2").glob("*.json")
+    return capsys.readouterr().out, json.loads(saved.read_text(encoding="utf-8")), bodies
+
+
+def test_the_smoke_script_says_response_format_was_sent_and_accepted(monkeypatch, tmp_path, capsys):
+    out, saved, bodies = smoke_run(monkeypatch, tmp_path, capsys, "--json-output")
+
+    assert all(b["response_format"] == {"type": "json_object"} and b["tools"] for b in bodies)
+    assert "JSON output together with tools: accepted by the provider; response_format was sent" in out
+    assert (saved["json_mode"], saved["response_format_sent"], saved["json_output_with_tools"]) == (
+        "json_object", True, "accepted")
+
+
+def test_the_smoke_script_does_not_call_it_accepted_when_response_format_was_never_sent(monkeypatch, tmp_path, capsys):
+    out, saved, bodies = smoke_run(monkeypatch, tmp_path, capsys, "--json-output", json_mode="none")
+
+    assert bodies and all("response_format" not in b for b in bodies)  # the provider never saw it
+    assert "JSON output together with tools: not tested (LLM_JSON_MODE=none, so response_format was not sent)" in out
+    assert "accepted" not in out.split("JSON output together with tools:")[1].splitlines()[0]
+    assert (saved["json_mode"], saved["response_format_sent"], saved["json_output_with_tools"]) == (
+        "none", False, "not tested")
+
+
+def test_the_smoke_script_without_json_output_sends_no_response_format_and_says_nothing_about_it(monkeypatch, tmp_path, capsys):
+    out, saved, bodies = smoke_run(monkeypatch, tmp_path, capsys)
+
+    assert all("response_format" not in b for b in bodies) and "JSON output together" not in out
+    assert (saved["response_format_sent"], saved["json_output_with_tools"]) == (False, None)

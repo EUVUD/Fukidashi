@@ -30,9 +30,19 @@ def list_page_summaries(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     ).fetchall()
 
 
-def latest_succeeded_run(conn: sqlite3.Connection, page_id: int) -> sqlite3.Row | None:
+def earlier_pages(conn: sqlite3.Connection, book_title: str, page_index: int, count: int) -> list[sqlite3.Row]:
+    """The pages of the book numbered `page_index - count` .. `page_index - 1` that exist, oldest first."""
     return conn.execute(
-        "SELECT * FROM runs WHERE page_id = ? AND status = 'succeeded' ORDER BY id DESC LIMIT 1", (page_id,)
+        "SELECT * FROM pages WHERE book_title = ? AND page_index >= ? AND page_index < ? ORDER BY page_index",
+        (book_title, page_index - count, page_index),
+    ).fetchall()
+
+
+def latest_succeeded_run(conn: sqlite3.Connection, page_id: int, config: str | None = None) -> sqlite3.Row | None:
+    """The page's latest succeeded Run, of any config, or of `config` when given."""
+    return conn.execute(
+        "SELECT * FROM runs WHERE page_id = ? AND status = 'succeeded' AND (? IS NULL OR config = ?)"
+        " ORDER BY id DESC LIMIT 1", (page_id, config, config)
     ).fetchone()
 
 
@@ -66,7 +76,7 @@ def finish_run(
     error: str | None,
     response_models: list[str],
     usage: dict,  # Meter.summary()
-    attempts: list[dict],
+    attempts: list[dict] | dict,  # baseline: one dict per call; translator: one record of the agent, repair, fallback
     translations: dict[int, str] | None,  # segment row id -> zh-Hans; None means the run failed
 ) -> None:
     # tokens are summed over calls with known usage; with none known they stay NULL rather than 0

@@ -9,6 +9,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from fukidashi.agents.loop import TRACING_VARIABLES
 from fukidashi.api.deps import get_client_factory, get_dataset_root, get_db
 from fukidashi.datasets.importer import import_openmantra
 from fukidashi.db import connect, init_db
@@ -21,6 +22,13 @@ SEGMENTS = [
     {"x": 10, "y": 20, "w": 30, "h": 40, "text_ja": "こんにちは", "text_en": "REF-EN-0", "text_zh": "REF-ZH-0"},
     {"x": 50, "y": 60, "w": 70, "h": 80, "text_ja": "さようなら", "text_en": "REF-EN-1", "text_zh": "REF-ZH-1"},
 ]
+
+
+@pytest.fixture(autouse=True)
+def no_tracing(monkeypatch):
+    """The agent loop refuses to run with LangSmith tracing on; a shell that has it set must not fail the suite."""
+    for name in TRACING_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture
