@@ -313,6 +313,7 @@ Every quality metric in both comparisons gets a paired bootstrap 95% CI. Primary
 fukidashi/
 ├── README.md              # English README, including AI vs human authorship and how code is reviewed
 ├── README.zh-CN.md        # Simplified Chinese README, kept in sync with README.md
+├── LICENSE                # MIT, code only; OpenMantra stays CC BY-NC 4.0
 ├── SCOPE.md
 ├── OUTLINE.md             # this file
 ├── IDEAS.md               # ideas that come up outside a checkpoint
