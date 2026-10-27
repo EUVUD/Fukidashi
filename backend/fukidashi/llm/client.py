@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import openai
 from openai.types import CompletionUsage
+from openai.types.chat import ChatCompletion
 
 from .errors import ProviderError, describe_api_error
 from .metering import CallRecord, Meter, PageBudget, Usage
@@ -91,41 +93,60 @@ class LLMClient:
             resp = self._client.chat.completions.create(**kwargs)
         except Exception as e:
             # The request may have reached the provider and been billed (a timeout, a 5xx): unknown, not zero.
-            is_provider_error = isinstance(e, openai.OpenAIError)
-            description = self._redact(describe_api_error(e, self.config.base_url) if is_provider_error
-                                       else f"{type(e).__name__}: {e}")
-            rec = CallRecord(
-                page_id=budget.page_id,
-                requested_model=self.config.model,
-                response_model=None,
-                usage=None,
-                latency_s=round(time.monotonic() - start, 3),
-                cost_usd=None,
-                error=description,
-            )
-            self.meter.record(rec)
-            budget.charge(None)
+            # A 200 that claims to be JSON and is not makes the SDK raise JSONDecodeError: also the provider's doing.
+            is_provider_error = isinstance(e, (openai.OpenAIError, json.JSONDecodeError))
+            description = (describe_api_error(e, self.config.base_url) if is_provider_error
+                           else f"{type(e).__name__}: {e}")
+            description = self._redact(description)
+            rec = self._record(budget, start, error=description)
             if not is_provider_error:
                 raise
-            raise ProviderError(description, getattr(e, "status_code", None)) from e
-        latency = time.monotonic() - start
+            raise ProviderError(description, getattr(e, "status_code", None), rec) from e
 
-        usage = usage_from_api(resp.usage)
+        if not isinstance(resp, ChatCompletion):
+            # The SDK hands back the body as a str when a 200 is not JSON (say an HTML page from a gateway).
+            description = self._redact(
+                f"The response from {self.config.base_url} is not a chat completion (got {type(resp).__name__}, "
+                "not JSON). Check LLM_BASE_URL in .env."
+            )
+            raise ProviderError(description, None, self._record(budget, start, error=description))
+
+        # From here on the call is recorded once, with the usage the response carried, error or not.
+        text, finish_reason, problem = "", None, None
+        if not resp.choices:
+            problem = f"{self.config.model} returned no choices"
+        else:
+            try:
+                text, finish_reason = _first_choice(resp)
+            except (AttributeError, IndexError, TypeError):
+                problem = f"{self.config.model} returned a first choice that cannot be read"
+        rec = self._record(budget, start, response_model=resp.model, usage=usage_from_api(resp.usage), error=problem)
+        if problem:
+            raise ProviderError(self._redact(problem), None, rec)
+        return LLMResult(text=text, finish_reason=finish_reason, record=rec)
+
+    def _record(
+        self,
+        budget: PageBudget,
+        start: float,
+        *,
+        response_model: str | None = None,
+        usage: Usage | None = None,
+        error: str | None = None,
+    ) -> CallRecord:
+        """The one place a call enters the Meter and the budget."""
         rec = CallRecord(
             page_id=budget.page_id,
             requested_model=self.config.model,
-            response_model=resp.model,
+            response_model=response_model,
             usage=usage,
-            latency_s=round(latency, 3),
+            latency_s=round(time.monotonic() - start, 3),
             cost_usd=self._cost(usage),
+            error=error,
         )
         self.meter.record(rec)
         budget.charge(usage)
-
-        if not resp.choices:
-            raise ProviderError(f"{self.config.model} returned no choices")  # already recorded, with its usage
-        choice = resp.choices[0]
-        return LLMResult(text=choice.message.content or "", finish_reason=choice.finish_reason, record=rec)
+        return rec
 
     def _redact(self, text: str) -> str:
         # A provider may echo the key back in an error body; neither the ledger nor a Run may keep it.
@@ -139,8 +160,18 @@ class LLMClient:
         return (usage.input_tokens * c.price_input_per_m + usage.output_tokens * c.price_output_per_m) / 1_000_000
 
 
+def _first_choice(resp: ChatCompletion) -> tuple[str, str | None]:
+    """(text, finish_reason) of the first choice. Raises AttributeError, IndexError or TypeError if it is malformed."""
+    choice = resp.choices[0]
+    content = choice.message.content
+    if content is not None and not isinstance(content, str):
+        raise TypeError(f"message content is {type(content).__name__}, not text")
+    return content or "", choice.finish_reason
+
+
 def usage_from_api(u: CompletionUsage | None) -> Usage | None:
-    if u is None or u.prompt_tokens is None or u.completion_tokens is None:
+    # The SDK builds a response without validating it, so `usage` can be anything the provider sent.
+    if not isinstance(u, CompletionUsage) or u.prompt_tokens is None or u.completion_tokens is None:
         return None
     cached = u.prompt_tokens_details.cached_tokens if u.prompt_tokens_details else None
     return Usage(input_tokens=u.prompt_tokens, output_tokens=u.completion_tokens, cached_input_tokens=cached)

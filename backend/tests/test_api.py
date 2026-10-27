@@ -126,6 +126,21 @@ def test_a_provider_error_answers_502_and_the_run_has_unknown_cost(api, conn):
     assert client.get("/api/pages/book_a/1").json()["run"] is None  # nothing succeeded, nothing stored
 
 
+def test_a_body_that_claims_to_be_json_and_is_not_answers_502_not_500(api, conn):
+    client, _ = api
+    provider = mock_llm_client(
+        lambda request: httpx.Response(200, content=b"{nope", headers={"content-type": "application/json"}))
+    app.dependency_overrides[get_client_factory] = lambda: lambda: provider
+
+    resp = client.post("/api/pages/book_a/1/translate")
+
+    assert resp.status_code == 502
+    assert "not valid JSON" in resp.json()["detail"]
+    run = conn.execute("SELECT status, calls, unknown_usage_calls, cost_usd, error FROM runs").fetchone()
+    assert tuple(run)[:4] == ("failed", 1, 1, None)
+    assert run["error"] == resp.json()["detail"]
+
+
 @pytest.mark.parametrize(
     "env, missing",
     [({}, ["LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL"]),
