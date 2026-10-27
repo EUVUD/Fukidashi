@@ -1,5 +1,14 @@
 import json
 
+import httpx
+import pytest
+from conftest import mock_llm_client
+
+from fukidashi import config
+from fukidashi.api import deps
+from fukidashi.api.deps import get_client_factory
+from fukidashi.main import app
+
 GOOD = json.dumps({"translations": [{"id": 0, "zh": "你好"}, {"id": 1, "zh": "再见"}]}, ensure_ascii=False)
 
 
@@ -100,3 +109,51 @@ def test_a_duplicate_region_id_is_retried_and_a_good_retry_succeeds(api):
     assert resp.status_code == 200
     assert len(fake.requests) == 2
     assert [s["text_zh_hans"] for s in resp.json()["segments"]] == ["你好", "再见"]
+
+
+def test_a_provider_error_answers_502_and_the_run_has_unknown_cost(api, conn):
+    client, _ = api
+    provider = mock_llm_client(lambda request: httpx.Response(500, json={"error": {"message": "upstream exploded"}}))
+    app.dependency_overrides[get_client_factory] = lambda: lambda: provider  # the real LLMClient on a mock provider
+
+    resp = client.post("/api/pages/book_a/1/translate")
+
+    assert resp.status_code == 502
+    assert "API error 500" in resp.json()["detail"] and "upstream exploded" in resp.json()["detail"]
+    run = conn.execute("SELECT status, calls, unknown_usage_calls, cost_usd, error FROM runs").fetchone()
+    assert tuple(run)[:4] == ("failed", 1, 1, None)  # unknown, not 0.0
+    assert run["error"] == resp.json()["detail"]
+    assert client.get("/api/pages/book_a/1").json()["run"] is None  # nothing succeeded, nothing stored
+
+
+@pytest.mark.parametrize(
+    "env, missing",
+    [({}, ["LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL"]),
+     ({"LLM_API_KEY": "sk-secret-value"}, ["LLM_BASE_URL", "LLM_MODEL"])],
+    ids=["nothing-set", "only-the-key-set"],
+)
+def test_missing_llm_settings_answer_503_naming_only_the_variables(api, conn, tmp_path, monkeypatch, env, missing):
+    client, _ = api
+    del app.dependency_overrides[get_client_factory]  # the real factory, as the app runs it
+    for name in ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    # The factory loads ROOT/.env on every request: point it at an empty directory so the real .env is never read.
+    monkeypatch.setattr(config, "ROOT", tmp_path)
+    loaded = []
+    real_load_dotenv = deps.load_dotenv
+
+    def spy(path, *args, **kwargs):
+        loaded.append(path)
+        return real_load_dotenv(path, *args, **kwargs)
+
+    monkeypatch.setattr(deps, "load_dotenv", spy)
+
+    resp = client.post("/api/pages/book_a/1/translate")
+
+    assert loaded == [tmp_path / ".env"] and not loaded[0].exists()
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == f"Set {', '.join(missing)} in .env (see .env.example)"
+    assert "sk-secret-value" not in resp.text  # names, never values
+    assert conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
