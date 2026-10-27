@@ -36,6 +36,10 @@ def latest_succeeded_run(conn: sqlite3.Connection, page_id: int) -> sqlite3.Row 
     ).fetchone()
 
 
+def get_run(conn: sqlite3.Connection, run_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+
+
 def segments_with_translations(conn: sqlite3.Connection, page_id: int, run_id: int | None) -> list[sqlite3.Row]:
     """Every segment of the page, with its zh-Hans text from `run_id` (NULL when there is no run)."""
     return conn.execute(

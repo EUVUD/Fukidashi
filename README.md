@@ -47,6 +47,12 @@ npm run dev --prefix frontend                   # http://localhost:5173/tojime_n
 Pick a page and click Translate: the backend runs `baseline` on that page (one call, no tools, no KB) and stores the Run and its zh-Hans translations in SQLite. Translate makes a real call to the model configured in `.env`. `FUKIDASHI_DB` overrides the DB path.
 
 ```bash
+uv run python eval/run.py --config baseline --book tojime_no_siora --pages 2,3,4   # real calls: one per page
+```
+
+The eval harness translates those pages through the same code path as the editor (each page leaves a Run in SQLite), converts the zh-Hant reference translations to zh-Hans with OpenCC (`t2s`), and prints chrF and BLEU with their sacreBLEU signatures, plus cost per page and latency. The Manifest, per-Segment outputs and scores go to `runs/eval/<id>/`. The exit code is non-zero if a page failed or the harness could not start.
+
+```bash
 uv run pytest                                       # no network, no real LLM calls
 uv run python scripts/m0_first_call.py --dry-run    # print the M0 request without sending it
 ```

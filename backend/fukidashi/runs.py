@@ -40,6 +40,30 @@ class Outcome:
     result: BaselineResult  # ok, error and attempts of the baseline call
 
 
+@dataclass(frozen=True)
+class ValidPage:
+    row: sqlite3.Row
+    segment_rows: list[sqlite3.Row]
+    image_path: Path
+
+
+def validate_page(conn: sqlite3.Connection, book_title: str, page_index: int, dataset_root: Path) -> ValidPage:
+    """Check that the page can be translated, without a model call or a Run. Raises a `TranslateError`.
+
+    `translate_page` starts with this; the eval harness calls it for every page before its first model call.
+    """
+    page_row = store.find_page(conn, book_title, page_index)
+    if page_row is None:
+        raise PageNotFound(f"no page {book_title}/{page_index}")
+    seg_rows = store.page_segments(conn, page_row["id"])
+    if not seg_rows:
+        raise NothingToTranslate("this page has no text regions to translate")
+    image_path = dataset_root / page_row["image_path"]
+    if not image_path.is_file():
+        raise ImageMissing(f"image file missing: {image_path}")
+    return ValidPage(page_row, seg_rows, image_path)
+
+
 def translate_page(
     conn: sqlite3.Connection,
     book_title: str,
@@ -57,20 +81,13 @@ def translate_page(
     built (missing .env) leaves no Run behind. A failed model call or unparseable output is not an
     exception: it is a failed Run, reported in `Outcome.result`.
     """
-    page_row = store.find_page(conn, book_title, page_index)
-    if page_row is None:
-        raise PageNotFound(f"no page {book_title}/{page_index}")
-    seg_rows = store.page_segments(conn, page_row["id"])
-    if not seg_rows:
-        raise NothingToTranslate("this page has no text regions to translate")
-    image_path = dataset_root / page_row["image_path"]
-    if not image_path.is_file():
-        raise ImageMissing(f"image file missing: {image_path}")
-    segment_ids = {s["idx"]: s["id"] for s in seg_rows}
+    valid = validate_page(conn, book_title, page_index, dataset_root)
+    page_row = valid.row
+    segment_ids = {s["idx"]: s["id"] for s in valid.segment_rows}
     page = Page(
-        book_title, page_index, image_path,
+        book_title, page_index, valid.image_path,
         [Segment(s["idx"], s["x"], s["y"], s["w"], s["h"], s["text_ja"], s["text_en"], s["text_zh_hant"])
-         for s in seg_rows],
+         for s in valid.segment_rows],
     )
 
     client = make_client()
