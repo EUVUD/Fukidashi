@@ -47,6 +47,12 @@ npm run dev --prefix frontend                   # http://localhost:5173/tojime_n
 选一页点 Translate：后端对这一页跑一次 `baseline`（一次调用，不用 tools 和 KB），把 Run 和 zh-Hans 译文存进 SQLite。Translate 会真实调用 `.env` 里配置的模型。DB 路径可以用环境变量 `FUKIDASHI_DB` 改。
 
 ```bash
+uv run python eval/run.py --config baseline --book tojime_no_siora --pages 2,3,4   # 真实调用：每页一次
+```
+
+Eval harness（评测执行器）走和编辑器相同的代码路径翻译这几页（每页在 SQLite 里留下一个 Run），用 OpenCC（`t2s`）把 zh-Hant 参考译文转成 zh-Hans，然后打印 chrF 和 BLEU 及其 sacreBLEU 签名，以及每页成本和延迟。运行清单（Manifest）、逐 Segment 的输出和分数写入 `runs/eval/<id>/`。有页面失败或 harness 无法启动时，退出码非零。
+
+```bash
 uv run pytest                                       # 不联网，不发真实 LLM 请求
 uv run python scripts/m0_first_call.py --dry-run    # 打印 M0 的请求内容，不发送
 ```
