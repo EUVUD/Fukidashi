@@ -4,7 +4,7 @@
 
 多 agent 漫画翻译编辑器（日 → 简体中文）。在 [OpenMantra](https://github.com/mantra-inc/open-mantra-dataset) 数据集上，用标准的 MT evaluation framework 和单次调用的 baseline 做对比。
 
-> **现状（2026-10-26）：** M0 和 M1 已完成，vertical slice 已经跑通：导入 OpenMantra，对一页做一次模型调用完成翻译，在浏览器里逐句对照图上的 box 检查译文。Agent、Knowledge Base、Reviewer、tracing 和 eval harness 都在 M2 之后，现在还没有实现。
+> **现状（2026-10-27）：** M0 和 M1 已完成，vertical slice 已经跑通：导入 OpenMantra，对一页做一次模型调用完成翻译，在浏览器里逐句对照图上的 box 检查译文。M2 进行中：eval harness 已经能用 chrF / BLEU 给 `baseline` 打分，调用工具的 agent loop 也已经跑在带计量的 client 上。Translator Agent、Knowledge Base、Reviewer 和 tracing 还没有实现。
 
 ## 它做什么
 
@@ -25,7 +25,8 @@ Fukidashi 按产品评测，不做研究型对照实验（细节见 [OUTLINE.md 
 - **只有一个带计量的 client。** 所有模型调用都经过 `LLMClient`：它限制每页的 token budget，并把每次调用记进费用账本。provider 没返回的 usage 记为 unknown，不记成 0。
 - **参考译文不会泄漏进 prompt。** prompt 里只有日文和 box；和它们存在一起的参考译文不会进 prompt，有测试检查。
 - **Run 只追加，不覆盖。** Run 先以 `running` 插入，再标成 `succeeded` 或 `failed`；失败的 Run 保留原始响应，页面继续显示上一次成功的译文。
-- **Provider 可替换。** 任何支持图片输入和 JSON output 的 OpenAI-compatible 模型都可以通过 `.env` 接入；目前用 DeepSeek `deepseek-flash`（约 $0.0006 / 页）。
+- **Agent loop 不绕过计量。** 工具调用跑在 LangChain 的 `create_agent` 上，但它的模型是包在 `LLMClient` 外面的一层薄适配，所以每次 agent 调用都和其他调用一样计量，DeepSeek 的推理内容也按它 API 的要求传回。保护措施：步数上限、token budget、重复调用检测，被截断的回复不会被当成答案。
+- **Provider 可替换。** 任何支持图片输入、tool calling 和 JSON output 的 OpenAI-compatible 模型都可以通过 `.env` 接入；目前用 DeepSeek `deepseek-flash`（约 $0.0006 / 页）。
 
 设计图（Domain Model、顺序图、Object Model）：[docs/design.md](docs/design.md)（英文）。
 
@@ -63,7 +64,7 @@ uv run python scripts/m0_first_call.py --dry-run    # 打印 M0 的请求内容�
 |---|---|---|
 | M0 决定与第一次调用 | 10/18 | 完成（[记录](docs/m0.md)） |
 | M1 Vertical slice：页面 → `baseline` → 浏览器 | 10/25 | 完成（[记录](docs/m1.md)） |
-| M2 Agent layer 与 eval harness | 11/1 | 计划中 |
+| M2 Agent layer 与 eval harness | 11/1 | 进行中 |
 | M3 Knowledge Base 与 Reviewer | 11/8 | 计划中 |
 | M4–M5 Dev 评测、冻结 eval protocol | 11/22 | 计划中 |
 | M6–M8 Test 运行、编辑器产品化、分析 | 1/3 | 计划中 |

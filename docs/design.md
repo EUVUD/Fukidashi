@@ -1,6 +1,6 @@
 # Design Diagrams
 
-> 2026-10-27 · Matches the code after M2's first five tasks: the eval harness v0, the Run status and cost fixes, and provider and malformed-response error handling. Diagrams are Mermaid and render on GitHub.
+> 2026-10-27 · Matches the code after M2's first six tasks: the eval harness v0, the Run status and cost fixes, provider and malformed-response error handling, and the tool-calling loop. Diagrams are Mermaid and render on GitHub.
 > **Solid = implemented; dashed = planned** (milestones in [OUTLINE.md](../OUTLINE.md) §7). Terms follow OUTLINE §0.
 
 Fukidashi translates Japanese manga into Simplified Chinese (zh-Hans). Each page has several Segments (one line of dialogue in one oracle box); the model looks at the whole page image and translates them together, and the user checks the translations against the boxes in the browser.
@@ -140,15 +140,48 @@ sequenceDiagram
     Note over G: Meter appends every call to runs/usage.jsonl
 ```
 
+**The agent loop.** `run_agent` (`agents/loop.py`) runs a model through tool calls. `Runs` does not call it yet (the Translator Agent, M2, will); today only `scripts/m2_tool_smoke.py` does. One run:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as run_agent<br/>(agents/loop.py)
+    participant L as create_agent<br/>(LangChain graph)
+    participant X as LLMClientChatModel
+    participant C as LLMClient
+    participant M as LLM provider
+    participant T as tool guard<br/>and Tool
+
+    A->>L: system prompt, user message, tools, middleware
+    loop until an answer, at most max_steps model calls
+        L->>X: messages so far
+        X->>C: chat(OpenAI-format messages, tools)
+        C->>M: chat.completions.create
+        M-->>C: content, tool_calls, reasoning_content, usage
+        C-->>X: LLMResult (metered once)
+        X-->>L: AIMessage (reasoning_content kept for the next request)
+        alt finish reason is not stop or tool_calls
+            L-->>A: stop, incomplete
+        else tool calls
+            L->>T: each call: validate args, skip a duplicate, run the handler
+            T-->>L: ToolMessage (the result, or the model's mistake as text)
+        else answer
+            L-->>A: final message
+        end
+    end
+    A-->>A: AgentResult (text, stop reason, error, steps, messages)
+    Note over A,C: Step limit, BudgetExceeded and ProviderError end the run as step_limit, budget or provider_error, without a retry
+```
+
 ---
 
 ## 4. Object Model
 
-The objects in the code and how they depend on each other (the actual structure after M2's first five tasks).
+The objects in the code and how they depend on each other (the actual structure after M2's first six tasks).
 
 ### 4.1 Backend
 
-Colors mark layers: blue = API, teal = eval, pink = service, green = pipeline, orange = LLM, purple = data.
+Colors mark layers: blue = API, teal = eval, pink = service, green = pipeline, lime = agents, orange = LLM, purple = data.
 
 ```mermaid
 classDiagram
@@ -181,8 +214,23 @@ classDiagram
         attempts
         error
     }
+    class AgentLoop:::agent {
+        run_agent()
+    }
+    class LLMClientChatModel:::agent
+    class Tool:::agent {
+        name
+        args pydantic model
+        handler
+    }
+    class AgentResult:::agent {
+        text
+        stop_reason
+        steps
+        messages
+    }
     class LLMClient:::llm {
-        chat()
+        chat(tools)
         SDK max_retries=0
     }
     class ProviderError:::llm {
@@ -231,6 +279,10 @@ classDiagram
     LLMClient *-- LLMConfig
     LLMClient o-- Meter
     LLMClient ..> PageBudget : check, charge
+    AgentLoop ..> LLMClientChatModel : model of create_agent
+    AgentLoop ..> Tool : runs
+    AgentLoop ..> AgentResult : returns
+    LLMClientChatModel ..> LLMClient : chat
     Page *-- Segment
     Store ..> SQLite : SQL
     Importer ..> Page : loads
@@ -240,6 +292,7 @@ classDiagram
     classDef eval fill:#e0f4f4,stroke:#2a9d9d,color:#222
     classDef service fill:#fde8f1,stroke:#c4527f,color:#222
     classDef pipeline fill:#e6f4ea,stroke:#3a9d5d,color:#222
+    classDef agent fill:#eef6d8,stroke:#7a9a2a,color:#222
     classDef llm fill:#fff4e0,stroke:#d08a2a,color:#222
     classDef data fill:#f1e9fb,stroke:#8a5fc4,color:#222
 ```
@@ -251,6 +304,7 @@ classDiagram
 - `Runs` receives an `LLMClient` factory, not a client: every Run builds its own `LLMClient` and `Meter`, so each Run's usage is its own.
 - `llm/` (`LLMClient` and `describe_api_error`) is the only code that imports `openai`. `LLMClient` turns the SDK's automatic retries off, so every request sent is one call in the `Meter`. A request that raises, or a response `LLMClient` cannot read (an HTML page, a body that is not JSON, no readable first choice), is recorded once with an `error`, with unknown usage unless the response carried some, then leaves `llm/` as `ProviderError` carrying that `CallRecord`. `Baseline` adds it to `attempts` and puts the error on the Run without retrying (OUTLINE §3.6: a request that may have been billed is not resent automatically), so a finished Run has one attempt per call; it retries only empty or unparseable output.
 - `Baseline` touches neither HTTP nor SQLite.
+- `AgentLoop` (`agents/loop.py`) is LangChain's `create_agent` with `LLMClientChatModel` as its model, so every agent call goes through `LLMClient` and is metered once; nothing in the loop retries. Its guardrails are the Step limit (`ModelCallLimitMiddleware`), a check that a reply ending for any reason other than `stop` or `tool_calls` is never an answer, and a tool guard that validates arguments against the `Tool`'s pydantic model, passes the model's mistakes back as the tool's result and does not run a duplicate call again. LangChain stays inside `agents/`: callers get an `AgentResult` of plain values with one step per model call. `Runs` does not use it yet.
 
 ### 4.2 Frontend
 
@@ -298,6 +352,6 @@ classDiagram
 
 ### 4.4 Where later milestones plug in
 
-- **M2:** an Orchestrator and the Translator Agent (a tool loop; directories `orchestrator/` and `agents/` in OUTLINE §6) join `Baseline`. `LLMClient`, `Meter` and `PageBudget` stay as they are, and every agent call goes through them; `Runs.translate_page` picks Baseline or the Orchestrator by `config`, and `EvalHarness` accepts each config as it arrives (`CONFIGS` in `evaluation/harness.py`).
+- **M2:** the Translator Agent, built on `AgentLoop`, joins `Baseline`, and later an Orchestrator (`orchestrator/` in OUTLINE §6). `LLMClient`, `Meter` and `PageBudget` stay as they are, and every agent call goes through them; `Runs.translate_page` picks Baseline or the Orchestrator by `config`, and `EvalHarness` accepts each config as it arrives (`CONFIGS` in `evaluation/harness.py`).
 - **M3:** the `KB` (Glossary, Character Profiles, Proposal Queue) and the Reviewer / Curator Agents; `runs.config` gains `full` and `full_no_kb`.
 - **M7:** the frontend adds a canvas and editing to `PageView`, plus SSE, which adds an event subscription to the `api` module.

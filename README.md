@@ -4,7 +4,7 @@ English | [简体中文](README.zh-CN.md)
 
 A multi-agent manga translation editor (Japanese → Simplified Chinese), evaluated on the [OpenMantra](https://github.com/mantra-inc/open-mantra-dataset) dataset against a single-call baseline with a standard MT evaluation framework.
 
-> **Status (2026-10-26):** M0 and M1 are done. The vertical slice works end to end: import OpenMantra, translate a page with one model call, and check every line against its box in the browser. The agents, the Knowledge Base, the Reviewer, tracing and the eval harness are planned for M2 onward and do not exist yet.
+> **Status (2026-10-27):** M0 and M1 are done. The vertical slice works end to end: import OpenMantra, translate a page with one model call, and check every line against its box in the browser. M2 is in progress: an eval harness scores `baseline` with chrF / BLEU, and a tool-calling agent loop runs on our metered client. The Translator Agent, the Knowledge Base, the Reviewer and tracing do not exist yet.
 
 ## What it does
 
@@ -25,7 +25,8 @@ Fukidashi is evaluated as a product, not as a research experiment (details in [O
 - **One metered client.** Every model call goes through `LLMClient`, which enforces a per-page token budget and logs each call to a cost ledger. Usage the provider does not report is recorded as unknown, never as 0.
 - **No reference leakage.** Prompts contain only the Japanese text and boxes; the reference translations stored next to them never reach a prompt, and a test checks it.
 - **Runs are recorded, not overwritten.** A Run is inserted as `running` and finished as `succeeded` or `failed`; a failed Run keeps the raw responses, and the page keeps showing the last good translation.
-- **Swappable provider.** Any OpenAI-compatible model with vision and JSON output works through `.env`; the current choice is DeepSeek `deepseek-flash` (about $0.0006 per page).
+- **An agent loop that keeps the metering.** Tool calls run on LangChain's `create_agent`, but its model is a thin adapter over `LLMClient`, so every agent call is metered like any other and DeepSeek's reasoning is passed back as its API requires. Guardrails: a step limit, the token budget, duplicate-call detection, and a truncated reply is never taken as an answer.
+- **Swappable provider.** Any OpenAI-compatible model with vision, tool calling and JSON output works through `.env`; the current choice is DeepSeek `deepseek-flash` (about $0.0006 per page).
 
 Diagrams (domain model, sequence diagrams, object model): [docs/design.md](docs/design.md).
 
@@ -63,7 +64,7 @@ uv run python scripts/m0_first_call.py --dry-run    # print the M0 request witho
 |---|---|---|
 | M0 Decisions & first call | 10/18 | Done ([record](docs/m0.md)) |
 | M1 Vertical slice: page → `baseline` → browser | 10/25 | Done ([record](docs/m1.md)) |
-| M2 Agent layer & eval harness | 11/1 | Planned |
+| M2 Agent layer & eval harness | 11/1 | In progress |
 | M3 Knowledge Base & Reviewer | 11/8 | Planned |
 | M4–M5 Dev evaluation, protocol freeze | 11/22 | Planned |
 | M6–M8 Test run, editor productization, analysis | 1/3 | Planned |

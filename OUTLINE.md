@@ -1,6 +1,6 @@
 # Fukidashi — Project Outline
 
-> v0.11 · 2026-10-27
+> v0.12 · 2026-10-27
 > **v0.2 (2026-10-22):** evaluation changed from a research-style controlled experiment to a standard evaluation framework plus a baseline comparison (plan B); see §4.
 > **v0.3 (2026-10-22):** M0 decisions recorded in §8: name Fukidashi, ja → zh-Hans, an OpenAI-compatible provider, a $100 budget cap.
 > **v0.4 (2026-10-24):** M1 added the term Run (§0).
@@ -11,6 +11,7 @@
 > **v0.9 (2026-10-26):** §8 decides the OpenCC config (`t2s`); §6 moves the eval library into `backend/fukidashi/evaluation/`, leaving the entry point and eval data in `eval/`.
 > **v0.10 (2026-10-27):** §8 records that the provider SDK's automatic retries are off; §3.5 and §3.6 note that a failed request is metered as unknown and is not resent, as implemented in M2.
 > **v0.11 (2026-10-27):** §8 decides the agent loop: LangChain v1 `create_agent`, with `LLMClient` as its model through an adapter; §5 adds it to the tech stack.
+> **v0.12 (2026-10-27):** after M2's tool-calling loop: §0 adds Agent loop, Step and Stop reason; §3.4 records the guardrails as built and the smoke findings; §9 records that `deepseek-flash` can call tools.
 > Convention: code, docs, commit messages and reports use the canonical terms in §0.
 
 ---
@@ -41,7 +42,10 @@ Use the English term in the left column everywhere, in code and in docs. The Chi
 | Typesetting | 排版 / 嵌字 | Written in-house |
 | Overflow rate | 嵌字溢出率 | Product metric |
 | Token budget (per page) | 每页 token 预算 | |
-| Step limit | 步数上限 | |
+| Step limit | 步数上限 | `max_steps` model calls per agent run, default 6 |
+| Agent loop | agent 循环 | `run_agent` in `agents/`: LangChain's `create_agent` with our metered model and the §3.4 guardrails (§8) |
+| Step | 步 | One model call in an agent run, with the tool calls it asked for; a failed call is a step too |
+| Stop reason | 停止原因 | Why an agent run ended: `final`, `step_limit`, `incomplete`, `budget` or `provider_error` |
 | Metering | 计量 | Written in-house; unknown usage is counted separately, never recorded as 0 |
 | Trace | 执行轨迹 | Recorded by the tracing tool since v0.2, no longer custom JSONL |
 | Tracing tool | tracing 工具 | Langfuse or Arize Phoenix, chosen in M2 |
@@ -181,10 +185,11 @@ Fukidashi is a product, so it is evaluated with general, objective metrics rathe
 
 ### 3.4 Agent Loop Guardrails
 
-- Step limit; per-page token budget; duplicate tool call detection; tool errors are passed back to the agent as they are.
+- Step limit; per-page token budget; duplicate tool call detection; tool errors are passed back to the agent as they are. **Built in M2** (`agents/loop.py`): the Step limit is `max_steps` model calls (default 6); a duplicate is the same tool with the same validated arguments; the model's mistakes (an unknown tool, arguments that fail the tool's pydantic model, a handler that raises) go back as the tool's result. Nothing in the loop retries: a provider error ends the run (§3.6).
+- A reply that ended for any reason other than `stop` or `tool_calls` is never taken as the answer (stop reason `incomplete`): with thinking on, reasoning can use up `max_tokens` and leave an empty, truncated reply. Further checks (no progress, a cap on tool calls, near-duplicates, a wall-clock deadline) wait for traces that show a need (`IDEAS.md`).
 - Structured output: validate against a JSON schema, retry once on a parse failure, then **fall back visibly** to `baseline` (one call per page).
 - The prompt keeps a stable prefix for prompt caching: `system → tool definitions → glossary → page`.
-- **Two DeepSeek rules:** with tools, the `reasoning_content` of every turn must be passed back unchanged in later requests (handled in M2's tool loop); JSON output occasionally comes back empty, which the retry above covers. Thinking is switched in `extra_body`; effort is `reasoning_effort` (`low` / `high` / `max`).
+- **Two DeepSeek rules:** with tools, the `reasoning_content` of every turn must be passed back unchanged in later requests (done by `LLMClientChatModel` since M2; `deepseek-flash` sends `""` on its final turn, which goes back as it is); JSON output occasionally comes back empty, which the retry above covers. Thinking is switched in `extra_body`; effort is `reasoning_effort` (`low` / `high` / `max`). The M2 smoke runs (2026-10-27, text only) also showed that `response_format: json_object` is accepted together with tools.
 
 ### 3.5 Metering & Tracing
 
@@ -332,7 +337,7 @@ fukidashi/
 │   │   ├── datasets/      # OpenMantra loader and importer
 │   │   ├── pipeline/      # baseline (M1); from M2 the orchestrator takes over and baseline stays as a config
 │   │   ├── orchestrator/  # translate → review → finalize
-│   │   ├── agents/        # translator.py, reviewer.py, curator.py
+│   │   ├── agents/        # loop.py + model.py (the agent loop, M2); translator.py, reviewer.py, curator.py
 │   │   ├── tools/         # lookup_term, lookup_character, ...
 │   │   ├── kb/            # Glossary, Character Profiles, Proposal Queue
 │   │   ├── llm/           # client, metering, token budget
@@ -415,7 +420,7 @@ fukidashi/
 | Model cost exceeds the budget | $100 cap; `runs/usage.jsonl` logs tokens and cost for every call (cost needs prices in `.env`); estimate on 3 pages first, judge calls included; tune on a subset of dev pages if costs run high |
 | GEMBA-MQM disagrees with humans | Per the eval protocol's decision rule, report it for reference only and say so |
 | COMET / xCOMET does not run on the Mac | Use the Windows machine's GPU; if xCOMET does not fit in memory, report COMET only |
-| `deepseek-flash`'s vision is new (2026-10-17 release) and its tool calling is untested | Read translations by hand in M0 and M1; test the tool loop in M2; if it falls short, switch providers in `.env` without code changes |
+| `deepseek-flash`'s vision is new (2026-10-17 release) and its tool calling is untested | Read translations by hand in M0 and M1; test the tool loop in M2; if it falls short, switch providers in `.env` without code changes. **Tool calling answered (2026-10-27):** three smoke runs through the agent loop with thinking on all called the tool and used its result (#16) |
 
 **Pivot rules (decided only at checkpoints):**
 - **10/25:** no real translation in the browser → drop the frontend for now, keep only the CLI path, and move all editor work to M7. The project itself does not change.
