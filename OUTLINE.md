@@ -1,6 +1,6 @@
 # Fukidashi — Project Outline
 
-> v0.20 · 2026-10-28
+> v0.21 · 2026-10-28
 > **v0.2 (2026-10-22):** evaluation changed from a research-style controlled experiment to a standard evaluation framework plus a baseline comparison (plan B); see §4.
 > **v0.3 (2026-10-22):** M0 decisions recorded in §8: name Fukidashi, ja → zh-Hans, an OpenAI-compatible provider, a $100 budget cap.
 > **v0.4 (2026-10-24):** M1 added the term Run (§0).
@@ -20,6 +20,7 @@
 > **v0.18 (2026-10-28):** after the Orchestrator and `full_no_kb` (#29) and the KB store (#28): §0 adds Send-back / Revision and KB snapshot; §3.2, §3.3 and §4.2 record what is built; §3.5 no longer claims review rounds are spans (only the root span carries the loop's outcome).
 > **v0.19 (2026-10-28):** after the KB tools (#31): §3.2 and §3.4 record the agents' KB tools and where the snippets go; §3.3 marks the order of parallel proposals as settled.
 > **v0.20 (2026-10-28):** after hardening the KB seams (#33): §3.3 records the conflict across kinds and the first call's payload as built, and updates what is still open.
+> **v0.21 (2026-10-28):** M3 done (§7, `docs/m3.md`) after the Curator and `full` (#35): §3.2, §3.3, §3.5, §3.6 and §4.2 record what is built; §3.3 updates what is still open; §9 notes what the first `full` run showed about the KB.
 > Convention: code, docs, commit messages and reports use the canonical terms in §0.
 
 ---
@@ -212,8 +213,18 @@ Fukidashi is a product, so it is evaluated with general, objective metrics rathe
   - each agent has a system prompt of its own for the KB.
 - **One snapshot per page.** A page uses one snapshot and one proposal collector for all its stages, so its own proposals stay invisible to it until finalize (§3.6).
 - **Proposals.** Proposals are validated by the same code that stores them. The page's proposals come back in call order: Translator run, step, position in the reply. A failed Run returns none.
-- **Not wired yet.** No config passes a snapshot yet. That, the Curator's call and the KB write are the next task's.
+- **Wired in #35:** the `full` config passes the snapshot (below).
 - **Real check** (`tojime_no_siora` page 3, empty KB, $0.009): the Translator looked a term up, proposed one term (a family name, as a term) and flagged one region; the Reviewer approved without a lookup. A non-empty snippets part, a character proposal and a Reviewer lookup have run only against scripted providers.
+
+**As built in M3, the Curator and `full` (#35):**
+- **`full`** is the Orchestrator with the KB of the eval run: the snapshot is read once, before the page. After a successful page comes finalize (§3.6).
+- **The Curator Agent** (`agents/curator.py`) makes one call per page, without tools and without the page image. It sees:
+  - the page's KB snippets;
+  - each region's Japanese text and stored translation;
+  - the page's term proposals.
+  It never sees a name proposal (names go to a person whatever it says), the other agents' conversations or a reference translation. It accepts or rejects each term with a reason in Simplified Chinese; a bad answer gets one repair call.
+- **Without an answer** (unusable, provider error, spent budget), the page still succeeds and its terms stay undecided. The rules still apply names, confirmations and conflicts.
+- **First real run** (`tojime_no_siora` pages 2–4, $0.033; §4.2): the Curator was called on 2 pages and needed no repair. It accepted 3 terms and rejected 1, a rendering the stored translation did not use. Both names went to the Human Review Queue. Page 3's Translator found the name page 2 had proposed, so the KB carried a name from one page to the next.
 
 **Review loop:** the Reviewer sends a page back at most twice. This is fixed; since v0.2 it is not tuned for cost parity.
 
@@ -229,7 +240,7 @@ Fukidashi is a product, so it is evaluated with general, objective metrics rathe
 - **Readable states:** lookups and KB snippets return `approved` and `pending_human` entries, the latter marked as pending; `proposed` and `rejected` entries are not returned. So a name proposed on one page reaches later pages before a human has confirmed it (§8).
 - **One KB per eval run:** each eval run starts every book with an empty KB, which fills page by page in page order; nothing carries over between eval runs. The editor keeps one KB per book (M7).
 - **Retrieval:** relevant terms and characters are matched against the source text and truncated to a character budget; the agent looks up the rest with tools. No vector database, and the report says why: terms and names are identifiers, where exact match beats embeddings.
-- **As built in M3, storage and rules (#28)** (`kb/`; the agents read it since #31, nothing writes it yet):
+- **As built in M3, storage and rules (#28)** (`kb/`; the agents read it since #31, and `full` writes it at finalize since #35):
   - **Tables.** A `kbs` row is one KB (book, purpose `eval` or `editor`, label). The entries, profiles and proposals each belong to one KB.
   - **Profile status.** Character Profiles carry a `status` like entries do, because names go to the Human Review Queue. That queue is the set of rows with status `pending_human`, not a table of its own.
   - **Proposal IDs** come from the KB, the page, the kind and the normalised pair, so a retried page writes nothing twice. The same pair proposed on a later page becomes evidence.
@@ -239,11 +250,13 @@ Fukidashi is a product, so it is evaluated with general, objective metrics rathe
   - **Settled in #33:**
     - **Payload per id.** For one proposal id, the details kept are those of the first call in that order.
     - **Conflict across kinds.** A term whose source is a readable character's name or alias goes to the Human Review Queue and writes nothing. So does a character whose name is a readable term's source. Within a page, the earlier proposal counts as existing for the later one.
+  - **Settled in #35:** a conflict across kinds has its own result (`conflict_across_kinds`), so it is counted apart from a same-kind conflict; what is written is unchanged.
   - **Still open for task design:**
     - a proposal left undecided (the Curator's call failed) cannot be decided by applying its page again;
+    - a failure after the KB write (when the Run is finished) leaves the KB written under a failed Run. A retry of that page on the same KB would find its own proposals as duplicates, and the Curator's decisions would be lost. It matters once a page can be retried on a kept KB (the editor, M7);
     - a name proposed as a term when the KB holds nothing it collides with: the first real KB run proposed a family name that way. Only the Curator's judgment can catch it;
     - a character proposed under another character's alias becomes a second pending profile, because the match is on the name only; a character's aliases are not checked against term sources either;
-    - a conflict across kinds is told apart from a same-kind conflict only by its reason text.
+    - **variant spellings.** Retrieval and the rules match exact strings. In the first `full` run the dataset spelled one family name two ways on consecutive pages, and the KB ended with two approved entries with two different renderings. No rule sees it, and the Curator judges one page at a time. The same exact match left the snippets part empty on all 3 pages (§9).
 
 ### 3.4 Agent Loop Guardrails
 
@@ -256,14 +269,14 @@ Fukidashi is a product, so it is evaluated with general, objective metrics rathe
 ### 3.5 Metering & Tracing
 
 - **Metering is ours:** every LLM call records the model ID, input / output / cached tokens and cost. When the provider returns no usage, including a request that failed or timed out, the call is recorded as **unknown** and counted separately, never as 0. Cost per page comes from this data.
-- **Tracing uses an off-the-shelf tool:** Arize Phoenix, run locally (§8), replacing custom trace JSONL. LangSmith is never used: `run_agent` refuses to start while its tracing variables are on. **Built in M2** (`tracing/`): off unless `FUKIDASHI_TRACING=phoenix`; each `translate_page` is one trace whose root span carries book, page, config, Run id, status and, for `translator`, the stop reason and fallback reason; OpenInference adds a span per provider call and the agent's node and tool spans; an exporter wrapper removes page images and the API key, and spans go straight to the local endpoint, never through a proxy; eval rows and the manifest record the trace ID, also for a page that fails before its Run exists. One trace per page; agent steps and tool calls are spans. For `full_no_kb` (M3) the root span also carries the number of Send-backs and why the loop stopped; the stages (translate, review, revise) have no spans of their own, so a trace shows the agents' spans one after another (`IDEAS.md`). Eval results store the trace ID, so a score links straight to its trace.
+- **Tracing uses an off-the-shelf tool:** Arize Phoenix, run locally (§8), replacing custom trace JSONL. LangSmith is never used: `run_agent` refuses to start while its tracing variables are on. **Built in M2** (`tracing/`): off unless `FUKIDASHI_TRACING=phoenix`; each `translate_page` is one trace whose root span carries book, page, config, Run id, status and, for `translator`, the stop reason and fallback reason; OpenInference adds a span per provider call and the agent's node and tool spans; an exporter wrapper removes page images and the API key, and spans go straight to the local endpoint, never through a proxy; eval rows and the manifest record the trace ID, also for a page that fails before its Run exists. One trace per page; agent steps and tool calls are spans. For `full_no_kb` and `full` (M3) the root span also carries the number of Send-backs and why the loop stopped, and for `full` the Curator's status and how many proposals got each result; the stages (translate, review, revise) have no spans of their own, so a trace shows the agents' spans one after another (`IDEAS.md`). Eval results store the trace ID, so a score links straight to its trace.
 - **Choosing:** Phoenix runs locally as one Python process, which is light on an 8 GB Mac. Self-hosting Langfuse needs more components, and Langfuse Cloud sends traces to a third party.
 - The editor's live agent trace (SSE) is a **product feature** and separate from the tracing tool: the first is for users, the second for development and evaluation.
 
 ### 3.6 Reliability
 
 - **The page is the retry unit;** task state is persisted in SQLite.
-- LLM calls have no side effects and are safe to retry; the KB write, which does have side effects, happens once, at finalize, by the Curator.
+- LLM calls have no side effects and are safe to retry; the KB write, which does have side effects, happens once, at finalize, by the Curator. **Built in M3** (#35): finalize runs only after a successful page, in the order Curator call → `curator.apply` (one transaction) → the Run is finished. A failing write fails the Run and leaves the KB unchanged; a failure after the write is still open (§3.3).
 - When a result is unknown (for example a timeout that may still have been billed), it is not resent automatically; the user decides. Since M2, `LLMClient` turns off the provider SDK's own retries (§8) and records a failed request as a call with unknown usage, and `baseline` fails the Run instead of resending.
 - SSE events carry an increasing `seq`; after a disconnect the client reconnects with `Last-Event-ID` and the server replays what was missed.
 
@@ -305,6 +318,8 @@ Every vision component is a swappable **adapter**.
 **`translator` (M2):** the Translator Agent alone, without KB or Reviewer, run on the M2 smoke pages. It is not one of the reported configs; M3 builds `full` and `full_no_kb` on top of it.
 
 **`full_no_kb` as built (M3, #29):** the Orchestrator with the KB off (§3.2). On `tojime_no_siora` pages 2–4 it scored chrF 9.28 / BLEU 5.30, against `baseline`'s two runs (11.17 / 6.72 and 12.87 / 8.83) and `translator` (10.67 / 6.46). No page was sent back, so its stored translations are the flagging Translator's first answers. The gap to `translator` shows run-to-run noise on 27 segments, not an effect of the Reviewer; whole dev books come in M4.
+
+**`full` as built (M3, #35):** the Orchestrator with the KB on, a fresh KB for each eval run, and the Curator at finalize (§3.2). On `tojime_no_siora` pages 2–4 it scored chrF 10.86 / BLEU 7.69 at $0.011 per page (22 calls; latency p50 20.6 s, p95 53.8 s). It is the first eval run in which the Reviewer sent a page back: page 4, twice, ending at the Send-back limit. As with `full_no_kb`, 27 segments say nothing about quality.
 
 **KB off means:** no KB snippets in the prompt; `lookup_term`, `lookup_character` and `propose_entry` disabled; the Curator does not run; the Reviewer does not see the KB either. The Translator, the Reviewer, `get_previous_context` and the token budget are the same as in `full`.
 
@@ -445,7 +460,7 @@ fukidashi/
 | **M0** Decisions & first call | 1 | 10/16–10/18 | 2.5 | 4 decisions; `SCOPE.md`; download and check OpenMantra (fields in `annotation.json`, book title spelling, page and text-region counts); first real model output (model ID and token usage recorded). **Done 2026-10-24**, see `docs/m0.md` |
 | **M1** Vertical slice | 2 | 10/19–10/25 | 3.5 | M1-a: FastAPI + SQLite + OpenMantra import (oracle boxes + source text); M1-b: C0 → the frontend shows the page image, boxes and a translation list. **Checkpoint 10/25: a real translation of one page in the browser.** **Done 2026-10-24**, see `docs/m1.md` |
 | **M2** Agent layer & eval harness | 3 | 10/26–11/1 | 3.5 | Tool-calling loop + guardrails; Translator Agent; metering; tracing tool (Phoenix, §8); eval harness: `eval/run.py` + manifest + sacreBLEU (chrF / BLEU, with signature); `baseline` scored on 3 pages, Translator Agent runs on the same 3 pages (smoke test, not a reported config). **Done 2026-10-28**, see `docs/m2.md`. `translator` scored chrF 10.67 on the 3 pages, inside `baseline`'s run-to-run spread (11.17–12.87), at about $0.0016 per page against $0.0009 |
-| **M3** KB & Reviewer | 4 | 11/2–11/8 | 3 | KB + Curator + Proposal Queue + unit tests for KB write permissions; Reviewer Agent in the full system (at most 2 rounds, fixed); gold glossary for the dev split; `baseline` / `full` / `full_no_kb` each run on 1 page |
+| **M3** KB & Reviewer | 4 | 11/2–11/8 | 3 | KB + Curator + Proposal Queue + unit tests for KB write permissions; Reviewer Agent in the full system (at most 2 rounds, fixed); gold glossary for the dev split; `baseline` / `full` / `full_no_kb` each run on 1 page. **Done 2026-10-28**, see `docs/m3.md`. Each config ran on `tojime_no_siora` pages 2–4: `full` scored chrF 10.86 and `full_no_kb` 9.28, at about $0.011 and $0.004 per page; on 27 segments that is no comparison (two `baseline` runs of the same pages differed by 1.7 chrF). Seven tasks; about 6 hours of active sessions against 3 planned (`IDEAS.md`) |
 | **M4** Dev evaluation | 5 | 11/9–11/15 | 3 | Estimate tokens and cost on 3 pages first (judge calls included) against the budget cap; set up COMET / xCOMET (Windows GPU if the Mac cannot run it) and check checkpoint licenses and memory; run all 3 configs on the dev split. **11/15: first dev numbers** (chrF / BLEU, COMET, term accuracy, cost, latency) |
 | **M5** Freeze | 6 | 11/16–11/22 | 3 | Term accuracy / consistency; GEMBA-MQM + human agreement check on about 30 segments; tune prompts and tools from the MQM error breakdown; gold glossary for the test split; one-page `eval/PROTOCOL.md`. **11/22 freeze, tag `exp-frozen`** |
 | **M6** Test run | 9 | 12/7–12/13 | 1 | From `exp-frozen`, run the test split in the background, each of the 3 configs once, then score with COMET. **Checkpoint 12/13** |
@@ -499,7 +514,7 @@ fukidashi/
 |---|---|
 | Sliding into over-engineering again (PanelFlow is the cautionary tale) | Vertical slice first; `SCOPE.md` fixes the scope; the 10/25 checkpoint only asks whether the browser shows a real translation |
 | The editor eats the schedule | Product features are concentrated in M7 (12 h since v0.2); when time runs out, cut from the bottom of `SCOPE.md` |
-| Books are too short for KB gains to show | Use term accuracy, not consistency alone; report honestly; long books are discussed in the report only |
+| Books are too short for KB gains to show | Use term accuracy, not consistency alone; report honestly; long books are discussed in the report only. **First sign (2026-10-28):** in the first `full` run (3 pages) the KB's snippets matched nothing on any page, and its one cross-page use came through a lookup. M4 measures how often the KB reaches a page on whole dev books before the ablation is read (`IDEAS.md`) |
 | Model cost exceeds the budget | $100 cap; `runs/usage.jsonl` logs tokens and cost for every call (cost needs prices in `.env`); estimate on 3 pages first, judge calls included; tune on a subset of dev pages if costs run high |
 | GEMBA-MQM disagrees with humans | Per the eval protocol's decision rule, report it for reference only and say so |
 | COMET / xCOMET does not run on the Mac | Use the Windows machine's GPU; if xCOMET does not fit in memory, report COMET only |
