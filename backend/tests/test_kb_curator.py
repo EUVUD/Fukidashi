@@ -11,10 +11,11 @@ from kb_support import accept, dump, name, new_kb, new_run, reject, term
 
 from fukidashi import store
 from fukidashi.datasets.importer import import_openmantra
-from fukidashi.kb import KBNotFound, load_snapshot
+from fukidashi.kb import KBNotFound
 from fukidashi.kb.curator import (
     ACCEPTED, CONFIRMED, CONFLICT, DUPLICATE, PENDING, REJECTED, RESULTS, UNDECIDED, Outcome, apply,
 )
+from fukidashi.kb.loader import load_snapshot
 
 ALL_STATUSES = ("proposed", "approved", "rejected", "pending_human")
 
@@ -228,13 +229,157 @@ def test_a_conflicting_name_goes_to_the_human_review_queue_and_the_profile_stays
     assert (row["status"], "conflicts with profile" in row["reason"]) == ("pending_human", True)
 
 
-def test_a_term_and_a_name_with_the_same_source_do_not_meet(imported, kb, run_id):
+def test_a_term_and_a_name_with_the_same_source_meet_as_a_conflict_across_kinds(imported, kb, run_id):
+    # Task 015: this used to assert [ACCEPTED], "terms are compared with entries, names with profiles". A name proposed
+    # as a term now goes to a person (OUTLINE 3.3, "Still open"), so the same setup gives the opposite result.
     apply(imported, kb, 1, run_id, [name(kb, 1, "ユキ", "小雪")])
     word = term(kb, 2, "ユキ", "雪")
 
     outcomes = apply(imported, kb, 2, run_id, [word], accept_all([word]))
 
-    assert results(outcomes) == [ACCEPTED]  # terms are compared with entries, names with profiles
+    assert results(outcomes) == [CONFLICT] and entries(imported, kb) == []
+
+
+# --- rule 3, across kinds: a name under the wrong kind goes to a person, and nothing is written for it ---
+
+
+def insert_profile(conn, kb_id, name_src, name_tgt="小雪", aliases=(), status="approved"):
+    """A profile in any state, as a person or an older Curator left it. Committed: `apply` wants no open transaction."""
+    store.insert_profile(conn, kb_id=kb_id, name_src=name_src, name_tgt=name_tgt, aliases=list(aliases), notes="",
+                         status=status, page_index=1, event={"event": "created"})
+    conn.commit()
+
+
+def insert_entry(conn, kb_id, source, target="封印", status="approved"):
+    store.insert_entry(conn, kb_id=kb_id, source_term=source, target_term=target, category="", status=status,
+                       provenance="human", page_index=1, event={"event": "created"})
+    conn.commit()
+
+
+def kinds_untouched(conn, kb_id, before):
+    """Entries and profiles are as they were; only the proposal queue grew."""
+    now = dump(conn)
+    assert (now["glossary_entries"], now["character_profiles"]) == (before["glossary_entries"], before["character_profiles"])
+
+
+@pytest.mark.parametrize("decision", [None, accept("worth keeping"), reject("too generic")], ids=["none", "accept", "reject"])
+@pytest.mark.parametrize("status", ["approved", "pending_human"])
+def test_a_term_whose_source_is_a_profiles_name_goes_to_a_person_and_no_entry_is_written(
+        imported, kb, run_id, status, decision):
+    insert_profile(imported, kb, "ユキ", aliases=["ゆき"], status=status)
+    before = dump(imported)
+    word = term(kb, 2, "ユキ", "雪")
+
+    outcomes = apply(imported, kb, 2, run_id, [word], {} if decision is None else {word.proposal_id: decision})
+
+    assert results(outcomes) == [CONFLICT]   # whatever the Curator Agent said: the rules are code
+    assert entries(imported, kb) == []
+    kinds_untouched(imported, kb, before)
+    row = proposal_row(imported, word)
+    assert (row["status"], row["decided_at"] is not None) == ("pending_human", True)
+    assert "across kinds" in row["reason"] and "ユキ" in row["reason"] and "profile" in row["reason"]
+    assert load_snapshot(imported, kb).term("ユキ") is None   # still no term for the agents to find
+
+
+def test_a_term_whose_source_is_a_profiles_alias_goes_to_a_person_and_no_entry_is_written(imported, kb, run_id):
+    insert_profile(imported, kb, "ユキ", aliases=["ゆき", "雪ちゃん"])
+    before = dump(imported)
+    word = term(kb, 2, "雪ちゃん", "小雪酱")
+
+    outcomes = apply(imported, kb, 2, run_id, [word], accept_all([word]))
+
+    assert results(outcomes) == [CONFLICT] and entries(imported, kb) == []
+    kinds_untouched(imported, kb, before)
+    row = proposal_row(imported, word)
+    assert row["status"] == "pending_human" and "across kinds" in row["reason"] and "an alias" in row["reason"]
+
+
+@pytest.mark.parametrize("decision", [None, accept("a real name"), reject("not a name")], ids=["none", "accept", "reject"])
+@pytest.mark.parametrize("status", ["approved", "pending_human"])
+def test_a_character_whose_name_is_an_entrys_source_goes_to_a_person_and_no_profile_is_written(
+        imported, kb, run_id, status, decision):
+    insert_entry(imported, kb, "封印", "封印术", status=status)
+    before = dump(imported)
+    person = name(kb, 2, "封印", "封印", aliases=["ふういん"])
+
+    outcomes = apply(imported, kb, 2, run_id, [person], {} if decision is None else {person.proposal_id: decision})
+
+    assert results(outcomes) == [CONFLICT] and profiles(imported, kb) == []
+    kinds_untouched(imported, kb, before)
+    row = proposal_row(imported, person)
+    assert (row["status"], row["decided_at"] is not None) == ("pending_human", True)
+    assert "across kinds" in row["reason"] and "封印" in row["reason"] and "entry" in row["reason"]
+    assert load_snapshot(imported, kb).character("封印") is None
+
+
+def test_on_one_page_a_name_then_a_term_with_its_source_meet_as_a_conflict_across_kinds(imported, kb, run_id):
+    person, word = name(kb, 1, "ユキ", "小雪"), term(kb, 1, "ユキ", "雪")
+
+    outcomes = apply(imported, kb, 1, run_id, [person, word], accept_all([person, word]))
+
+    assert results(outcomes) == [PENDING, CONFLICT]   # the earlier proposal counts as existing for the later one
+    assert [p["name_src"] for p in profiles(imported, kb)] == ["ユキ"] and entries(imported, kb) == []
+    assert proposal_row(imported, word)["status"] == "pending_human"
+
+
+def test_on_one_page_a_term_then_a_name_with_its_source_meet_as_a_conflict_across_kinds(imported, kb, run_id):
+    word, person = term(kb, 1, "ユキ", "雪"), name(kb, 1, "ユキ", "小雪")
+
+    outcomes = apply(imported, kb, 1, run_id, [word, person], accept_all([word]))
+
+    assert results(outcomes) == [ACCEPTED, CONFLICT]
+    assert [e["source_term"] for e in entries(imported, kb)] == ["ユキ"] and profiles(imported, kb) == []
+    row = proposal_row(imported, person)
+    assert row["status"] == "pending_human" and "across kinds" in row["reason"]
+
+
+def test_on_one_page_a_name_after_a_term_that_was_not_stored_is_a_new_name(imported, kb, run_id):
+    word, person = term(kb, 1, "ユキ", "雪"), name(kb, 1, "ユキ", "小雪")   # the term is rejected: there is no entry
+
+    outcomes = apply(imported, kb, 1, run_id, [word, person], {word.proposal_id: reject("a name, not a term")})
+
+    assert results(outcomes) == [REJECTED, PENDING] and [p["name_src"] for p in profiles(imported, kb)] == ["ユキ"]
+
+
+@pytest.mark.parametrize("status", ["proposed", "rejected"])
+def test_a_proposed_or_rejected_profile_never_triggers_the_rule_for_a_term(imported, kb, run_id, status):
+    insert_profile(imported, kb, "ユキ", aliases=["ゆき"], status=status)
+    words = [term(kb, 2, "ユキ", "雪"), term(kb, 2, "ゆき", "雪儿")]
+
+    outcomes = apply(imported, kb, 2, run_id, words, accept_all(words))
+
+    assert results(outcomes) == [ACCEPTED, ACCEPTED]   # the profile is not readable, so it is not there to collide with
+
+
+@pytest.mark.parametrize("status", ["proposed", "rejected"])
+def test_a_proposed_or_rejected_entry_never_triggers_the_rule_for_a_character(imported, kb, run_id, status):
+    insert_entry(imported, kb, "封印", status=status)
+    person = name(kb, 2, "封印", "封印")
+
+    outcomes = apply(imported, kb, 2, run_id, [person])
+
+    assert results(outcomes) == [PENDING] and [p["name_src"] for p in profiles(imported, kb)] == ["封印"]
+
+
+def test_a_same_kind_match_comes_first_so_a_confirmation_is_still_a_confirmation(imported, kb, run_id):
+    insert_entry(imported, kb, "ユキ", "雪")   # a term, and a profile with the same string: a KB older than the rule
+    insert_profile(imported, kb, "ユキ")
+    word = term(kb, 2, "ユキ", "雪")
+
+    outcomes = apply(imported, kb, 2, run_id, [word])
+
+    assert results(outcomes) == [CONFIRMED]   # nothing new is created, so no name ends up under the wrong kind
+    assert pages(entries(imported, kb)[0]) == [1, 2]
+
+
+def test_a_term_and_a_name_that_share_nothing_are_not_touched_by_the_rule(imported, kb, run_id):
+    insert_profile(imported, kb, "ユキ", aliases=["ゆき"])
+    insert_entry(imported, kb, "封印")
+    proposals = [term(kb, 2, "結界", "结界"), name(kb, 2, "ハル", "小春", aliases=["ユキ以外"])]
+
+    outcomes = apply(imported, kb, 2, run_id, proposals, accept_all(proposals))
+
+    assert results(outcomes) == [ACCEPTED, PENDING]
 
 
 # --- rule 4: a name becomes a pending profile, whatever the decision says ---

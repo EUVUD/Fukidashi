@@ -16,8 +16,8 @@ that gives no usable answer is `unusable`, and the translation it was meant to r
 With a Knowledge Base snapshot (`kb`, with the page's `ProposalCollector`) the Translator also has `lookup_term`,
 `lookup_character` and `propose_entry` (OUTLINE §3.2), its system prompt is `KB_SYSTEM_PROMPT`, and the user message
 starts with the KB's entries for the page (§3.4: system, tools, glossary, page). The snapshot and the collector hold no
-database connection, so the handlers are safe in worker threads. The Reviewer's two lookups and its snippets part are
-built here too, and `reviewer.py` imports them: one definition of what an agent can read from the KB.
+database connection, so the handlers are safe in worker threads. The lookups and the snippets part are what the
+Reviewer reads from the KB too, so they are defined once, in `kb_tools.py`; `propose_entry` is the Translator's alone.
 
 This module imports no LangChain and no database: the earlier pages are read by the caller before the run starts,
 because tool handlers run in LangGraph worker threads.
@@ -27,27 +27,27 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Annotated, Any
 
 from pydantic import BaseModel, Field, StringConstraints, WithJsonSchema, field_validator
 
 from ..datasets.openmantra import Page
-from ..kb.collector import ProposalCollector
-from ..kb.entities import APPROVED, KEY_FIELDS, KINDS, PAYLOADS, CharacterProfile, GlossaryEntry
+from ..kb.collector import DEFAULT_PROPOSER, ProposalCollector
+from ..kb.entities import KEY_FIELDS, KINDS, PAYLOADS, Proposal, make_proposal
 from ..kb.snapshot import KBSnapshot
 from ..llm.client import LLMClient
 from ..llm.errors import ProviderError
 from ..llm.metering import BudgetExceeded, PageBudget
 from ..pipeline import baseline
+from .kb_tools import kb_snippets_part, lookup_tools
 from .loop import BUDGET, DEFAULT_MAX_STEPS, FINAL, PROVIDER_ERROR, Tool, run_agent
 
 CONFIG_NAME = "translator"
 DEFAULT_PAGE_BUDGET = 60_000  # tokens for the agent and its repair; the fallback has its own (baseline's)
 MAX_PAGES_BACK = 2
 MAX_REASON_CHARS = 200
-KB_SNIPPET_CHARS = 1_000  # the character budget of the KB's entries at the start of a user message (OUTLINE §3.3)
 PROPOSE_ENTRY = "propose_entry"
 
 SYSTEM_PROMPT = """You translate Japanese manga dialogue into Simplified Chinese (zh-Hans).
@@ -187,66 +187,7 @@ class FlagCollector:
             return sorted(self._flags, key=lambda f: f["id"])  # stable: one region's flags keep the order they came in
 
 
-# --- the Knowledge Base's tools (OUTLINE §3.2, §3.3) ----------------------------------------------------------------
-
-def kb_snippets_part(page: Page, kb: KBSnapshot) -> dict:
-    """The text part that starts a user message when the KB is on: the entries and profiles found in the page's Japanese
-    text, cut to `KB_SNIPPET_CHARS`, or a line saying there are none.
-
-    The regions are matched one per line, so that no entry can match across two regions.
-    """
-    snippets = kb.snippets("\n".join(s.ja for s in page.segments), KB_SNIPPET_CHARS)
-    if not snippets:
-        return {"type": "text", "text": "The knowledge base has no entry for this page's text yet."}
-    return {"type": "text", "text": "Knowledge base entries that occur in this page's text:\n" + snippets}
-
-
-def _status(item: GlossaryEntry | CharacterProfile) -> str:
-    return "approved" if item.status == APPROVED else "pending"  # a snapshot holds nothing but these two
-
-
-class LookupTermArgs(BaseModel):
-    source_term: str = Field(description="The term exactly as it is written in the Japanese text.")
-
-
-class LookupCharacterArgs(BaseModel):
-    name: str = Field(description="The character's name, or another name they are called by, as written in the "
-                                  "Japanese text.")
-
-
-def lookup_tools(kb: KBSnapshot) -> list[Tool]:
-    """`lookup_term` and `lookup_character` over `kb`, the Reviewer's tools as well as the Translator's.
-
-    The handlers only read the snapshot, which is immutable and holds no database connection, so they are safe in worker
-    threads. An exact lookup: a term must be written as the entry has it (after NFKC and trimming).
-    """
-
-    def lookup_term(source_term: str) -> dict:
-        entry = kb.term(source_term)
-        if entry is None:
-            return {"found": False, "note": "The knowledge base has no entry for this term."}
-        return {"found": True, "source_term": entry.source_term, "target_term": entry.target_term,
-                "category": entry.category, "status": _status(entry)}
-
-    def lookup_character(name: str) -> dict:
-        profile = kb.character(name)
-        if profile is None:
-            return {"found": False, "note": "The knowledge base has no character with this name."}
-        return {"found": True, "name_src": profile.name_src, "name_tgt": profile.name_tgt,
-                "aliases": list(profile.aliases), "notes": profile.notes, "status": _status(profile)}
-
-    return [
-        Tool(name="lookup_term",
-             description="Look up one Japanese term in the knowledge base of this book. Returns its Chinese rendering "
-                         "and whether a person has confirmed it (approved) or not yet (pending), or says there is none.",
-             args=LookupTermArgs, handler=lookup_term),
-        Tool(name="lookup_character",
-             description="Look up a character in the knowledge base of this book by their name or by another name they "
-                         "are called by. Returns the Chinese name, the other names, notes on their speech style and "
-                         "whether a person has confirmed the profile (approved) or not yet (pending), or says there is none.",
-             args=LookupCharacterArgs, handler=lookup_character),
-    ]
-
+# --- propose_entry (OUTLINE §3.2, §3.3; the lookups and the snippets are in kb_tools.py) ----------------------------
 
 def _payload_help() -> str:
     """What the `payload` of each kind holds, taken from the payload models, so that the prompt's tool definition and
@@ -291,20 +232,44 @@ def propose_entry_tool(collector: ProposalCollector) -> Tool:
     )
 
 
-def proposal_ids(steps: Sequence[Mapping]) -> list[str]:
-    """The ids of the proposals that the `propose_entry` calls of an agent run made, each once, in the order of the
-    calls: the step, then the call's position in the model's reply.
+def _accepted_calls(steps: Sequence[Mapping]) -> Iterator[Mapping]:
+    """The `propose_entry` calls of an agent run that made a proposal, in the order of the calls: the step, then the
+    call's position in the model's reply.
 
     The calls of one reply run in parallel, so the order in which their handlers finish is a race; the steps keep the
     order the model made them in. Only calls whose handler ran and returned count: a call the model got wrong, a
     duplicate that was not run again, and a call in a reply that was cut off have no proposal.
     """
-    ids: dict[str, None] = {}
     for step in steps:
         for tool_call in step["tool_calls"]:
             if tool_call["name"] == PROPOSE_ENTRY and tool_call["ran"] and tool_call["error"] is None:
-                ids.setdefault(json.loads(tool_call["result"])["proposal_id"])
+                yield tool_call
+
+
+def proposal_ids(steps: Sequence[Mapping]) -> list[str]:
+    """The ids of the proposals that the `propose_entry` calls of an agent run made, each once, in the order of the
+    calls (see `_accepted_calls`)."""
+    ids: dict[str, None] = {}
+    for tool_call in _accepted_calls(steps):
+        ids.setdefault(json.loads(tool_call["result"])["proposal_id"])
     return list(ids)
+
+
+def step_proposals(steps: Sequence[Mapping], kb_id: int, page_index: int) -> tuple[Proposal, ...]:
+    """The proposals that the `propose_entry` calls of an agent run made, each id once, in the order of the calls, with
+    the payload of the first call that made it.
+
+    Two calls can make the same proposal id (the same kind, source and target) with other details (a category, aliases,
+    notes). The collector keeps whichever call arrived first, and for the calls of one reply, which run side by side,
+    that is a race. So the proposals are built again from the arguments the steps recorded, by the same `make_proposal`
+    the handler used, and the first call in the order of the calls wins: what is kept does not depend on thread timing.
+    """
+    made: dict[str, Proposal] = {}
+    for tool_call in _accepted_calls(steps):
+        arguments = json.loads(tool_call["arguments"])  # the handler ran on these, so `make_proposal` accepts them
+        proposal = make_proposal(kb_id, page_index, arguments["kind"], arguments["payload"], DEFAULT_PROPOSER)
+        made.setdefault(proposal.proposal_id, proposal)
+    return tuple(made.values())
 
 
 @dataclass(frozen=True)
@@ -322,6 +287,7 @@ class TranslatorResult:
     error: str | None = None  # why translations is None
     flags: list[dict] = field(default_factory=list)  # {"id", "reason"}; see run_translator
     unusable: bool = False  # a revision that gave no usable answer; see run_translator. Never true for a first pass
+    proposals: tuple[Proposal, ...] = ()  # the run's KB proposals; see run_translator. Empty without a collector
 
     @property
     def ok(self) -> bool:
@@ -334,7 +300,7 @@ class TranslatorResult:
 
     @property
     def proposal_ids(self) -> list[str]:
-        """The proposals this run's `propose_entry` calls made, as ids in the order of the calls (see `proposal_ids`).
+        """The ids of `proposals`, read from the calls' results (see `proposal_ids`).
 
         They count whatever became of the run: after a fallback, and for a revision that was unusable, the calls were
         made and the collector has them. Whether a proposal fits the translation that is stored is the Curator's
@@ -378,10 +344,12 @@ def run_translator(
 
     With a `kb` snapshot the agent also has `lookup_term`, `lookup_character` and `propose_entry`, uses
     `KB_SYSTEM_PROMPT`, and the user message starts with the KB's entries for the page; the proposals go to `collector`,
-    the page's, which the caller shares between the page's runs. `proposal_ids` of the result says which proposals this
-    run made and in what order. The KB goes with flagging (its prompt describes `flag_uncertain`), and `kb` and
+    the page's, which the caller shares between the page's runs. `proposals` of the result are the proposals this run
+    made, in the order of the calls, each id once with the payload of the first call that made it (see
+    `step_proposals`): the collector only answers the model, and what it kept is not what the caller stores. They count
+    whatever became of the run. The KB goes with flagging (its prompt describes `flag_uncertain`), and `kb` and
     `collector` come together and must be the page's own: anything else is a `ValueError`, before any request. With no
-    `kb`, which is the default, the requests are what they are without the KB.
+    `kb`, which is the default, the requests are what they are without the KB, and `proposals` is empty.
     """
     ids = [s.index for s in page.segments]
     if revision is not None:
@@ -408,13 +376,16 @@ def run_translator(
         "repair": None,
         "fallback": None,
     }
+    # The agent's calls are all made by now (the repair and the fallback have no tools), so this is the run's proposals.
+    made = step_proposals(agent.steps, collector.kb_id, collector.page_index) if collector is not None else ()
     if agent.stop_reason in (PROVIDER_ERROR, BUDGET):
-        return TranslatorResult(None, record, agent.error)  # no fallback: it would send another request (OUTLINE §3.6)
+        # no fallback: it would send another request (OUTLINE §3.6)
+        return TranslatorResult(None, record, agent.error, proposals=made)
 
     if agent.stop_reason == FINAL:
         try:
             return TranslatorResult(baseline.parse_translations(agent.text, ids), record,
-                                    flags=flag_collector.flags if flag_collector is not None else [])
+                                    flags=flag_collector.flags if flag_collector is not None else [], proposals=made)
         except PARSE_ERRORS as e:
             answer_error = str(e)
         record["agent"]["answer_parse_error"] = answer_error
@@ -424,15 +395,15 @@ def run_translator(
                 budget=budget, max_tokens=max_tokens, json_output=True,
             )
         except BudgetExceeded as e:
-            return TranslatorResult(None, record, f"Stopped: {e}")
+            return TranslatorResult(None, record, f"Stopped: {e}", proposals=made)
         except ProviderError as e:
             record["repair"] = {"error": e.description, "record": asdict(e.record) if e.record is not None else None,
                                 "raw": None, "parse_error": None}
-            return TranslatorResult(None, record, e.description)
+            return TranslatorResult(None, record, e.description, proposals=made)
         record["repair"] = {"error": None, "record": asdict(reply.record), "raw": reply.text, "parse_error": None}
         try:
             return TranslatorResult(baseline.parse_translations(reply.text, ids), record,
-                                    flags=flag_collector.flags if flag_collector is not None else [])
+                                    flags=flag_collector.flags if flag_collector is not None else [], proposals=made)
         except PARSE_ERRORS as e:
             record["repair"]["parse_error"] = str(e)
             reason = f"unparseable: the answer ({answer_error}) and its repair ({e}) could not be used"
@@ -440,10 +411,10 @@ def run_translator(
         reason = f"{agent.stop_reason}: {agent.error}"
 
     if revision is not None:  # no fallback: the translation the revision was meant to replace stands
-        return TranslatorResult(None, record, reason, unusable=True)
+        return TranslatorResult(None, record, reason, unusable=True, proposals=made)
     fallback = baseline.run_baseline(page, client, PageBudget(page.page_id, fallback_budget), max_tokens=max_tokens)
     record["fallback"] = {"reason": reason, "attempts": fallback.attempts}
-    return TranslatorResult(fallback.translations, record, fallback.error)
+    return TranslatorResult(fallback.translations, record, fallback.error, proposals=made)
 
 
 def _user_message(page: Page, revision: Revision | None, kb: KBSnapshot | None) -> list[dict]:

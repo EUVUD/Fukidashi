@@ -44,7 +44,7 @@ from fukidashi.kb import KBSnapshot, ProposalCollector
 from fukidashi.kb.entities import KEY_FIELDS
 from fukidashi.llm.client import LLMClient, LLMConfig
 from fukidashi.llm.metering import CallRecord, Meter
-from fukidashi.orchestrator.flow import proposals_in_order
+from fukidashi.orchestrator.flow import merge_proposals
 from fukidashi.pipeline import baseline
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -176,13 +176,14 @@ def changed_regions(before: dict[int, str], after: dict[int, str]) -> list[int]:
     return [i for i in sorted(before) if before[i] != after.get(i)]
 
 
-def kb_report(kb: KBSnapshot, collector: ProposalCollector, stages: list[tuple[str, object]]) -> dict:
-    """What --kb found out: the page's proposals, in the order of the calls, and every KB tool call of each stage.
-    `stages` are (name, result) pairs of the stages that ran; a Reviewer's result has no proposals."""
-    order = [i for _, result in stages for i in getattr(result, "proposal_ids", [])]
+def kb_report(kb: KBSnapshot, stages: list[tuple[str, object]]) -> dict:
+    """What --kb found out: the page's proposals, in the order of the calls (each id once, with its first call's
+    payload), and every KB tool call of each stage. `stages` are (name, result) pairs of the stages that ran; a
+    Reviewer's result has no proposals."""
+    made = merge_proposals(*(getattr(result, "proposals", ()) for _, result in stages))
     proposals = [{"kind": p.kind, **dict(zip(("source", "target"), (p.payload[f] for f in KEY_FIELDS[p.kind]))),
                   "payload": p.payload, "proposal_id": p.proposal_id}
-                 for p in proposals_in_order(collector, order)]
+                 for p in made]
     calls = [{"stage": name, "tool": c["name"], "arguments": c["arguments"], "result": c["result"], "error": c["error"],
               "ran": c["ran"], "duplicate": c["duplicate"]}
              for name, result in stages for c in tool_calls_of(result.attempts) if c["name"] in KB_TOOLS]
@@ -251,7 +252,7 @@ def main() -> None:
         meter.records[translator_calls:], second.attempts["agent"]["stop_reason"], second.attempts["agent"]["steps"]))
     kb_stages = [("translator", made), *([("revision", revision)] if revision is not None else []),
                  *([("reviewer", review)] if review is not None else [])]
-    knowledge_base = None if kb is None else kb_report(kb, collector, kb_stages)
+    knowledge_base = None if kb is None else kb_report(kb, kb_stages)
     models = sorted({r.response_model for r in meter.records if r.response_model})
     flagged = {}
     for f in made.flags:

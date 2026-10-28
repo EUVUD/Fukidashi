@@ -10,8 +10,9 @@ from kb_support import KB_TABLES, accept, name, new_kb, new_run, term
 from fukidashi import store
 from fukidashi.datasets.importer import import_openmantra
 from fukidashi.db import connect, init_db
-from fukidashi.kb import ProposalCollector, load_snapshot
+from fukidashi.kb import ProposalCollector
 from fukidashi.kb.curator import ACCEPTED, apply
+from fukidashi.kb.loader import load_snapshot
 
 # schema.sql as it was before the KB tables, to build a database from the old schema.
 OLD_SCHEMA = """

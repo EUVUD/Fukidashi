@@ -13,8 +13,8 @@ no verdict is returned, never raised: `unusable` when nothing more was sent for 
 it is (a Repair that failed, the Step limit, a cut-off reply), `failed` after a provider error or a spent budget, where
 nothing more is sent either (OUTLINE §3.6).
 
-This module imports no LangChain and no database. The lookups and the snippets part are the Translator's: they are
-defined in `translator.py`, so that both agents read the KB the same way.
+This module imports no LangChain and no database, and not the Translator's module. The lookups and the snippets part
+are shared with the Translator: they are defined once, in `kb_tools.py`, so that both agents read the KB the same way.
 """
 
 from __future__ import annotations
@@ -29,8 +29,8 @@ from ..llm.client import LLMClient
 from ..llm.errors import ProviderError
 from ..llm.metering import BudgetExceeded, PageBudget
 from ..pipeline import baseline
+from .kb_tools import kb_snippets_part, lookup_tools
 from .loop import BUDGET, DEFAULT_MAX_STEPS, FINAL, PROVIDER_ERROR, run_agent
-from .translator import kb_snippets_part, lookup_tools
 
 DEFAULT_REVIEW_BUDGET = 30_000  # tokens; the Reviewer's own, so a long Translator run cannot leave it without
 

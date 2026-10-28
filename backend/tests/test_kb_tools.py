@@ -20,12 +20,13 @@ from test_reviewer import APPROVE, REVISE, issue, verdict_json
 from test_translator import tool_result
 
 from fukidashi import store
-from fukidashi.agents import reviewer, translator
+from fukidashi.agents import kb_tools, reviewer, translator
 from fukidashi.datasets.importer import import_openmantra
 from fukidashi.datasets.openmantra import get_page
-from fukidashi.kb import KBSnapshot, ProposalCollector, load_snapshot
+from fukidashi.kb import KBSnapshot, ProposalCollector
 from fukidashi.kb.curator import apply
 from fukidashi.kb.entities import CharacterProfile, GlossaryEntry, make_proposal
+from fukidashi.kb.loader import load_snapshot
 from fukidashi.orchestrator import flow, run_orchestrator
 from fukidashi.pipeline import baseline
 
@@ -152,8 +153,8 @@ def test_the_snippets_are_cut_to_the_character_budget_and_never_in_the_middle_of
 
     text = provider.bodies[0]["messages"][1]["content"][0]["text"]
     lines = text.removeprefix(HEADER).split("\n")
-    assert translator.KB_SNIPPET_CHARS == 1_000
-    assert 0 < len(lines) < len(singles) and len("\n".join(lines)) <= translator.KB_SNIPPET_CHARS
+    assert kb_tools.KB_SNIPPET_CHARS == 1_000
+    assert 0 < len(lines) < len(singles) and len("\n".join(lines)) <= kb_tools.KB_SNIPPET_CHARS
     assert all(line.startswith("term: ") and line.endswith("译" * 100) for line in lines)  # whole lines only
 
 
@@ -170,8 +171,8 @@ def test_the_regions_are_matched_one_by_one_so_that_no_entry_matches_across_two_
 def test_the_snippets_part_is_the_same_for_the_translator_and_the_reviewer(page):
     kb = snapshot(ON_PAGE_TERM, ON_PAGE_NAME)
 
-    assert translator.kb_snippets_part(page, kb) == {"type": "text", "text": HEADER + "\n".join(EXPECTED_LINES)}
-    assert reviewer.build_user_message(page, {0: "你好", 1: "再见"}, [], kb)[0] == translator.kb_snippets_part(page, kb)
+    assert kb_tools.kb_snippets_part(page, kb) == {"type": "text", "text": HEADER + "\n".join(EXPECTED_LINES)}
+    assert reviewer.build_user_message(page, {0: "你好", 1: "再见"}, [], kb)[0] == kb_tools.kb_snippets_part(page, kb)
 
 
 def test_the_kb_on_needs_flagging_a_collector_and_the_pages_own_collector_before_any_request(page):
@@ -235,7 +236,7 @@ def test_propose_entrys_definition_says_a_name_is_a_character_and_what_the_paylo
 # --- AC3: the lookups ---------------------------------------------------------------------------------------------
 
 def handlers(kb):
-    return {t.name: t.handler for t in translator.lookup_tools(kb)}
+    return {t.name: t.handler for t in kb_tools.lookup_tools(kb)}
 
 
 def test_lookup_term_returns_an_approved_entry_a_pending_one_marked_and_says_when_a_term_is_missing():
