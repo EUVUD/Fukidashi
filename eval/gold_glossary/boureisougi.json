@@ -2,8 +2,8 @@
   "book_title": "boureisougi",
   "split": "dev",
   "opencc_config": "t2s",
-  "drafted_by": "Claude (an AI coding assistant, not the translation model), 2026-10-28, from text_ja and the OpenCC t2s-converted text_zh of annotation.json only; no stored Runs, Translations or eval outputs were opened",
-  "reviewed_by_author": null,
+  "drafted_by": "Claude (an AI coding assistant, not the translation model), 2026-10-27, from text_ja and the OpenCC t2s-converted text_zh of annotation.json only; no stored Runs, Translations or eval outputs were opened",
+  "reviewed_by_author": "2026-10-27",
   "entries": [
     {"id": "kururu", "category": "character", "source": "枢", "target": "枢", "note": "Given name of the undertaker, the protagonist; the text gives its reading once."},
     {"id": "karasuma", "category": "character", "source": "烏丸", "target": "乌丸", "note": "Family name of the undertaker; also the name of his funeral company."},
