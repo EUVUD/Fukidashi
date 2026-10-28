@@ -36,4 +36,4 @@ One task is one PR, about 1–4 hours, one concern. Split anything larger and us
 
 ## When the user comes back after a review
 
-Read the task's `## Review`, explain the verdict in plain words, and recommend one of: merge, another execution round, or change the task. Once the user has merged, set `status: done`, record the PR number in `pr:`, update the OUTLINE milestone row if the milestone is complete, and propose the next task.
+Read the task's `## Review`, explain the verdict in plain words, and recommend one of: merge, another execution round, or change the task. Once the user has merged, set `status: done`, record the PR number in `pr:`, update the OUTLINE milestone row if the milestone is complete, and propose the next task. Offer to remove the task's worktree (`git worktree remove <main checkout>-task-NNN`, after `git cherry -v origin/main task/NNN-slug` shows its commits landed); remove it only when the user agrees.

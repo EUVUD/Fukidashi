@@ -4,14 +4,15 @@
 
 多 agent 漫画翻译编辑器（日 → 简体中文）。在 [OpenMantra](https://github.com/mantra-inc/open-mantra-dataset) 数据集上，用标准的 MT evaluation framework 和单次调用的 baseline 做对比。
 
-> **现状（2026-10-28）：** M0、M1 和 M2 已完成。vertical slice 已经跑通：导入 OpenMantra，对一页做一次模型调用完成翻译，在浏览器里逐句对照图上的 box 检查译文。M2 新增了用 chrF / BLEU 给各个 config 打分的 eval harness；第一版 Translator Agent（即 `translator` config），它跑在调用工具的 agent loop 上，底下是带计量的 client；还有可选的 tracing，trace 发到本机的 Arize Phoenix（[记录](docs/m2.md)）。下一步是 M3 的 Knowledge Base 和 Reviewer。
+> **现状（2026-10-28）：** M0、M1 和 M2 已完成。vertical slice 已经跑通：导入 OpenMantra，对一页做一次模型调用完成翻译，在浏览器里逐句对照图上的 box 检查译文。M2 新增了用 chrF / BLEU 给各个 config 打分的 eval harness；第一版 Translator Agent（即 `translator` config），它跑在调用工具的 agent loop 上，底下是带计量的 client；还有可选的 tracing，trace 发到本机的 Arize Phoenix（[记录](docs/m2.md)）。M3 正在进行：两部 dev 作品的 gold glossary 和 Reviewer Agent 已经有了，接下来是 Orchestrator 和 Knowledge Base。
 
 ## 它做什么
 
 - **带上下文翻译一页。** 模型同时看到整页图片和每个气泡的日文原文、box，为每个 box 返回一句简体中文。
 - **在原位检查。** 编辑器在页面上画出每个 box，并把原文、译文和参考译文并排列出。
 - **第一版 Translator Agent（M2）。** `translator` config 给模型同样的一页，外加一个读取前几页的工具；答案不合格时修复一次，仍不行就回退到 `baseline`，并且会明确记录下来。
-- **计划中（M3）：** 查 Glossary 和 Character Profiles 的 tools；Reviewer Agent 在 independent context 里检查结果；Curator Agent 是每本书 Knowledge Base 唯一的写者。
+- **Reviewer Agent（M3，进行中）。** 在 independent context 里检查一页的译文：它看得到页面、译文和 Translator 标为不确定的区域，看不到 Translator 的推理。目前还没有接入任何 config。
+- **计划中（M3）：** 按 翻译 → 审校 → 定稿 运行的 Orchestrator；查 Glossary 和 Character Profiles 的 tools；Curator Agent 是每本书 Knowledge Base 唯一的写者。
 
 ## 怎么评测
 
@@ -68,6 +69,7 @@ Tracing 默认关闭，出错也不会让翻译失败。每个 span 里的页面
 ```bash
 uv run pytest                                       # 不联网，不发真实 LLM 请求
 uv run python scripts/m0_first_call.py --dry-run    # 打印 M0 的请求内容，不发送
+uv run python eval/glossary.py check                # 对照数据集检查 gold glossary；不调用模型
 ```
 
 ## Roadmap
@@ -77,7 +79,7 @@ uv run python scripts/m0_first_call.py --dry-run    # 打印 M0 的请求内容�
 | M0 决定与第一次调用 | 10/18 | 完成（[记录](docs/m0.md)） |
 | M1 Vertical slice：页面 → `baseline` → 浏览器 | 10/25 | 完成（[记录](docs/m1.md)） |
 | M2 Agent layer 与 eval harness | 11/1 | 完成（[记录](docs/m2.md)） |
-| M3 Knowledge Base 与 Reviewer | 11/8 | 计划中 |
+| M3 Knowledge Base 与 Reviewer | 11/8 | 进行中 |
 | M4–M5 Dev 评测、冻结 eval protocol | 11/22 | 计划中 |
 | M6–M8 Test 运行、编辑器产品化、分析 | 1/3 | 计划中 |
 | M9 报告与发布 | 1/17 | 计划中 |
@@ -90,8 +92,8 @@ uv run python scripts/m0_first_call.py --dry-run    # 打印 M0 的请求内容�
 
 ## 数据与署名
 
-OpenMantra 来自 Hinami et al., *Towards Fully Automated Manga Translation*（AAAI 2021），许可为 **CC BY-NC 4.0**。图片不在本仓库里，请按上面的命令另外 clone。文档里为了举例引用了其中几句短文本。数据笔记：[docs/openmantra.md](docs/openmantra.md)（英文）。
+OpenMantra 来自 Hinami et al., *Towards Fully Automated Manga Translation*（AAAI 2021），许可为 **CC BY-NC 4.0**。图片不在本仓库里，请按上面的命令另外 clone。文档里为了举例引用了其中几句短文本；`eval/gold_glossary/` 里的 gold glossary 含有取自其日文原文和中文参考译文的短术语（人名和反复出现的词）。数据笔记：[docs/openmantra.md](docs/openmantra.md)（英文）。
 
 ## 许可
 
-本仓库的代码以 [MIT License](LICENSE) 发布。该许可不覆盖 OpenMantra：数据集本身不在本仓库里分发，文档中引用的原文仍适用 CC BY-NC 4.0，使用数据集须遵守该许可。
+本仓库的代码以 [MIT License](LICENSE) 发布。该许可不覆盖 OpenMantra：数据集本身不在本仓库里分发，文档中引用的原文和 `eval/gold_glossary/` 里的术语仍适用 CC BY-NC 4.0，使用数据集须遵守该许可。
