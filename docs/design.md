@@ -1,6 +1,6 @@
 # Design Diagrams
 
-> 2026-10-27 · Matches the code after M2's first seven tasks: the eval harness v0, the Run status and cost fixes, provider and malformed-response error handling, the tool-calling loop and the Translator Agent. Diagrams are Mermaid and render on GitHub.
+> 2026-10-27 · Matches the code at the end of M2: the eval harness v0, the Run status and cost fixes, provider and malformed-response error handling, the tool-calling loop, the Translator Agent and tracing. Diagrams are Mermaid and render on GitHub.
 > **Solid = implemented; dashed = planned** (milestones in [OUTLINE.md](../OUTLINE.md) §7). Terms follow OUTLINE §0.
 
 Fukidashi translates Japanese manga into Simplified Chinese (zh-Hans). Each page has several Segments (one line of dialogue in one oracle box); the model looks at the whole page image and translates them together, and the user checks the translations against the boxes in the browser.
@@ -140,6 +140,20 @@ sequenceDiagram
     Note over G: Meter appends every call to runs/usage.jsonl
 ```
 
+**Tracing** (optional, `FUKIDASHI_TRACING=phoenix`). The whole `translate_page` call runs inside one root span, so one page is one trace in the local Phoenix. The OpenInference instrumentors add a span for every provider call and for the agent graph and its tools. A `translator` page as recorded in M2, simplified (16 spans in all, most of them LangGraph's node and middleware spans):
+
+```
+translate_page tojime_no_siora/3   (config, run_id, run_status, calls, stop_reason, fallback_reason)
+├─ LangGraph                       the agent: model and tool nodes, middleware
+│  ├─ LLMClientChatModel           LangChain's view of a model call
+│  ├─ get_previous_context         tool span: arguments and result
+│  └─ LLMClientChatModel
+├─ ChatCompletion                  the openai SDK call: messages, tokens (images replaced by "[image omitted]")
+└─ ChatCompletion
+```
+
+The `ChatCompletion` spans are children of the root, next to the LangChain spans rather than inside them, because the LangChain instrumentor does not make its spans current. A `baseline` page is the root and one `ChatCompletion` span per call.
+
 **The agent loop.** `run_agent` (`agents/loop.py`) runs a model through tool calls. The Translator Agent calls it for config `translator`, and `scripts/m2_tool_smoke.py` calls it with a toy tool. One run:
 
 ```mermaid
@@ -194,11 +208,11 @@ flowchart TD
 
 ## 4. Object Model
 
-The objects in the code and how they depend on each other (the actual structure after M2's first seven tasks).
+The objects in the code and how they depend on each other (the actual structure at the end of M2).
 
 ### 4.1 Backend
 
-Colors mark layers: blue = API, teal = eval, pink = service, green = pipeline, lime = agents, orange = LLM, purple = data.
+Colors mark layers: blue = API, teal = eval, pink = service, green = pipeline, lime = agents, orange = LLM, purple = data, grey = tracing.
 
 ```mermaid
 classDiagram
@@ -214,6 +228,14 @@ classDiagram
     class EvalHarness:::eval {
         run_eval()
     }
+    class Tracing:::tracing {
+        setup()
+        page_span()
+    }
+    class Backend:::tracing {
+        phoenix()
+    }
+    class RedactingExporter:::tracing
     class EvalOutputs:::eval {
         manifest.json
         segments.jsonl
@@ -289,6 +311,9 @@ classDiagram
     EvalHarness ..> Runs : validate, translate
     EvalHarness ..> Store : reads Runs, Translations
     EvalHarness ..> EvalOutputs : writes
+    Runs ..> Tracing : page_span
+    Tracing ..> Backend : exporter
+    Tracing ..> RedactingExporter : wraps the exporter
     Runs ..> Store : Runs, Translations
     Runs ..> Baseline : config baseline
     Runs ..> Translator : config translator
@@ -314,6 +339,7 @@ classDiagram
 
     classDef api fill:#e8f0fe,stroke:#4a78d0,color:#222
     classDef eval fill:#e0f4f4,stroke:#2a9d9d,color:#222
+    classDef tracing fill:#eeeeee,stroke:#777777,color:#222
     classDef service fill:#fde8f1,stroke:#c4527f,color:#222
     classDef pipeline fill:#e6f4ea,stroke:#3a9d5d,color:#222
     classDef agent fill:#eef6d8,stroke:#7a9a2a,color:#222
@@ -324,6 +350,7 @@ classDiagram
 - `PagesRouter` only parses parameters, maps errors to status codes and shapes responses; it has no SQL. "Translate a page and record a Run" lives in `Runs.translate_page`, and the SQL lives in `Store`.
 - `Runs.translate_page` does not depend on HTTP, so the eval harness calls it directly (OUTLINE §1.3, Same code path). An invalid page raises `PageNotFound` or another `TranslateError` before any Run exists, which the router maps to 404 / 422. A failed model call or unparseable output is not an exception but a `failed` Run (502). An unexpected exception after the Run row exists marks that Run failed and is raised as `RunCrashed` with its `run_id` (500).
 - `EvalHarness` (`evaluation/harness.py`; CLI `eval/run.py`) calls `validate_page` for every page before the first model call, then `translate_page` page by page, and scores the stored Translations against references converted with OpenCC `t2s`. It writes `EvalOutputs` to `runs/eval/<id>/`; `scores.json` reports scored and failed Runs' cost separately, and any unknown cost makes a total `null`.
+- `Tracing` (`tracing/`) is off unless `FUKIDASHI_TRACING` names a backend. `setup()`, called once by an entry point, installs the OpenInference instrumentors for the `openai` SDK and LangChain and a batch span processor whose exporter comes from `Backend` (Phoenix, which must be on this machine), wrapped in `RedactingExporter` so no page image or API key reaches a span. `Runs` opens `page_span` around each page and returns its trace ID in `Outcome`; `EvalHarness` writes it per page. Only `tracing/` imports OpenTelemetry or OpenInference, and tracing never fails a Run.
 - `PagesRouter` gets the SQLite connection, the dataset path and the `LLMClient` factory through FastAPI's `Depends` (`get_db`, `get_dataset_root`, `get_client_factory`). Tests swap them for a temporary DB and a fake `LLMClient`, so tests never make real requests.
 - `Runs` receives an `LLMClient` factory, not a client: every Run builds its own `LLMClient` and `Meter`, so each Run's usage is its own.
 - `llm/` (`LLMClient` and `describe_api_error`) is the only code that imports `openai`. `LLMClient` turns the SDK's automatic retries off, so every request sent is one call in the `Meter`. A request that raises, or a response `LLMClient` cannot read (an HTML page, a body that is not JSON, no readable first choice), is recorded once with an `error`, with unknown usage unless the response carried some, then leaves `llm/` as `ProviderError` carrying that `CallRecord`. `Baseline` adds it to `attempts` and puts the error on the Run without retrying (OUTLINE §3.6: a request that may have been billed is not resent automatically), so a finished Run has one attempt per call; it retries only empty or unparseable output.
@@ -377,6 +404,6 @@ classDiagram
 
 ### 4.4 Where later milestones plug in
 
-- **M2:** done except tracing: the Translator Agent, built on `AgentLoop`, runs beside `Baseline`; the tracing tool (OUTLINE §3.5) is next. An Orchestrator (`orchestrator/` in OUTLINE §6) comes with the Reviewer in M3. `LLMClient`, `Meter` and `PageBudget` stay as they are, and every agent call goes through them; `Runs.translate_page` picks Baseline or the Orchestrator by `config`, and `EvalHarness` accepts each config as it arrives (`CONFIGS` in `evaluation/harness.py`).
+- **M2 (done):** `Translator` built on `AgentLoop` runs beside `Baseline`, and `Tracing` wraps every `translate_page`. `LLMClient`, `Meter` and `PageBudget` stayed as they were, and every agent call goes through them. `Runs.translate_page` picks the pipeline by `config`, and `EvalHarness` accepts each config in `runs.CONFIGS`. An Orchestrator (`orchestrator/` in OUTLINE §6) comes with the Reviewer in M3.
 - **M3:** the `KB` (Glossary, Character Profiles, Proposal Queue) and the Reviewer / Curator Agents; `runs.config` gains `full` and `full_no_kb`.
 - **M7:** the frontend adds a canvas and editing to `PageView`, plus SSE, which adds an event subscription to the `api` module.
