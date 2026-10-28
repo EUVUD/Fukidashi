@@ -551,14 +551,14 @@ def test_the_other_configs_keep_every_key_they_have_today(imported, root, tmp_pa
 
 
 def test_the_harness_and_its_command_line_know_the_new_config(tmp_path):
-    assert harness.CONFIGS == runs.CONFIGS == ("baseline", "translator", "full_no_kb")
+    assert harness.CONFIGS == runs.CONFIGS == ("baseline", "translator", "full_no_kb", "full")
 
     stopped = run_cli(tmp_path, "--config", "full_no_kb", "--book", "book_t", "--pages", "1")
-    refused = run_cli(tmp_path, "--config", "full", "--book", "book_t", "--pages", "1")
+    refused = run_cli(tmp_path, "--config", "nonexistent", "--book", "book_t", "--pages", "1")
 
     assert "invalid choice" not in stopped.stderr
     assert stopped.returncode == 2 and "Stopped before any model call" in stopped.stderr  # no such page: nothing sent
-    assert refused.returncode == 2 and "invalid choice" in refused.stderr   # `full` waits for the KB
+    assert refused.returncode == 2 and "invalid choice" in refused.stderr
 
 
 # --- the page's trace -------------------------------------------------------------------------------------------------

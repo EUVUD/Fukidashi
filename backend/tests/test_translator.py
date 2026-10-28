@@ -161,8 +161,8 @@ def test_an_unknown_config_is_a_value_error_before_a_client_is_built_or_a_run_ex
     def no_client():
         raise AssertionError("make_client must not be called")
 
-    with pytest.raises(ValueError, match="unknown config 'full'"):
-        runs.translate_page(imported, BOOK, 1, make_client=no_client, dataset_root=root, config="full")
+    with pytest.raises(ValueError, match="unknown config 'nonexistent'"):
+        runs.translate_page(imported, BOOK, 1, make_client=no_client, dataset_root=root, config="nonexistent")
 
     assert imported.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
 
@@ -600,7 +600,7 @@ def test_a_baseline_eval_reports_zero_fallback_pages(imported, root, tmp_path):
 
 
 def test_the_harness_knows_both_configs_and_the_cli_accepts_translator(tmp_path):
-    assert harness.CONFIGS == ("baseline", "translator", "full_no_kb")  # `full_no_kb` joined in task 012
+    assert harness.CONFIGS == ("baseline", "translator", "full_no_kb", "full")  # `full_no_kb` joined in task 012, `full` in 016
 
     stopped = run_cli(tmp_path, "--config", "translator", "--book", "book_t", "--pages", "1")
 
