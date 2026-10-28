@@ -1,6 +1,6 @@
 # Fukidashi — Project Outline
 
-> v0.13 · 2026-10-27
+> v0.14 · 2026-10-28
 > **v0.2 (2026-10-22):** evaluation changed from a research-style controlled experiment to a standard evaluation framework plus a baseline comparison (plan B); see §4.
 > **v0.3 (2026-10-22):** M0 decisions recorded in §8: name Fukidashi, ja → zh-Hans, an OpenAI-compatible provider, a $100 budget cap.
 > **v0.4 (2026-10-24):** M1 added the term Run (§0).
@@ -13,6 +13,7 @@
 > **v0.11 (2026-10-27):** §8 decides the agent loop: LangChain v1 `create_agent`, with `LLMClient` as its model through an adapter; §5 adds it to the tech stack.
 > **v0.12 (2026-10-27):** after M2's tool-calling loop: §0 adds Agent loop, Step and Stop reason; §3.4 records the guardrails as built and the smoke findings; §9 records that `deepseek-flash` can call tools.
 > **v0.13 (2026-10-27):** after the Translator Agent: §0 adds `translator`, Repair and Fallback; §3.2, §3.4 and §4.2 record the Translator Agent as built (`flag_uncertain` moves to M3); §8 decides the tracing tool (Arize Phoenix, local).
+> **v0.14 (2026-10-28):** M2 done (§7, `docs/m2.md`); §3.5 records tracing as built.
 > Convention: code, docs, commit messages and reports use the canonical terms in §0.
 
 ---
@@ -200,7 +201,7 @@ Fukidashi is a product, so it is evaluated with general, objective metrics rathe
 ### 3.5 Metering & Tracing
 
 - **Metering is ours:** every LLM call records the model ID, input / output / cached tokens and cost. When the provider returns no usage, including a request that failed or timed out, the call is recorded as **unknown** and counted separately, never as 0. Cost per page comes from this data.
-- **Tracing uses an off-the-shelf tool:** Arize Phoenix, run locally (§8), replacing custom trace JSONL. LangSmith is never used: `run_agent` refuses to start while its tracing variables are on. One trace per page; agent steps, tool calls and review rounds are spans. Eval results store the trace ID, so a score links straight to its trace.
+- **Tracing uses an off-the-shelf tool:** Arize Phoenix, run locally (§8), replacing custom trace JSONL. LangSmith is never used: `run_agent` refuses to start while its tracing variables are on. **Built in M2** (`tracing/`): off unless `FUKIDASHI_TRACING=phoenix`; each `translate_page` is one trace whose root span carries book, page, config, Run id, status and, for `translator`, the stop reason and fallback reason; OpenInference adds a span per provider call and the agent's node and tool spans; an exporter wrapper removes page images and the API key; eval rows and the manifest record the trace ID. One trace per page; agent steps, tool calls and review rounds are spans. Eval results store the trace ID, so a score links straight to its trace.
 - **Choosing:** Phoenix runs locally as one Python process, which is light on an 8 GB Mac. Self-hosting Langfuse needs more components, and Langfuse Cloud sends traces to a third party.
 - The editor's live agent trace (SSE) is a **product feature** and separate from the tracing tool: the first is for users, the second for development and evaluation.
 
@@ -374,7 +375,7 @@ fukidashi/
 |---|---|---|---|---|
 | **M0** Decisions & first call | 1 | 10/16–10/18 | 2.5 | 4 decisions; `SCOPE.md`; download and check OpenMantra (fields in `annotation.json`, book title spelling, page and text-region counts); first real model output (model ID and token usage recorded). **Done 2026-10-24**, see `docs/m0.md` |
 | **M1** Vertical slice | 2 | 10/19–10/25 | 3.5 | M1-a: FastAPI + SQLite + OpenMantra import (oracle boxes + source text); M1-b: C0 → the frontend shows the page image, boxes and a translation list. **Checkpoint 10/25: a real translation of one page in the browser.** **Done 2026-10-24**, see `docs/m1.md` |
-| **M2** Agent layer & eval harness | 3 | 10/26–11/1 | 3.5 | Tool-calling loop + guardrails; Translator Agent; metering; tracing tool (Phoenix, §8); eval harness: `eval/run.py` + manifest + sacreBLEU (chrF / BLEU, with signature); `baseline` scored on 3 pages, Translator Agent runs on the same 3 pages (smoke test, not a reported config). **Progress 2026-10-27:** all done except tracing (#8–#18); `translator` scored chrF 10.67 on the 3 pages, inside `baseline`'s run-to-run spread (11.17–12.87), at about $0.0016 per page |
+| **M2** Agent layer & eval harness | 3 | 10/26–11/1 | 3.5 | Tool-calling loop + guardrails; Translator Agent; metering; tracing tool (Phoenix, §8); eval harness: `eval/run.py` + manifest + sacreBLEU (chrF / BLEU, with signature); `baseline` scored on 3 pages, Translator Agent runs on the same 3 pages (smoke test, not a reported config). **Done 2026-10-28**, see `docs/m2.md`. `translator` scored chrF 10.67 on the 3 pages, inside `baseline`'s run-to-run spread (11.17–12.87), at about $0.0016 per page against $0.0009 |
 | **M3** KB & Reviewer | 4 | 11/2–11/8 | 3 | KB + Curator + Proposal Queue + unit tests for KB write permissions; Reviewer Agent in the full system (at most 2 rounds, fixed); gold glossary for the dev split; `baseline` / `full` / `full_no_kb` each run on 1 page |
 | **M4** Dev evaluation | 5 | 11/9–11/15 | 3 | Estimate tokens and cost on 3 pages first (judge calls included) against the budget cap; set up COMET / xCOMET (Windows GPU if the Mac cannot run it) and check checkpoint licenses and memory; run all 3 configs on the dev split. **11/15: first dev numbers** (chrF / BLEU, COMET, term accuracy, cost, latency) |
 | **M5** Freeze | 6 | 11/16–11/22 | 3 | Term accuracy / consistency; GEMBA-MQM + human agreement check on about 30 segments; tune prompts and tools from the MQM error breakdown; gold glossary for the test split; one-page `eval/PROTOCOL.md`. **11/22 freeze, tag `exp-frozen`** |

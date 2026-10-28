@@ -4,7 +4,7 @@ English | [简体中文](README.zh-CN.md)
 
 A multi-agent manga translation editor (Japanese → Simplified Chinese), evaluated on the [OpenMantra](https://github.com/mantra-inc/open-mantra-dataset) dataset against a single-call baseline with a standard MT evaluation framework.
 
-> **Status (2026-10-27):** M0 and M1 are done. The vertical slice works end to end: import OpenMantra, translate a page with one model call, and check every line against its box in the browser. M2 is in progress: an eval harness scores configs with chrF / BLEU, and a first Translator Agent runs as the `translator` config on a tool-calling loop over our metered client. The Knowledge Base, the Reviewer and tracing do not exist yet.
+> **Status (2026-10-28):** M0, M1 and M2 are done. The vertical slice works end to end: import OpenMantra, translate a page with one model call, and check every line against its box in the browser. M2 added an eval harness that scores configs with chrF / BLEU, a first Translator Agent (the `translator` config) on a tool-calling loop over our metered client, and optional tracing in a local Arize Phoenix ([record](docs/m2.md)). The Knowledge Base and the Reviewer come next, in M3.
 
 ## What it does
 
@@ -27,6 +27,7 @@ Fukidashi is evaluated as a product, not as a research experiment (details in [O
 - **No reference leakage.** Prompts contain only the Japanese text and boxes; the reference translations stored next to them never reach a prompt, and a test checks it.
 - **Runs are recorded, not overwritten.** A Run is inserted as `running` and finished as `succeeded` or `failed`; a failed Run keeps the raw responses, and the page keeps showing the last good translation.
 - **An agent loop that keeps the metering.** Tool calls run on LangChain's `create_agent`, but its model is a thin adapter over `LLMClient`, so every agent call is metered like any other and DeepSeek's reasoning is passed back as its API requires. Guardrails: a step limit, the token budget, duplicate-call detection, and a truncated reply is never taken as an answer.
+- **Traces that stay local.** Optional tracing sends one trace per page to an Arize Phoenix on this machine through OpenTelemetry. Page images and the API key are stripped from every span, and the backend is one exporter, so it can be swapped later.
 - **Swappable provider.** Any OpenAI-compatible model with vision, tool calling and JSON output works through `.env`; the current choice is DeepSeek `deepseek-flash` (about $0.0006 per page).
 
 Diagrams (domain model, sequence diagrams, object model): [docs/design.md](docs/design.md).
@@ -55,6 +56,15 @@ uv run python eval/run.py --config translator --book tojime_no_siora --pages 2,3
 
 The eval harness translates those pages through the same code path as the editor (each page leaves a Run in SQLite), converts the zh-Hant reference translations to zh-Hans with OpenCC (`t2s`), and prints chrF and BLEU with their sacreBLEU signatures, plus cost per page and latency; for `translator` it also counts the pages that fell back to `baseline`. The Manifest, per-Segment outputs and scores go to `runs/eval/<id>/`. The exit code is non-zero if a page failed or the harness could not start.
 
+Optional tracing: one trace per translated page (every model call, agent step and tool call) in an [Arize Phoenix](https://github.com/Arize-ai/phoenix) running on your machine. Start Phoenix in another terminal, set `FUKIDASHI_TRACING=phoenix` (in the shell or `.env`), and open http://localhost:6006:
+
+```bash
+PHOENIX_HOST=127.0.0.1 PHOENIX_TELEMETRY_ENABLED=false uvx --from arize-phoenix phoenix serve
+FUKIDASHI_TRACING=phoenix uv run python eval/run.py --config translator --book tojime_no_siora --pages 3
+```
+
+Tracing is off by default and never fails a translation. Page images and the API key are removed from every span, and the endpoint must be on this machine. If your shell uses an HTTP proxy, also set `NO_PROXY=localhost,127.0.0.1`. The eval outputs record each page's trace ID.
+
 ```bash
 uv run pytest                                       # no network, no real LLM calls
 uv run python scripts/m0_first_call.py --dry-run    # print the M0 request without sending it
@@ -66,7 +76,7 @@ uv run python scripts/m0_first_call.py --dry-run    # print the M0 request witho
 |---|---|---|
 | M0 Decisions & first call | 10/18 | Done ([record](docs/m0.md)) |
 | M1 Vertical slice: page → `baseline` → browser | 10/25 | Done ([record](docs/m1.md)) |
-| M2 Agent layer & eval harness | 11/1 | In progress |
+| M2 Agent layer & eval harness | 11/1 | Done ([record](docs/m2.md)) |
 | M3 Knowledge Base & Reviewer | 11/8 | Planned |
 | M4–M5 Dev evaluation, protocol freeze | 11/22 | Planned |
 | M6–M8 Test run, editor productization, analysis | 1/3 | Planned |
