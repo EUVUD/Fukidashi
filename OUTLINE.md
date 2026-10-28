@@ -1,6 +1,6 @@
 # Fukidashi — Project Outline
 
-> v0.19 · 2026-10-28
+> v0.20 · 2026-10-28
 > **v0.2 (2026-10-22):** evaluation changed from a research-style controlled experiment to a standard evaluation framework plus a baseline comparison (plan B); see §4.
 > **v0.3 (2026-10-22):** M0 decisions recorded in §8: name Fukidashi, ja → zh-Hans, an OpenAI-compatible provider, a $100 budget cap.
 > **v0.4 (2026-10-24):** M1 added the term Run (§0).
@@ -19,6 +19,7 @@
 > **v0.17 (2026-10-28):** after the gold glossary (#25) and the Reviewer (#26): §0 adds Flag, Verdict / Issue and Unusable review; §3.2 and §4.7 record what is built; §8 decides that the Reviewer writes its comments in Simplified Chinese; §10: each executor works in its own git worktree.
 > **v0.18 (2026-10-28):** after the Orchestrator and `full_no_kb` (#29) and the KB store (#28): §0 adds Send-back / Revision and KB snapshot; §3.2, §3.3 and §4.2 record what is built; §3.5 no longer claims review rounds are spans (only the root span carries the loop's outcome).
 > **v0.19 (2026-10-28):** after the KB tools (#31): §3.2 and §3.4 record the agents' KB tools and where the snippets go; §3.3 marks the order of parallel proposals as settled.
+> **v0.20 (2026-10-28):** after hardening the KB seams (#33): §3.3 records the conflict across kinds and the first call's payload as built, and updates what is still open.
 > Convention: code, docs, commit messages and reports use the canonical terms in §0.
 
 ---
@@ -233,12 +234,16 @@ Fukidashi is a product, so it is evaluated with general, objective metrics rathe
   - **Profile status.** Character Profiles carry a `status` like entries do, because names go to the Human Review Queue. That queue is the set of rows with status `pending_human`, not a table of its own.
   - **Proposal IDs** come from the KB, the page, the kind and the normalised pair, so a retried page writes nothing twice. The same pair proposed on a later page becomes evidence.
   - **`curator.apply`** applies one page's proposals and the Curator's decisions in one transaction, by the rules above. It is the only code that writes KB entries, which a test checks.
-  - **Agents** get only a KB snapshot and a proposal collector, neither of which holds a database connection (built in #31). Least privilege therefore comes from what an agent has, not from its prompt.
+  - **Agents** get only a KB snapshot and a proposal collector, neither of which holds a database connection (built in #31). Since #33 that holds for the whole import graph: loading the agents or the Orchestrator does not load the database module, and a test checks it. Least privilege therefore comes from what an agent has, not from its prompt.
   - **Settled in #31:** the order of parallel `propose_entry` calls within one reply. Proposals follow the calls' position, not their arrival.
+  - **Settled in #33:**
+    - **Payload per id.** For one proposal id, the details kept are those of the first call in that order.
+    - **Conflict across kinds.** A term whose source is a readable character's name or alias goes to the Human Review Queue and writes nothing. So does a character whose name is a readable term's source. Within a page, the earlier proposal counts as existing for the later one.
   - **Still open for task design:**
     - a proposal left undecided (the Curator's call failed) cannot be decided by applying its page again;
-    - a name proposed as a term is not checked against the profiles; the first real KB run did propose a family name as a term;
-    - for two calls of one reply with the same proposal id but different details, which details are kept still depends on timing.
+    - a name proposed as a term when the KB holds nothing it collides with: the first real KB run proposed a family name that way. Only the Curator's judgment can catch it;
+    - a character proposed under another character's alias becomes a second pending profile, because the match is on the name only; a character's aliases are not checked against term sources either;
+    - a conflict across kinds is told apart from a same-kind conflict only by its reason text.
 
 ### 3.4 Agent Loop Guardrails
 
