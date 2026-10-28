@@ -43,7 +43,14 @@
 
 ## Split
 
-2 dev books / 3 test books, split by book. Which books go where is decided in M3.
+2 dev books / 3 test books, split by book (decided 2026-10-28, OUTLINE §8):
+
+| Split | Books | Pages | Segments |
+|---|---|---|---|
+| Dev | `tojime_no_siora`, `boureisougi` | 82 | 608 |
+| Test | `balloon_dream`, `tencho_isoro`, `rasetugari` | 132 | 984 |
+
+`tojime_no_siora` is a dev book because M0–M2 already translated some of its pages. `boureisougi` is the smallest of the other four, which leaves the most data for the test split. 3 of the 5 pages without segments are in the dev split (`tojime_no_siora` 1, `boureisougi` 2), 2 in the test split (`balloon_dream`).
 
 ## Token estimate (for the budget)
 
