@@ -34,9 +34,9 @@ sequenceDiagram
 
 1. Open a new session and type `/architect`, optionally with a question, for example `/architect what should M2 start with`. It reads OUTLINE, SCOPE, IDEAS and git first, tells you where things stand, then answers.
 2. Discuss in the architect session. Once the work is settled, it shows you a task draft in chat (goal, scope, acceptance criteria) and writes `tasks/NNN-slug.md` only after you agree.
-3. Open a new session and type `/execute-task NNN`. The executor knows only the task file and the repository: it implements, verifies and commits on branch `task/NNN-slug`, then writes the Execution report into the task file. It does not push or open a PR.
+3. Open a new session and type `/execute-task NNN`. The executor knows only the task file and the repository: it implements, verifies and commits on branch `task/NNN-slug` in a git worktree of its own next to the main checkout (`<main checkout>-task-NNN`), then writes the Execution report into the task file. It does not push or open a PR. Tasks without `depends_on` between them can run side by side, each in its own session.
 4. Open another new session and type `/review-task NNN`. The reviewer reads the acceptance criteria first, then reads the diff and reruns the Verification itself, and only then compares with the Execution report. It does not change the repository; it writes the Review and a verdict.
-5. If the verdict is approved, you decide when to push, open the PR and rebase and merge; after merging, tell the architect, which marks the task done and suggests the next one. If the verdict is changes requested, go back to step 3 with the same `/execute-task NNN`; the executor reads the latest Review.
+5. If the verdict is approved, you decide when to push, open the PR and rebase and merge; after merging, tell the architect, which marks the task done, offers to remove the task's worktree and suggests the next one. If the verdict is changes requested, go back to step 3 with the same `/execute-task NNN`; the executor reads the latest Review.
 
 ## Why it is built this way
 
@@ -47,5 +47,5 @@ sequenceDiagram
 ## Limits
 
 - Role boundaries are conventions written into prompts, not permission isolation: the architect not editing code and the reviewer not changing the repository rely on instructions, not on enforcement.
-- When several sessions share one checkout, only one executor runs at a time. The executor checks for changes it did not make before starting.
+- **Each executor has its own worktree.** Sessions in one checkout share one `HEAD`: in M3, an executor's `git switch` in the main checkout moved the branch under another executor that was working there. Since then the executor never switches branches in the main checkout, which stays with you and the architect. Its worktree links `data`, `runs` and `.env` from the main checkout, so the dataset, the database and the cost ledger stay single. The executor still checks for changes it did not make before starting.
 - The reviewer and the executor are the same model. What is independent is the context, not the capability, so the reviewer's verdict still deserves a look at the diff from you.

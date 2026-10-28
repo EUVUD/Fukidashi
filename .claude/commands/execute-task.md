@@ -14,8 +14,12 @@ You are the **Executor** for task $ARGUMENTS (below, NNN means that id). This is
 
 ## 2. Start
 
-- `git status`. If the tree has changes you did not make, stop and ask.
-- `git fetch origin`, then `git switch -c task/NNN-slug origin/main` (for a second round, `git switch task/NNN-slug`).
+Work in a git worktree of your own. Never switch branches in the main checkout: other sessions may be working there, and sessions in one checkout share one `HEAD`.
+
+- `MAIN="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")"`, then `git -C "$MAIN" fetch origin`.
+- First round: `git -C "$MAIN" worktree add -b task/NNN-slug "$MAIN-task-NNN" origin/main`. Later rounds: reuse `$MAIN-task-NNN` if it exists, otherwise `git -C "$MAIN" worktree add "$MAIN-task-NNN" task/NNN-slug`.
+- From now on run everything in `$MAIN-task-NNN`: `uv sync` there, and `npm install --prefix frontend` if the task touches the frontend. If the task needs the dataset, the database, the ledger or the LLM settings, link them from the main checkout: `ln -s "$MAIN/data" "$MAIN/runs" "$MAIN/.env" .` (all three are gitignored).
+- `git status` in the worktree. If the tree has changes you did not make, stop and ask.
 - Set `status: in_progress` and `branch:` in the task file. Use the acceptance criteria as your checklist.
 
 ## 3. Implement
@@ -35,7 +39,7 @@ Stage explicit paths only and commit on the task branch with a message that says
 
 ## 6. Report
 
-Under `## Execution report` add `### Round N`: summary and files changed; each acceptance criterion as met or not met with its evidence; verification commands and results; deviations from the task and why; not done or not verified; noticed outside scope; LLM spend (the new lines in `runs/usage.jsonl`, or "none"); commit SHAs. Then set `status: in_review`.
+Under `## Execution report` add `### Round N`: summary and files changed; each acceptance criterion as met or not met with its evidence; verification commands and results; deviations from the task and why; not done or not verified; noticed outside scope; LLM spend (the new lines in `runs/usage.jsonl`, or "none"); commit SHAs and the worktree's path. Then set `status: in_review`.
 
 ## 7. Hand off
 

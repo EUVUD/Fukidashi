@@ -4,14 +4,15 @@ English | [简体中文](README.zh-CN.md)
 
 A multi-agent manga translation editor (Japanese → Simplified Chinese), evaluated on the [OpenMantra](https://github.com/mantra-inc/open-mantra-dataset) dataset against a single-call baseline with a standard MT evaluation framework.
 
-> **Status (2026-10-28):** M0, M1 and M2 are done. The vertical slice works end to end: import OpenMantra, translate a page with one model call, and check every line against its box in the browser. M2 added an eval harness that scores configs with chrF / BLEU, a first Translator Agent (the `translator` config) on a tool-calling loop over our metered client, and optional tracing in a local Arize Phoenix ([record](docs/m2.md)). The Knowledge Base and the Reviewer come next, in M3.
+> **Status (2026-10-28):** M0, M1 and M2 are done. The vertical slice works end to end: import OpenMantra, translate a page with one model call, and check every line against its box in the browser. M2 added an eval harness that scores configs with chrF / BLEU, a first Translator Agent (the `translator` config) on a tool-calling loop over our metered client, and optional tracing in a local Arize Phoenix ([record](docs/m2.md)). M3 is under way: a gold glossary for the two dev books and a Reviewer Agent exist; the Orchestrator and the Knowledge Base come next.
 
 ## What it does
 
 - **Translate a page in context.** The model sees the whole page image together with the Japanese text and box of every speech bubble, and returns a Simplified Chinese line for each box.
 - **Check it where it belongs.** The editor draws each box on the page and lists source, translation and reference side by side.
 - **A first Translator Agent (M2).** The `translator` config gives the model the same page plus a tool that reads the earlier pages; a bad answer is repaired once, and otherwise the page falls back to `baseline`, visibly.
-- **Planned (M3):** tools for a Glossary and Character Profiles, a Reviewer Agent that checks the result in an independent context, and a Curator Agent that is the only writer of the per-book Knowledge Base.
+- **A Reviewer Agent (M3, in progress).** It checks a page's translation in an independent context: it sees the page, the translation and the regions the Translator flagged as uncertain, never the Translator's reasoning. It is not part of a config yet.
+- **Planned (M3):** an Orchestrator that runs translate → review → finalize, tools for a Glossary and Character Profiles, and a Curator Agent that is the only writer of the per-book Knowledge Base.
 
 ## How it is evaluated
 
@@ -68,6 +69,7 @@ Tracing is off by default and never fails a translation. Page images and the API
 ```bash
 uv run pytest                                       # no network, no real LLM calls
 uv run python scripts/m0_first_call.py --dry-run    # print the M0 request without sending it
+uv run python eval/glossary.py check                # check the gold glossaries against the dataset; no model calls
 ```
 
 ## Roadmap
@@ -77,7 +79,7 @@ uv run python scripts/m0_first_call.py --dry-run    # print the M0 request witho
 | M0 Decisions & first call | 10/18 | Done ([record](docs/m0.md)) |
 | M1 Vertical slice: page → `baseline` → browser | 10/25 | Done ([record](docs/m1.md)) |
 | M2 Agent layer & eval harness | 11/1 | Done ([record](docs/m2.md)) |
-| M3 Knowledge Base & Reviewer | 11/8 | Planned |
+| M3 Knowledge Base & Reviewer | 11/8 | In progress |
 | M4–M5 Dev evaluation, protocol freeze | 11/22 | Planned |
 | M6–M8 Test run, editor productization, analysis | 1/3 | Planned |
 | M9 Report & release | 1/17 | Planned |
@@ -90,8 +92,8 @@ Most of the code is written by AI coding agents (Claude Code) through an archite
 
 ## Data and attribution
 
-OpenMantra is by Hinami et al., *Towards Fully Automated Manga Translation* (AAAI 2021), licensed **CC BY-NC 4.0**. The images are not part of this repository; clone the dataset separately as shown above. The docs quote a few short lines of its text for illustration. Data notes: [docs/openmantra.md](docs/openmantra.md).
+OpenMantra is by Hinami et al., *Towards Fully Automated Manga Translation* (AAAI 2021), licensed **CC BY-NC 4.0**. The images are not part of this repository; clone the dataset separately as shown above. The docs quote a few short lines of its text for illustration, and the gold glossaries in `eval/gold_glossary/` hold short terms (names and recurring words) taken from its Japanese text and Chinese reference translations. Data notes: [docs/openmantra.md](docs/openmantra.md).
 
 ## License
 
-The code in this repository is released under the [MIT License](LICENSE). The license does not cover OpenMantra: the dataset is not distributed here, and the lines of its text quoted in the docs remain under CC BY-NC 4.0, so any use of the dataset must follow that license.
+The code in this repository is released under the [MIT License](LICENSE). The license does not cover OpenMantra: the dataset is not distributed here, and the lines of its text quoted in the docs and the terms in `eval/gold_glossary/` remain under CC BY-NC 4.0, so any use of the dataset must follow that license.

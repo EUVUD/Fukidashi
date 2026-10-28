@@ -1,6 +1,6 @@
 # Fukidashi — Project Outline
 
-> v0.16 · 2026-10-28
+> v0.17 · 2026-10-28
 > **v0.2 (2026-10-22):** evaluation changed from a research-style controlled experiment to a standard evaluation framework plus a baseline comparison (plan B); see §4.
 > **v0.3 (2026-10-22):** M0 decisions recorded in §8: name Fukidashi, ja → zh-Hans, an OpenAI-compatible provider, a $100 budget cap.
 > **v0.4 (2026-10-24):** M1 added the term Run (§0).
@@ -16,6 +16,7 @@
 > **v0.14 (2026-10-28):** M2 done (§7, `docs/m2.md`); §3.5 records tracing as built.
 > **v0.15 (2026-10-28):** §3.5: spans reach the local endpoint without any proxy, and a page that fails before its Run exists keeps its trace ID.
 > **v0.16 (2026-10-28):** M3 decisions in §8: the dev / test split (§4.1), who drafts the gold glossary (§4.7), a fresh KB for each eval run with readable `pending_human` entries (§3.3), and the Curator as code rules plus one model call per page (§3.3).
+> **v0.17 (2026-10-28):** after the gold glossary (#25) and the Reviewer (#26): §0 adds Flag, Verdict / Issue and Unusable review; §3.2 and §4.7 record what is built; §8 decides that the Reviewer writes its comments in Simplified Chinese; §10: each executor works in its own git worktree.
 > Convention: code, docs, commit messages and reports use the canonical terms in §0.
 
 ---
@@ -29,6 +30,9 @@ Use the English term in the left column everywhere, in code and in docs. The Chi
 | Vertical slice | 竖切 | Get data → model → browser working end to end before adding any infrastructure |
 | Translator Agent | 翻译 agent | The only agent that calls tools on its own |
 | Reviewer Agent | 独立审校 agent | Independent context, read-only, sends a page back at most 2 times |
+| Flag | 不确定标记 | A region the Translator marks with `flag_uncertain`: its id and a short reason. The Reviewer reads the flags |
+| Verdict / Issue | 审校结论 / 审校意见 | The Reviewer's answer for one page: `approve` or `revise`, with at most one issue (a comment, optionally a suggestion) per region. Only `revise` sends the page back |
+| Unusable review | 无效审校 | A review that ended without a verdict (still unparseable after one Repair, or `step_limit` / `incomplete`): the translation stands. Unlike a failed review (`provider_error`, `budget`), after which nothing more is sent |
 | Curator Agent | 知识管理 agent | The only agent that writes to the Knowledge Base |
 | Orchestrator | 编排层 | Plain code, not an LLM; permissions are enforced here |
 | Knowledge Base (KB) | 故事知识库 | Holds the Glossary and Character Profiles |
@@ -180,6 +184,8 @@ Fukidashi is a product, so it is evaluated with general, objective metrics rathe
 
 **As built in M2:** the Translator Agent has one tool, `get_previous_context`: the Japanese text of up to 2 earlier pages and their latest `translator` translations, read before the run starts, never reference translations. `flag_uncertain` moves to M3, because a flag needs somewhere to be stored and someone to read it (the Reviewer in M3, the editor in M7). The KB tools arrive with the KB in M3.
 
+**As built in M3 so far (#26):** with its `flagging` switch on, the Translator also has `flag_uncertain`; the `translator` config keeps the switch off and sends exactly M2's requests. The Reviewer Agent exists (`agents/reviewer.py`) but is not part of any config until the Orchestrator arrives. In a fresh conversation it gets the page image, every region's Japanese text and translation, and the flags, and answers with a Verdict and per-region Issues. It has no tools yet (the KB's read-only lookups come with the KB) and a token budget of its own. One smoke run (`tojime_no_siora` page 3, $0.005 for both agents) flagged 1 of 12 regions and approved the page with a note on that region.
+
 **Review loop:** the Reviewer sends a page back at most twice. This is fixed; since v0.2 it is not tuned for cost parity.
 
 ### 3.3 Knowledge Base
@@ -298,6 +304,16 @@ Every quality metric in both comparisons gets a paired bootstrap 95% CI. Primary
 - Built from the reference translation, **before looking at any model output**.
 - **Who builds it (§8):** an AI coding assistant (Claude, not the translation model) drafts the entries from the Japanese text and the converted reference translations only, without access to stored Runs, Translations or eval outputs; the author reviews every entry. The glossary file says so.
 - **Not fully blind for `tojime_no_siora`:** its pages 2–4 were translated in M0–M2 and their output was read. It is a dev book; each test book's glossary is built before any page of that book is translated.
+- **As built (#25):**
+  - **Files.** One JSON file per book in `eval/gold_glossary/`. The header has `book_title`, `split`, `opencc_config`, `drafted_by` and `reviewed_by_author`. Each entry has an `id`, a `category` (`character` or `term`), `source` and `source_aliases` (Japanese), `target` and `target_variants` (zh-Hans), and an optional `note`.
+  - **Checks.** `eval/glossary.py check` validates the files against `annotation.json`, never the database:
+    - every term occurs where it should;
+    - each entry occurs in at least 2 segments;
+    - every target appears in the converted reference of a segment that contains its source;
+    - no term is longer than 20 characters, so no sentence of the dataset enters git.
+  - **Tools for the author.** `candidates` and `sheet` write candidate lists and review sheets to `runs/glossary/`; they quote the dataset and are gitignored.
+  - **Entries.** `tojime_no_siora` has 20 and `boureisougi` 17 (its names and coined terms ran out). Every entry occurs on 2 or more pages. The author approved all of them as drafted.
+  - **Ordinary words.** 15 of the 37 entries are recurring ordinary words, marked as borderline in their notes. How term accuracy treats them, and how it matches terms, is decided in M5 (`IDEAS.md`).
 
 ### 4.8 Reproducibility
 
@@ -425,6 +441,7 @@ fukidashi/
 | Who builds the gold glossary | M3 | **An AI coding assistant drafts it from the reference translations only, and the author reviews every entry** (§4.7). Drafting by hand would take the author about 2 hours for the two dev books. The drafting assistant (Claude) is not the translation model (DeepSeek), and it has no access to stored Runs, Translations or eval outputs | Decided (2026-10-28) |
 | KB scope in evaluation | M3 | **Each eval run starts every book with an empty KB**, filled page by page in page order, so two eval runs of the same config start from the same state. **`pending_human` entries are readable**, marked as pending; rejected ones are not (§3.3). No human works the Human Review Queue during an eval, and every name goes there; if pending entries were hidden, no name would ever reach a later page and the KB ablation would measure little. The cost: a wrong pending entry can spread to later pages, which the Reviewer is there to catch | Decided (2026-10-28) |
 | Curator form | M3 | **Rules in code, plus one model call per page without tools** (§3.3). Deduplication, routing conflicts and names to the Human Review Queue, and the single write at finalize are code, so they hold whatever the model answers (least privilege, §1.3). The model only judges the remaining proposals. Rejected: a tool-calling Curator, which would leave the rules to the prompt; a Curator with no model at all, which would leave two agents and change the scope (`SCOPE.md` §1) | Decided (2026-10-28) |
+| Reviewer comment language | M3 | **Simplified Chinese.** The Translator reads the Issues when a page is sent back, and from M7 the editor shows them to a Chinese-reading user. The first smoke run returned English comments because the Reviewer's prompt is English; the Translator's flag reasons were already Chinese | Decided (2026-10-28) |
 | COMET checkpoint | M4 | Which COMET and xCOMET models, by license and memory | Open |
 | Judge model (GEMBA-MQM) | M5 | A strong model different from the translation model | Open |
 
@@ -452,6 +469,7 @@ fukidashi/
 ## 10. Development Workflow
 
 - Each task has a goal and acceptance criteria → AI implements it → **one task, one PR** → the author reviews the diff. Details in `docs/workflow.md`.
+- Each executor works in a git worktree of its own, so tasks with no dependency between them can run side by side without sharing a branch (since M3).
 - The README states which code is AI-written, which is the author's, and how it is reviewed.
 - Tests cover the places that can break: KB write permissions, proposal deduplication, metering (unknown usage), bootstrap.
 

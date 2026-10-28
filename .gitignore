@@ -1,9 +1,10 @@
 # data (OpenMantra is CC BY-NC 4.0; images are not redistributed)
-data/
+# No trailing slash: an executor's worktree links data and runs from the main checkout, and a link is not a directory
+/data
 
 # local secrets and run outputs
 .env
-runs/
+/runs
 
 # local task queue shared by the architect / executor / reviewer sessions (see CLAUDE.md)
 tasks/
