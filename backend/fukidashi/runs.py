@@ -152,15 +152,23 @@ def translate_page(
     and a message that says the Run was not marked.
 
     With tracing on, the whole call is one trace (`tracing.page_span`); `Outcome.trace_id` and `RunCrashed.trace_id`
-    name it.
+    name it. So does every other exception that leaves the call (a `TranslateError`, `LLMNotConfigured`, a failing
+    `start_run`): it keeps its type and gains a `trace_id` attribute, None when tracing is off.
     """
     if config not in CONFIGS:
         raise ValueError(f"unknown config {config!r}; expected one of {CONFIGS}")
     with tracing.page_span(book=book_title, page_index=page_index, config=config) as span:
-        return _translate_page(
-            conn, book_title, page_index, span, make_client=make_client, dataset_root=dataset_root, config=config,
-            page_budget=page_budget, max_tokens=max_tokens, agent_budget=agent_budget, max_steps=max_steps,
-        )
+        try:
+            return _translate_page(
+                conn, book_title, page_index, span, make_client=make_client, dataset_root=dataset_root, config=config,
+                page_budget=page_budget, max_tokens=max_tokens, agent_budget=agent_budget, max_steps=max_steps,
+            )
+        except Exception as e:
+            try:
+                e.trace_id = None if span is None else span.trace_id
+            except AttributeError:  # an exception type that takes no attributes: same exception, no ID
+                pass
+            raise
 
 
 def _translate_page(
