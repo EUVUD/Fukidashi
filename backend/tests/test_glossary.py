@@ -445,5 +445,6 @@ def test_the_committed_glossaries_hold_terms_for_their_own_book():
         assert loaded.problems == (), path
         assert loaded.book_title == path.stem and loaded.split == splits.split_of(loaded.book_title)
         assert loaded.opencc_config == "t2s"
+        assert loaded.reviewed_by_author, f"{path} has not been reviewed by the author"
         assert 1 <= len(loaded.entries) <= 40, path
         assert all(len(t) <= glossary.MAX_TERM_CHARS for e in loaded.entries for t in (*e.sources, *e.targets)), path
