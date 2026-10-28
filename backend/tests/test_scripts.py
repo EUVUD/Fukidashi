@@ -606,3 +606,198 @@ def test_the_review_smoke_reports_an_unusable_review_and_exits_1(monkeypatch, tm
     assert "review unusable: unparseable" in out
     assert saved["reviewer"]["status"] == "unusable" and saved["reviewer"]["verdict"] is None
     assert saved["reviewer"]["calls"] == 2 and saved["reviewer"]["steps"] == 1
+
+
+# --- scripts/m3_review_smoke.py --kb and --revise-check (task 014) ---------------------------------------------------
+
+M3_REVISED = json.dumps({"translations": [{"id": 0, "zh": "你好啊"}, {"id": 1, "zh": "再见"}]}, ensure_ascii=False)
+M3_NOTHING_YET = "The knowledge base has no entry for this page's text yet."
+
+
+def kb_tables_are_empty(db_path):
+    from fukidashi.db import connect
+
+    c = connect(db_path)
+    try:
+        return all(c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] == 0
+                   for t in ("kbs", "glossary_entries", "character_profiles", "proposals", "runs"))
+    finally:
+        c.close()
+
+
+DRY_RUNS = [   # the options, the second request's key, the Translator's prompt and tools, the second request's tools
+    (["--kb"], "reviewer_first_request", translator.KB_SYSTEM_PROMPT, reviewer.KB_SYSTEM_PROMPT,
+     ["get_previous_context", "flag_uncertain", "lookup_term", "lookup_character", "propose_entry"],
+     ["lookup_term", "lookup_character"]),
+    (["--revise-check"], "revision_first_request", translator.FLAG_SYSTEM_PROMPT, translator.FLAG_SYSTEM_PROMPT,
+     ["get_previous_context", "flag_uncertain"], ["get_previous_context", "flag_uncertain"]),
+    (["--kb", "--revise-check"], "revision_first_request", translator.KB_SYSTEM_PROMPT, translator.KB_SYSTEM_PROMPT,
+     ["get_previous_context", "flag_uncertain", "lookup_term", "lookup_character", "propose_entry"],
+     ["get_previous_context", "flag_uncertain", "lookup_term", "lookup_character", "propose_entry"]),
+]
+
+
+@pytest.mark.parametrize("options, key, first_prompt, second_prompt, first_tools, second_tools", DRY_RUNS,
+                         ids=["kb", "revise-check", "kb-and-revise-check"])
+def test_the_review_smoke_dry_run_with_kb_or_revise_check_prints_the_requests_and_sends_and_writes_nothing(
+        monkeypatch, tmp_path, dataset, db_path, conn, capsys, options, key, first_prompt, second_prompt, first_tools,
+        second_tools):
+    import_openmantra(conn, dataset)
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("a dry run must send nothing")
+
+    m3_setup(monkeypatch, tmp_path, dataset, db_path, "--dry-run", *options)
+    monkeypatch.setattr(m3, "LLMClient", refuse)
+    monkeypatch.setattr(m3, "load_dotenv", refuse)
+    monkeypatch.setattr(httpx.Client, "send", refuse)
+
+    m3.main()
+
+    out = capsys.readouterr().out
+    shown = json.loads(out[: out.rindex("}") + 1])
+    assert list(shown) == ["translator_first_request", key]
+    first, second = shown["translator_first_request"], shown[key]
+    assert first["messages"][0]["content"] == first_prompt and second["messages"][0]["content"] == second_prompt
+    assert [t["function"]["name"] for t in first["tools"]] == first_tools
+    assert (second["tools"] and [t["function"]["name"] for t in second["tools"]]) == second_tools
+    for request in (first, second):
+        parts = request["messages"][1]["content"]
+        kb_on = "--kb" in options
+        assert [p["type"] for p in parts][:2] == (["text", "image_url"] if kb_on else ["image_url", "text"])
+        if kb_on:
+            assert parts[0]["text"] == M3_NOTHING_YET   # an empty snapshot, in memory
+        image = next(p for p in parts if p["type"] == "image_url")
+        assert image["image_url"]["url"].endswith("base64 omitted)") and "000.jpg" in image["image_url"]["url"]
+    if "--revise-check" in options:
+        revision_text = second["messages"][1]["content"][-1]["text"]
+        assert "(placeholder translation of region 0)" in revision_text and m3.REVISE_COMMENT in revision_text
+        assert f'"id": {0}, "comment": "{m3.REVISE_COMMENT}"' in revision_text   # the Issue is on the first region
+    assert "data:image" not in out and base64.b64encode(b"\xff\xd8fake-jpeg").decode() not in out
+    assert "REF-ZH" not in out and "REF-EN" not in out
+    assert out.rstrip().endswith("Dry run: nothing was sent.")
+    assert not (tmp_path / "runs").exists() and kb_tables_are_empty(db_path)   # no file, no ledger, no Run, no KB row
+
+
+def test_the_review_smoke_with_kb_shows_the_proposals_and_the_lookups_and_writes_no_kb_row(
+        monkeypatch, tmp_path, dataset, db_path, conn, capsys):
+    import_openmantra(conn, dataset)
+    provider = Provider(
+        ask(call("l1", {"source_term": "こんにちは"}, name="lookup_term"),
+            call("p1", {"kind": "term", "payload": {"source_term": "封印", "target_term": "封印术"}},
+                 name="propose_entry"),
+            call("p2", {"kind": "term", "payload": {"source_term": "x", "target_term": "y\nz"}}, name="propose_entry")),
+        answer(M3_TRANSLATIONS),
+        ask(call("l2", {"name": "ユキ"}, name="lookup_character")),
+        answer(M3_REVISE))
+
+    code, out, saved = m3_run_with(monkeypatch, tmp_path, dataset, db_path, capsys, provider, "--kb")
+
+    assert code == 0 and len(provider.bodies) == 4
+    assert "Knowledge base: in memory, KB 0, 0 entries and 0 profiles; nothing was written to the database" in out
+    assert "proposals made: 1" in out and "  term: 封印 -> 封印术" in out
+    assert "KB tool calls: 4" in out and "translator: lookup_term(" in out and "reviewer: lookup_character(" in out
+    assert "tools called: lookup_term x1, propose_entry x2" in out and "tools called: lookup_character x1" in out
+    assert "Saved runs/smoke/" in out and "-review-kb-book_a-001.json" in out
+    kb = saved["knowledge_base"]
+    assert (kb["kb_id"], kb["entries"], kb["profiles"]) == (0, 0, 0)
+    assert [(p["kind"], p["source"], p["target"]) for p in kb["proposals"]] == [("term", "封印", "封印术")]
+    assert [(c["stage"], c["tool"], c["ran"]) for c in kb["calls"]] == [
+        ("translator", "lookup_term", True), ("translator", "propose_entry", True), ("translator", "propose_entry", True),
+        ("reviewer", "lookup_character", True)]
+    assert kb["calls"][2]["error"] is not None   # the proposal with a line break was refused, and it is shown
+    assert json.loads(kb["calls"][0]["result"]) == {"found": False, "note": "The knowledge base has no entry for this term."}
+    first = provider.bodies[0]
+    assert first["messages"][0]["content"] == translator.KB_SYSTEM_PROMPT and len(first["tools"]) == 5
+    assert provider.bodies[2]["messages"][0]["content"] == reviewer.KB_SYSTEM_PROMPT
+    assert saved["reviewer"]["verdict"] == "revise" and saved["revision"] is None
+    assert kb_tables_are_empty(db_path)   # no KB row, no entry, no profile, no proposal, no Run
+
+
+def m3_run_with(monkeypatch, tmp_path, dataset, db_path, capsys, provider, *options):
+    """Like `m3_run`, with options on the command line."""
+    monkeypatch.setattr(sys, "argv", ["m3_review_smoke.py", "--book", "book_a", "--page", "1", *options])
+    monkeypatch.setattr(m3, "ROOT", tmp_path)
+    monkeypatch.setattr(m3, "get_page", lambda book, index: get_page(book, index, dataset))
+    monkeypatch.setattr(m3.config, "DB_PATH", db_path)
+    monkeypatch.setattr(m3, "load_dotenv", lambda path: None)
+    monkeypatch.setattr(m3, "LLMClient", lambda config, meter: LLMClient(
+        config, meter, http_client=httpx.Client(transport=httpx.MockTransport(provider))))
+    for name, value in {"LLM_BASE_URL": "http://provider.test/v1", "LLM_API_KEY": "sk-test", "LLM_MODEL": "mock-model",
+                        "LLM_PRICE_INPUT_PER_M": "1.0", "LLM_PRICE_OUTPUT_PER_M": "2.0"}.items():
+        monkeypatch.setenv(name, value)
+    code = 0
+    try:
+        m3.main()
+    except SystemExit as exited:
+        code = exited.code
+    saved = list((tmp_path / "runs" / "smoke").glob("*.json"))
+    return code, capsys.readouterr().out, (json.loads(saved[0].read_text(encoding="utf-8")) if saved else None)
+
+
+def test_the_review_smoke_revise_check_sends_one_revision_with_the_fixed_issue_instead_of_a_review(
+        monkeypatch, tmp_path, dataset, db_path, conn, capsys):
+    import_openmantra(conn, dataset)
+    provider = Provider(answer(M3_TRANSLATIONS), answer(M3_REVISED))
+
+    code, out, saved = m3_run_with(monkeypatch, tmp_path, dataset, db_path, capsys, provider, "--revise-check")
+
+    assert code == 0 and len(provider.bodies) == 2   # the Translator, then the Revision: no review
+    revision_request = provider.bodies[1]
+    assert revision_request["messages"][0]["content"] == translator.FLAG_SYSTEM_PROMPT
+    parts = revision_request["messages"][1]["content"]
+    assert [p["type"] for p in parts] == ["image_url", "text", "text"]   # the three-part user message
+    assert '{"id": 0, "zh": "你好"}' in parts[2]["text"] and m3.REVISE_COMMENT in parts[2]["text"]
+    assert '"suggestion": null' in parts[2]["text"] and "REF-ZH" not in json.dumps(provider.bodies)
+    assert "Revision: stop reason final, 1 steps, 1 calls, 100 input / 20 output tokens, cost $0.0001" in out
+    assert "usable: yes; the Issue was on region 0; regions changed: [0]" in out
+    assert "你好\n      -> 你好啊" in out and "Reviewer" not in out
+    assert "-revise-book_a-001.json" in out
+    assert saved["reviewer"] is None and saved["knowledge_base"] is None
+    assert saved["revision"]["ok"] is True and saved["revision"]["changed_regions"] == [0]
+    assert saved["revision"]["issue"] == {"id": 0, "comment": m3.REVISE_COMMENT, "suggestion": None}
+    assert saved["revision"]["translations"] == {"0": "你好啊", "1": "再见"}
+    assert (saved["translator"]["calls"], saved["revision"]["calls"], saved["meter"]["calls"]) == (1, 1, 2)
+    assert run_count(db_path) == 0
+
+
+def test_the_review_smoke_revise_check_reports_an_unusable_revision_and_exits_1(
+        monkeypatch, tmp_path, dataset, db_path, conn, capsys):
+    import_openmantra(conn, dataset)
+    provider = Provider(answer(M3_TRANSLATIONS), answer("not json"), answer("still not json"))
+
+    code, out, saved = m3_run_with(monkeypatch, tmp_path, dataset, db_path, capsys, provider, "--revise-check")
+
+    assert code == 1 and len(provider.bodies) == 3   # the translation, the revision, its one repair
+    assert "usable: no (unusable): unparseable" in out
+    assert saved["revision"]["ok"] is False and saved["revision"]["unusable"] is True
+    assert saved["revision"]["changed_regions"] is None   # an unusable revision has no translation to compare
+    assert saved["revision"]["calls"] == 2
+
+
+def test_the_review_smoke_with_kb_and_revise_check_gives_the_revision_the_kb_too(
+        monkeypatch, tmp_path, dataset, db_path, conn, capsys):
+    import_openmantra(conn, dataset)
+    provider = Provider(
+        ask(call("p1", {"kind": "term", "payload": {"source_term": "封印", "target_term": "封印术"}}, name="propose_entry")),
+        answer(M3_TRANSLATIONS),
+        ask(call("p2", {"kind": "character", "payload": {"name_src": "ユキ", "name_tgt": "小雪"}}, name="propose_entry")),
+        answer(M3_REVISED))
+
+    code, out, saved = m3_run_with(monkeypatch, tmp_path, dataset, db_path, capsys, provider, "--kb", "--revise-check")
+
+    assert code == 0 and len(provider.bodies) == 4
+    revision_request = provider.bodies[2]
+    assert revision_request["messages"][0]["content"] == translator.KB_SYSTEM_PROMPT
+    assert [p["type"] for p in revision_request["messages"][1]["content"]] == ["text", "image_url", "text", "text"]
+    assert [(p["kind"], p["source"]) for p in saved["knowledge_base"]["proposals"]] == [("term", "封印"), ("character", "ユキ")]
+    assert "proposals made: 2" in out and "-revise-kb-book_a-001.json" in out
+    assert kb_tables_are_empty(db_path)
+
+
+def test_the_review_smoke_docstring_describes_what_the_script_does_now():
+    doc = m3.__doc__
+
+    assert "--kb" in doc and "--revise-check" in doc and "--dry-run" in doc
+    assert "later task" not in doc and "is a later task" not in doc   # was: "The config that runs Translator -> Reviewer is a later task's"
+    assert "full_no_kb" in doc   # the config that runs this flow as Runs

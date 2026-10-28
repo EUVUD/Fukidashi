@@ -14,6 +14,12 @@ A `revise` verdict sends the page back, at most `MAX_SEND_BACKS` times. After th
 review, because another `revise` could not be acted on. A provider error or a spent budget in any stage fails the Run
 with that stage's error, and nothing more is sent (OUTLINE §3.6); the translations of the earlier stages are dropped,
 so a `full_no_kb` page is the whole pipeline or nothing.
+
+The Knowledge Base is a switch (OUTLINE §4.2): a `KBSnapshot` turns it on, `None` leaves `full_no_kb`. The caller takes
+the snapshot once, before the page starts, and the whole page uses it, so what the Translator proposes on this page is
+invisible to this page's lookups. The Orchestrator makes the page's one `ProposalCollector`, gives it to every
+Translator run, and returns the proposals in the order of the calls (see `run_orchestrator`). Writing them is the
+Curator's, later.
 """
 
 from __future__ import annotations
@@ -24,10 +30,14 @@ from dataclasses import dataclass
 from ..agents import reviewer, translator
 from ..agents.loop import DEFAULT_MAX_STEPS
 from ..datasets.openmantra import Page
+from ..kb.collector import ProposalCollector
+from ..kb.entities import Proposal
+from ..kb.snapshot import KBSnapshot
 from ..llm.client import LLMClient
 from ..pipeline import baseline
 
 CONFIG_NAME = "full_no_kb"
+KB_CONFIG_NAME = "full"  # the config name in the attempts record when a KB snapshot is given
 MAX_SEND_BACKS = 2  # OUTLINE §3.2: fixed, not tuned
 
 # The kinds of stage, in the order of the flow.
@@ -54,6 +64,7 @@ class OrchestratorResult:
     translations: dict[int, str] | None  # region id -> zh-Hans; None when the Run failed
     attempts: dict  # what `runs.py` stores: see run_orchestrator
     error: str | None = None  # why translations is None
+    proposals: tuple[Proposal, ...] = ()  # the page's KB proposals in the order of the calls; empty when the Run failed
 
     @property
     def ok(self) -> bool:
@@ -84,16 +95,24 @@ def run_orchestrator(
     fallback_budget: int = baseline.DEFAULT_PAGE_BUDGET,
     max_tokens: int = baseline.DEFAULT_MAX_TOKENS,
     max_steps: int = DEFAULT_MAX_STEPS,
-    use_kb: bool = False,
+    kb: KBSnapshot | None = None,
 ) -> OrchestratorResult:
     """Run one page through translate → review → revise. Never raises for provider errors or bad output.
 
     Every Translator run (the first pass and each revision) has `agent_budget` tokens to itself, every review has
     `review_budget`, and the first pass's fallback has `fallback_budget`; the most a page can use is their sum.
-    `use_kb` is the one switch between `full_no_kb` (off) and `full`: the Knowledge Base does not exist yet, so on is
-    refused, before any request.
+    `kb` is the one switch between `full_no_kb` (None) and `full`: with a snapshot the Translator also has the KB's
+    lookups and `propose_entry`, the Reviewer has the lookups, and both get the KB's entries for the page in their user
+    message; without one, every request is what it is without the KB.
 
-    The attempts record: {"config": "full_no_kb",
+    `proposals` of the result are the proposals the Translator's `propose_entry` calls made, each once, ordered by
+    where its call stands: the Translator run (the first pass, then each revision in turn), then the step, then the
+    call's position in the model's reply. The calls of one reply run in parallel, so the order they arrive in is a race
+    and is not used. Every call that `make_proposal` accepted counts, from every Translator run of the page, including a
+    first pass that fell back to `baseline` and a revision that was unusable: whether a proposal fits the stored
+    translation is the Curator's judgment. A Run that failed has none.
+
+    The attempts record: {"config": "full_no_kb" ("full" with a `kb`),
       "stages": [{"kind": "translate" | "review" | "revise", "status": "ok" | "unusable" | "failed", "error",
                   "attempts": <the agent's own record>,
                   # a translate or revise stage also has "flags"; a review stage also has "verdict" and "issues"
@@ -104,23 +123,26 @@ def run_orchestrator(
                 "stop": "approved" | "review_unusable" | "revision_unusable" | "send_back_limit" | "failed"}}
     When the Run failed, the failed stage is the last one and `final` has no stage (`stage`, `kind` null).
     """
-    if use_kb:
-        raise ValueError("the Knowledge Base does not exist yet: only `full_no_kb` (use_kb=False) can run")
     stages: list[dict] = []
+    collector = ProposalCollector(kb.kb_id, page.page_index) if kb is not None else None
+    proposal_order: list[str] = []  # the ids of the page's proposals, in the order of the calls, once each
 
     def finish(stop: str, *, translations: dict[int, str] | None = None, produced_by: int | None = None,
                reviewed: bool = False, error: str | None = None) -> OrchestratorResult:
         final = {"stage": produced_by, "kind": None if produced_by is None else stages[produced_by]["kind"],
                  "reviewed": reviewed, "stop": stop}
         send_backs = sum(s["kind"] == REVISE for s in stages)
-        return OrchestratorResult(
-            translations, {"config": CONFIG_NAME, "stages": stages, "send_backs": send_backs, "final": final}, error)
+        attempts = {"config": CONFIG_NAME if kb is None else KB_CONFIG_NAME, "stages": stages,
+                    "send_backs": send_backs, "final": final}
+        return OrchestratorResult(translations, attempts, error,
+                                  proposals_in_order(collector, proposal_order) if translations is not None else ())
 
     first = translator.run_translator(
         page, client, previous=previous, agent_budget=agent_budget, fallback_budget=fallback_budget,
-        max_tokens=max_tokens, max_steps=max_steps, flagging=True,
+        max_tokens=max_tokens, max_steps=max_steps, flagging=True, kb=kb, collector=collector,
     )
     stages.append(_translator_stage(TRANSLATE, first))
+    proposal_order += first.proposal_ids
     if not first.ok:  # a provider error or a spent budget, or the fallback failed too
         return finish(FAILED, error=first.error)
 
@@ -128,6 +150,7 @@ def run_orchestrator(
     while True:
         review = reviewer.run_reviewer(
             page, current, flags, client, review_budget=review_budget, max_tokens=max_tokens, max_steps=max_steps,
+            kb=kb,
         )
         stages.append({"kind": REVIEW, "status": review.status, "error": review.error, "verdict": review.verdict,
                        "issues": review.issues, "attempts": review.attempts})
@@ -140,9 +163,10 @@ def run_orchestrator(
 
         revision = translator.run_translator(
             page, client, previous=previous, agent_budget=agent_budget, max_tokens=max_tokens, max_steps=max_steps,
-            flagging=True, revision=translator.Revision(current, review.issues),
+            flagging=True, revision=translator.Revision(current, review.issues), kb=kb, collector=collector,
         )
         stages.append(_translator_stage(REVISE, revision))
+        proposal_order += revision.proposal_ids  # before anything else: an unusable revision's calls were made too
         if revision.unusable:  # the translation the Reviewer sent back stands
             return finish(REVISION_UNUSABLE, translations=current, produced_by=produced_by, reviewed=True)
         if not revision.ok:
@@ -150,6 +174,15 @@ def run_orchestrator(
         current, flags, produced_by = revision.translations, revision.flags, len(stages) - 1
         if sum(s["kind"] == REVISE for s in stages) == MAX_SEND_BACKS:  # no further review: see the module docstring
             return finish(SEND_BACK_LIMIT, translations=current, produced_by=produced_by)
+
+
+def proposals_in_order(collector: ProposalCollector | None, order: Sequence[str]) -> tuple[Proposal, ...]:
+    """The collector's proposals in `order` (ids, first occurrence). The collector lists them in the order they arrived,
+    which for the calls of one reply is a race; `order` comes from the agents' steps, which keep the model's order."""
+    if collector is None:
+        return ()
+    by_id = {p.proposal_id: p for p in collector.proposals}
+    return tuple(by_id[proposal_id] for proposal_id in dict.fromkeys(order))
 
 
 def _translator_stage(kind: str, result: translator.TranslatorResult) -> dict:
