@@ -46,8 +46,8 @@ def pages(root):
     return load_pages(root)
 
 
-RYU = {"id": "ryu", "category": "character", "source": "リュウ", "target": "龙"}
-SCHOOL = {"id": "school", "category": "term", "source": "学校", "target": "学校"}
+RYU = {"id": "ryu", "category": "character", "source": "リュウ", "target": "龙", "borderline": False}
+SCHOOL = {"id": "school", "category": "term", "source": "学校", "target": "学校", "borderline": True}
 
 
 def raw(*entries, **header):
@@ -99,7 +99,7 @@ def test_a_source_or_alias_found_in_no_segment_is_a_problem(pages):
 
 
 def test_an_entry_in_fewer_than_two_segments_is_a_problem(pages):
-    once = {"id": "thanks", "category": "term", "source": "ありがとう", "target": "谢谢"}
+    once = {"id": "thanks", "category": "term", "source": "ありがとう", "target": "谢谢", "borderline": False}
     assert codes(problems(pages, once)) == ["too_few_segments"]
     # the alias adds a second segment, so the entry is fine
     assert problems(pages, {**once, "source_aliases": ["杖"], "target_variants": ["断"]}) == []
@@ -113,6 +113,43 @@ def test_a_target_or_variant_found_in_no_reference_of_its_segments_is_a_problem(
 def test_a_target_found_only_in_segments_without_the_source_is_a_problem(pages):
     # 谢谢 is in the converted reference of page 3, which does not contain リュウ
     assert codes(problems(pages, {**RYU, "target": "谢谢"})) == ["target_not_found"]
+
+
+def taiwan_pages():
+    """Two segments whose Traditional reference has 著, a character form that `t2s` keeps (mainland: 着)."""
+    return [Page(BOOK, 1, Path("x.jpg"), [Segment(0, 0, 0, 0, 0, "封眼だ", "EN", "封著眼"),
+                                          Segment(1, 0, 0, 0, 0, "封眼です", "EN", "又封著眼")])]
+
+
+SEALED = {"id": "sealed", "category": "term", "source": "封眼", "target": "封著眼", "borderline": False}
+
+
+def test_a_variant_that_is_the_target_in_mainland_forms_is_not_looked_for_in_the_reference():
+    assert glossary.mainland_form("封著眼") == "封着眼" and glossary.mainland_form("龙") == "龙"
+    assert glossary.occurrences(entry(source="封眼", target="封著眼"), taiwan_pages())[0].text_zh == "封著眼"  # t2s keeps 著
+
+    found = glossary.check(glossary.parse_glossary(raw({**SEALED, "target_variants": ["封着眼"]})), taiwan_pages())
+
+    assert found == []
+
+
+@pytest.mark.parametrize("change", [
+    {"target_variants": ["封着眼镜"]},  # not the target in mainland forms
+    {"target_variants": ["封着"]},
+    {"target": "封着眼"},  # the target itself must be in the reference, whatever its form
+    {"target_variants": ["云"]},
+])
+def test_any_other_term_missing_from_the_reference_is_still_reported(change):
+    found = glossary.check(glossary.parse_glossary(raw({**SEALED, **change})), taiwan_pages())
+
+    assert codes(found) == ["target_not_found"]
+
+
+def test_the_exemption_is_for_the_one_form_not_for_every_variant_of_an_entry_that_has_it():
+    both = {**SEALED, "target_variants": ["封着眼", "云"]}
+    found = glossary.check(glossary.parse_glossary(raw(both)), taiwan_pages())
+
+    assert [(p.code, "云" in p.message) for p in found] == [("target_not_found", True)]
 
 
 def test_a_source_or_alias_used_by_two_entries_is_a_problem(pages):
@@ -174,6 +211,7 @@ def test_each_problem_is_reported_separately(pages):
     ({"id": None}, "id"), ({"category": ""}, "category"), ({"source": 5}, "source"), ({"target": None}, "target"),
     ({"source_aliases": "x"}, "source_aliases"), ({"target_variants": [1]}, "target_variants"),
     ({"note": 3}, "note"), ({"sourse": "x"}, "sourse"),
+    ({"borderline": "yes"}, "borderline"), ({"borderline": None}, "borderline"), ({"borderline": 1}, "borderline"),
 ])
 def test_an_entry_of_the_wrong_shape_is_a_problem_and_left_out(pages, change, field):
     loaded = glossary.parse_glossary(raw({**RYU, **change}, SCHOOL))
@@ -181,6 +219,23 @@ def test_an_entry_of_the_wrong_shape_is_a_problem_and_left_out(pages, change, fi
     assert [e.id for e in loaded.entries] == ["school"]
     assert [p.code for p in loaded.problems] == ["shape"]
     assert field in loaded.problems[0].message
+
+
+def test_a_missing_borderline_is_a_problem_and_the_entry_is_left_out(pages):
+    without = {k: v for k, v in RYU.items() if k != "borderline"}
+    loaded = glossary.parse_glossary(raw(without, SCHOOL))
+
+    assert [e.id for e in loaded.entries] == ["school"]
+    assert [p.code for p in loaded.problems] == ["shape"]
+    assert "borderline" in loaded.problems[0].message and loaded.problems[0].where == "ryu"
+    assert codes(glossary.check(loaded, pages)) == ["shape"]
+
+
+def test_borderline_is_read_as_a_boolean():
+    loaded = glossary.parse_glossary(raw(RYU, SCHOOL))
+
+    assert loaded.problems == ()
+    assert [(e.id, e.borderline) for e in loaded.entries] == [("ryu", False), ("school", True)]
 
 
 @pytest.mark.parametrize("header", [
@@ -448,3 +503,13 @@ def test_the_committed_glossaries_hold_terms_for_their_own_book():
         assert loaded.reviewed_by_author, f"{path} has not been reviewed by the author"
         assert 1 <= len(loaded.entries) <= 40, path
         assert all(len(t) <= glossary.MAX_TERM_CHARS for e in loaded.entries for t in (*e.sources, *e.targets)), path
+
+
+def test_the_committed_glossaries_mark_the_borderline_entries_their_notes_name():
+    # until the field existed, a note starting with "Borderline" was the only mark (OUTLINE 4.7)
+    marked = 0
+    for path in sorted((config.ROOT / "eval" / "gold_glossary").glob("*.json")):
+        for e in glossary.load_glossary(path).entries:
+            assert e.borderline == (e.note or "").startswith("Borderline"), (path.name, e.id)
+            marked += e.borderline
+    assert marked > 0

@@ -17,6 +17,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from opencc import OpenCC
+
 from ..datasets.openmantra import Page
 from .references import OPENCC_CONFIG, to_zh_hans
 from .splits import split_of
@@ -28,6 +30,7 @@ MIN_SEGMENTS = 2  # an entry that occurs once cannot show consistency
 _HEADER_KEYS = ("book_title", "split", "opencc_config", "drafted_by", "reviewed_by_author", "entries")
 _ENTRY_REQUIRED = ("id", "category", "source", "target")
 _ENTRY_OPTIONAL = ("source_aliases", "target_variants", "note")
+_ENTRY_FLAGS = ("borderline",)  # required, and a boolean
 
 
 @dataclass(frozen=True)
@@ -49,6 +52,7 @@ class Entry:
     source_aliases: tuple[str, ...] = ()  # other Japanese forms of the same thing; none contains `source`
     target_variants: tuple[str, ...] = ()  # the other renderings the reference uses; also correct
     note: str | None = None
+    borderline: bool = False  # an ordinary word: term accuracy leaves it out of its primary score (OUTLINE 4.7)
 
     @property
     def sources(self) -> tuple[str, ...]:
@@ -159,11 +163,14 @@ def _parse_entry(raw: Any, position: int) -> tuple[Entry | None, list[Problem]]:
     if isinstance(raw.get("id"), str) and raw["id"].strip():
         where = raw["id"]
     problems: list[Problem] = []
-    for key in sorted(set(raw) - set(_ENTRY_REQUIRED) - set(_ENTRY_OPTIONAL)):
+    for key in sorted(set(raw) - set(_ENTRY_REQUIRED) - set(_ENTRY_OPTIONAL) - set(_ENTRY_FLAGS)):
         problems.append(Problem("shape", where, f"unknown field `{key}`"))
     for key in _ENTRY_REQUIRED:
         if not isinstance(raw.get(key), str) or not raw[key].strip():
             problems.append(Problem("shape", where, f"`{key}` must be a non-empty string"))
+    for key in _ENTRY_FLAGS:
+        if not isinstance(raw.get(key), bool):
+            problems.append(Problem("shape", where, f"`{key}` must be true or false"))
     lists: dict[str, tuple[str, ...]] = {}
     for key in ("source_aliases", "target_variants"):
         value = raw.get(key, [])
@@ -177,7 +184,7 @@ def _parse_entry(raw: Any, position: int) -> tuple[Entry | None, list[Problem]]:
     if problems:
         return None, problems
     return Entry(raw["id"], raw["category"], raw["source"], raw["target"], lists["source_aliases"],
-                 lists["target_variants"], note), []
+                 lists["target_variants"], note, raw["borderline"]), []
 
 
 # --- segments and occurrences ------------------------------------------------------------------------------------
@@ -185,6 +192,19 @@ def _parse_entry(raw: Any, position: int) -> tuple[Entry | None, list[Problem]]:
 @lru_cache(maxsize=None)
 def _hans(text_zh_hant: str) -> str:
     return to_zh_hans(text_zh_hant)
+
+
+@lru_cache(maxsize=1)
+def _taiwan_to_mainland() -> OpenCC:
+    return OpenCC("tw2s")
+
+
+def mainland_form(target: str) -> str:
+    """`target` with the Taiwan character forms that `t2s` keeps written the mainland way (封著眼 -> 封着眼).
+
+    A glossary lists that form as a variant: the reference cannot contain it, but a system's translation will.
+    """
+    return _taiwan_to_mainland().convert(target)
 
 
 @dataclass(frozen=True)
@@ -282,7 +302,10 @@ def check(glossary: Glossary, pages: Sequence[Page]) -> list[Problem]:
         if len(occs) < MIN_SEGMENTS:
             problems.append(Problem(
                 "too_few_segments", where, f"occurs in {len(occs)} segment(s), at least {MIN_SEGMENTS} are needed"))
+        mainland = mainland_form(entry.target)
         for target in dict.fromkeys(t for t in entry.targets if t.strip()):
+            if target == mainland and target != entry.target:
+                continue  # the target in mainland forms: the converted reference cannot contain it, a translation can
             if not any(target in o.text_zh for o in occs):
                 problems.append(Problem(
                     "target_not_found", where,
