@@ -184,7 +184,8 @@ def test_an_unexpected_error_fails_that_page_and_the_rest_still_run(imported, ro
     assert crashed["run_id"] == run["id"]  # the crashed Run is recorded, so the page points to it
     assert (run["status"], run["error"]) == ("failed", "RuntimeError: provider exploded")
     assert result.scores["pages_scored"] == 1
-    assert result.manifest["pages"][0] == {"book": "book_e", "page_index": 1, "status": "failed", "run_id": run["id"]}
+    assert result.manifest["pages"][0] == {"book": "book_e", "page_index": 1, "status": "failed", "run_id": run["id"],
+                                           "trace_id": None}
 
 
 def test_a_failed_run_cost_is_reported_apart_from_the_scored_cost(imported, root, tmp_path):
@@ -483,13 +484,18 @@ def test_cost_summary_over_no_runs_costs_nothing_but_an_unknown_run_still_makes_
         assert metrics.cost_summary(runs)["total_usd"] is None
 
 
-def run_cli(tmp_path, *args):
-    env = {"PATH": "/usr/bin:/bin", "FUKIDASHI_DB": str(tmp_path / "cli.db")}
-    return subprocess.run([sys.executable, str(config.ROOT / "eval" / "run.py"), *args],
+# `eval/run.py` loads .env at start; the child gets a `load_dotenv` that reads nothing, so no test reads the real one.
+CLI_CHILD = ("import dotenv, runpy, sys; dotenv.load_dotenv = lambda *a, **k: False; "
+             "sys.argv = sys.argv[1:]; runpy.run_path(sys.argv[0], run_name='__main__')")
+
+
+def run_cli(tmp_path, *args, **env):
+    env = {"PATH": "/usr/bin:/bin", "FUKIDASHI_DB": str(tmp_path / "cli.db"), **env}
+    return subprocess.run([sys.executable, "-c", CLI_CHILD, str(config.ROOT / "eval" / "run.py"), *args],
                           capture_output=True, text=True, env=env, timeout=60)
 
 
-def test_cli_lists_its_options_and_accepts_only_baseline(tmp_path):
+def test_cli_lists_its_options_and_rejects_bad_arguments_before_touching_the_database(tmp_path):
     helped = run_cli(tmp_path, "--help")
     assert helped.returncode == 0
     assert all(option in helped.stdout for option in ("--config", "--book", "--pages", "baseline"))

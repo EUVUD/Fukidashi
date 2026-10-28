@@ -7,12 +7,19 @@ Usage:
   uv run python scripts/m2_tool_smoke.py --dry-run       # build the first request, send nothing
   uv run python scripts/m2_tool_smoke.py                 # real run, configured by .env
   uv run python scripts/m2_tool_smoke.py --json-output   # the same with response_format set next to the tools
+  uv run python scripts/m2_tool_smoke.py --repair-check  # then one repair request, as the Translator builds it
+  uv run python scripts/m2_tool_smoke.py --repair-check --dry-run   # print both requests, send nothing
+
+The repair request carries a history with tool calls and their results but no `tools`. Whether the provider takes that
+was never tried (task 007 Review); --repair-check sends it once. The agent's plain-text answer stands in for
+a bad answer.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -20,11 +27,16 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
+import httpx
 from pydantic import BaseModel, Field
 
+from fukidashi import tracing
 from fukidashi.agents.loop import FINAL, AgentResult, Tool, run_agent
+from fukidashi.agents.translator import PARSE_ERRORS, repair_messages
 from fukidashi.llm.client import LLMClient, LLMConfig
-from fukidashi.llm.metering import Meter, PageBudget
+from fukidashi.llm.errors import ProviderError
+from fukidashi.llm.metering import BudgetExceeded, Meter, PageBudget
+from fukidashi.pipeline.baseline import parse_translations
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -58,6 +70,107 @@ TOOL = Tool(
     args=LookupTerm,
     handler=lookup_term,
 )
+
+
+REPAIR_IDS = [0]  # the one region of the made-up page, as the Translator's repair message lists them
+
+
+def bad_answer_error(text: str | None) -> str:
+    """Why the Translator would reject `text`: what `parse_translations` says about a plain-text translation."""
+    try:
+        parse_translations(text or "", REPAIR_IDS)
+    except PARSE_ERRORS as e:
+        return str(e)
+    return "the answer is not the JSON this page needs"
+
+
+def repair_check(
+    client, budget: PageBudget, result: AgentResult, *, max_tokens: int, response_format_sent: bool
+) -> dict:
+    """Send the repair request the Translator would send after `result`'s answer, and say what the provider did."""
+    messages = repair_messages(result.messages, bad_answer_error(result.text), REPAIR_IDS)
+    check = {"roles": [m["role"] for m in messages], "tools_sent": False, "response_format_sent": response_format_sent,
+             "accepted": False, "status_code": None, "error": None, "answer": None, "answer_is_json": None,
+             "answer_passes_parse_translations": None}
+    try:
+        reply = client.chat(messages, budget=budget, max_tokens=max_tokens, json_output=True)
+    except ProviderError as e:
+        return check | {"status_code": e.status_code, "error": e.description}
+    except BudgetExceeded as e:
+        return check | {"error": f"not sent: {e}"}
+    try:
+        json.loads(reply.text)
+    except ValueError:
+        check["answer_is_json"] = False
+    else:
+        check["answer_is_json"] = True
+    try:
+        parse_translations(reply.text, REPAIR_IDS)
+    except PARSE_ERRORS:
+        check["answer_passes_parse_translations"] = False
+    else:
+        check["answer_passes_parse_translations"] = True
+    # HTTP 200 (the call returned) and an answer that parses as JSON
+    return check | {"accepted": check["answer_is_json"], "answer": reply.text}
+
+
+def describe_repair_check(check: dict) -> list[str]:
+    sent = ("response_format was sent" if check["response_format_sent"]
+            else "response_format was NOT sent (LLM_JSON_MODE=none)")
+    lines = [f"Repair request: roles {', '.join(check['roles'])}; no tools; {sent}"]
+    if check["error"] is not None:
+        code = f" (HTTP {check['status_code']})" if check["status_code"] else ""
+        lines.append(f"Repair request: not accepted{code}: {check['error']}")
+    elif check["accepted"]:
+        lines.append("Repair request: accepted by the provider (HTTP 200); the answer parses as JSON: "
+                     + check["answer"])
+        lines.append("  and it passes parse_translations" if check["answer_passes_parse_translations"]
+                     else "  but it does not pass parse_translations")
+    else:
+        lines.append(f"Repair request: HTTP 200, but the answer is not JSON: {check['answer']!r}")
+    return lines
+
+
+def completion(message: dict, finish_reason: str) -> httpx.Response:
+    return httpx.Response(200, json={
+        "id": "dry-run", "object": "chat.completion", "created": 0, "model": "dry-run",
+        "choices": [{"index": 0, "finish_reason": finish_reason, "message": {"role": "assistant", **message}}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    })
+
+
+def dry_run_repair_check(args, budget: PageBudget) -> None:
+    """Print the first request and the repair request exactly as they would go out (JSON bodies, built by the real
+    client and the real agent loop), answering the provider's side with made-up replies on a mock transport."""
+    bodies: list[dict] = []
+    arguments = json.dumps({"term": "カゲミザワ"}, ensure_ascii=False)
+    replies = iter([
+        completion({"content": None, "reasoning_content": "(made up)", "tool_calls": [{
+            "id": "call_dry_run", "type": "function", "function": {"name": "lookup_term", "arguments": arguments}}]},
+            "tool_calls"),
+        completion({"content": "阴泽前辈，今天也在屋顶上吗？", "reasoning_content": "(made up)"}, "stop"),
+        completion({"content": '{"translations": [{"id": 0, "zh": "..."}]}'}, "stop"),
+    ])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return next(replies)
+
+    json_mode = os.environ.get("LLM_JSON_MODE", "json_object")  # .env is not read in a dry run
+    config = LLMConfig("http://dry-run.invalid/v1", "dry-run", "LLM_MODEL", json_mode=json_mode)
+    client = LLMClient(config, Meter(), http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+    result = run_agent(client, budget, system_prompt=JSON_SYSTEM_PROMPT if args.json_output else SYSTEM_PROMPT,
+                       user_message=LINE, tools=[TOOL], max_tokens=args.max_tokens, json_output=args.json_output,
+                       max_steps=args.max_steps)
+    check = repair_check(client, budget, result, max_tokens=args.max_tokens,
+                         response_format_sent=json_mode == "json_object")
+    first, repair = bodies[0], bodies[-1]
+    print(json.dumps({"first_request": first, "repair_request": repair}, ensure_ascii=False, indent=2))
+    print(f"\nRepair request roles: {', '.join(check['roles'])}; tools: {'sent' if 'tools' in repair else 'none'}; "
+          f"response_format: {repair.get('response_format', 'not sent')}")
+    print("The history is made up (a tool call, then a plain-text answer); its shape is the real one. "
+          "LLM_MODEL and the key are placeholders.")
+    print("\nDry run: nothing was sent.")
 
 
 class FirstRequest(Exception):
@@ -102,6 +215,9 @@ def main() -> None:
     ap.add_argument("--page-budget", type=int, default=20_000, help="token budget for the run")
     ap.add_argument("--max-steps", type=int, default=6, help="model calls per run")
     ap.add_argument("--dry-run", action="store_true", help="print the first request and send nothing")
+    ap.add_argument("--repair-check", action="store_true",
+                    help="after the run, send one repair request as the Translator Agent builds it (history, repair "
+                         "message, JSON output, no tools)")
     args = ap.parse_args()
 
     system_prompt = JSON_SYSTEM_PROMPT if args.json_output else SYSTEM_PROMPT
@@ -109,6 +225,9 @@ def main() -> None:
     options = dict(system_prompt=system_prompt, user_message=LINE, tools=[TOOL], max_tokens=args.max_tokens,
                    json_output=args.json_output, max_steps=args.max_steps)
 
+    if args.dry_run and args.repair_check:
+        dry_run_repair_check(args, budget)
+        return
     if args.dry_run:
         try:
             run_agent(DryRunClient(), budget, **options)
@@ -123,8 +242,18 @@ def main() -> None:
         config = LLMConfig.from_env()
     except RuntimeError as e:
         sys.exit(str(e))
+    try:
+        tracing.setup()
+    except tracing.TracingError as e:
+        sys.exit(str(e))
     meter = Meter(ledger_path=ROOT / "runs" / "usage.jsonl")
-    result = run_agent(LLMClient(config, meter), budget, **options)
+    client = LLMClient(config, meter)
+    repair = None
+    with tracing.page_span(book="m2_tool_smoke", page_index=0, config="tool-smoke"):  # one trace for the whole run
+        result = run_agent(client, budget, **options)
+        if args.repair_check and result.stop_reason == FINAL:
+            repair = repair_check(client, budget, result, max_tokens=args.max_tokens,
+                                  response_format_sent=config.json_mode == "json_object")
     # LLMClient sends response_format only in JSON mode, so `--json-output` alone proves nothing about the provider
     response_format_sent = args.json_output and config.json_mode == "json_object"
     first = result.steps[0] if result.steps else None
@@ -149,6 +278,7 @@ def main() -> None:
         "meter": summary,
         "page_budget": {"limit": budget.limit_tokens, "used": budget.used_tokens, "verified": budget.verified},
         "result": asdict(result),
+        "repair_check": repair,  # null unless --repair-check ran it
     }
     run_dir = ROOT / "runs" / "m2"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -169,6 +299,9 @@ def main() -> None:
             verdict = ("accepted by the provider" if accepted else
                        f"not accepted ({first['error'] if first else 'no request was made'})")
             print(f"JSON output together with tools: {verdict}; response_format was sent")
+    if args.repair_check:
+        print("\n".join(describe_repair_check(repair) if repair else
+                        ["Repair request: not sent, because the agent did not finish with an answer"]))
     cost = f"${summary['cost_usd']:.4f}" if summary["cost_usd"] is not None else "unknown"
     print(f"Calls: {summary['calls']}  input tokens: {summary['input_tokens']}  output tokens: {summary['output_tokens']}"
           f"  unknown-usage calls: {summary['unknown_usage_calls']}  Cost: {cost}")

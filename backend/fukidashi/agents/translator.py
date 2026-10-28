@@ -148,7 +148,7 @@ def run_translator(
         record["agent"]["answer_parse_error"] = answer_error
         try:
             reply = client.chat(
-                [*agent.messages, {"role": "user", "content": _repair_message(answer_error, ids)}],
+                repair_messages(agent.messages, answer_error, ids),
                 budget=budget, max_tokens=max_tokens, json_output=True,
             )
         except BudgetExceeded as e:
@@ -169,6 +169,15 @@ def run_translator(
     fallback = baseline.run_baseline(page, client, PageBudget(page.page_id, fallback_budget), max_tokens=max_tokens)
     record["fallback"] = {"reason": reason, "attempts": fallback.attempts}
     return TranslatorResult(fallback.translations, record, fallback.error)
+
+
+def repair_messages(history: list[dict], parse_error: str, ids: list[int]) -> list[dict]:
+    """The messages of the repair request: the agent's `history` as OpenAI-format dicts, then the repair message.
+
+    The request carries no `tools`, although the history holds tool calls and their results. Whether the provider
+    accepts that is what `scripts/m2_tool_smoke.py --repair-check` finds out.
+    """
+    return [*history, {"role": "user", "content": _repair_message(parse_error, ids)}]
 
 
 def _repair_message(parse_error: str, ids: list[int]) -> str:
