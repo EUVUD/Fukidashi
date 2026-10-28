@@ -31,6 +31,7 @@ from fukidashi.evaluation import harness
 from fukidashi.kb import curator as curator_rules
 from fukidashi.kb.entities import KEY_FIELDS
 from fukidashi.kb.loader import load_snapshot
+from fukidashi.llm.client import LLMNotConfigured
 from fukidashi.llm.metering import Meter
 from fukidashi.pipeline import baseline
 
@@ -651,6 +652,39 @@ def test_a_full_eval_that_stops_before_any_model_call_makes_no_kb(imported, root
     assert kb_rows(imported) == [] and not (tmp_path / "out").exists()
 
 
+def test_a_full_eval_without_an_llm_setting_leaves_no_kb_no_run_and_no_output_directory(imported, root, tmp_path):
+    def not_configured():
+        raise LLMNotConfigured("Set LLM_API_KEY in .env")
+
+    with pytest.raises(LLMNotConfigured):
+        harness.run_eval(imported, config=CONFIG, book=BOOK, page_indexes=[1, 2, 3], make_client=not_configured,
+                         dataset_root=root, out_root=tmp_path / "out", repo_root=app_config.ROOT)
+
+    assert kb_rows(imported) == []
+    assert imported.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+    assert not (tmp_path / "out").exists()
+
+
+def test_a_full_eval_whose_first_client_fails_otherwise_fails_that_page_and_goes_on_to_the_next(imported, root, tmp_path):
+    provider, made = Provider(answer(zh_json(2)), answer(APPROVE)), []
+
+    def make_client():
+        made.append(1)
+        if len(made) == 1:
+            raise RuntimeError("cannot build the client")
+        return mock_llm_client(provider)
+
+    result = harness.run_eval(imported, config=CONFIG, book=BOOK, page_indexes=[1, 2], make_client=make_client,
+                              dataset_root=root, out_root=tmp_path / "out", repo_root=app_config.ROOT)
+
+    assert len(made) == 2 and result.exit_code == 1 and len(provider.bodies) == 2
+    (failed,) = result.scores["failed_pages"]
+    assert (failed["page_index"], failed["run_id"], failed["error"]) == (1, None, "RuntimeError: cannot build the client")
+    assert [(p["page_index"], p["status"]) for p in result.manifest["pages"]] == [(1, "failed"), (2, "scored")]
+    assert len(kb_rows(imported)) == 1 and result.manifest["kb"]["id"] == kb_rows(imported)[0]["id"]
+    assert imported.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1  # page 1 never got a Run
+
+
 def test_the_kb_label_is_the_eval_id_and_a_taken_label_gets_a_suffix(imported, root, tmp_path, monkeypatch):
     monkeypatch.setattr(harness, "_now", lambda: "2026-01-01T00:00:00+00:00")
     new_kb(imported, label="20260101T000000Z-full", book=BOOK)   # an earlier KB with the label of this eval's id
@@ -676,6 +710,52 @@ def test_the_other_configs_keep_every_key_they_have_and_make_no_kb(imported, roo
     assert kb_rows(imported) == []
     for result in (reviewed, translated):
         assert "curator" not in harness.format_summary(result) and "knowledge base" not in harness.format_summary(result)
+
+
+SUMMARY_LINES = (("chrF", "chrF"), ("BLEU", "BLEU"), ("cost ", "cost"), ("latency ", "latency"),
+                 ("scored ", "scored"), ("fallback to baseline", "fallback"), ("review loop", "review loop"),
+                 ("curator ", "curator"), ("proposals ", "proposals"), ("knowledge base", "knowledge base"),
+                 ("REVIEW LOOP ", "REVIEW LOOP"), ("CURATOR ", "CURATOR"), ("FELL BACK", "FELL BACK"),
+                 ("skipped ", "skipped"), ("FAILED", "FAILED"), ("failed runs cost", "failed runs cost"))
+
+
+def cut_off():
+    return answer("", finish_reason="length")
+
+
+# Per config: the provider's script and the kinds of the summary's lines, in order. Page 1 is clean, page 2 falls back
+# to `baseline` (the agent's reply is cut off; `baseline` itself cannot), page 3 fails. A skipped page is added by hand.
+SUMMARY_ORDER = {
+    "baseline": (lambda: Provider(answer(zh_json(1)), answer(zh_json(2)), upstream_500()),
+                 ["id", "scored", "chrF", "BLEU", "cost", "latency", "skipped", "FAILED", "failed runs cost"]),
+    "translator": (lambda: Provider(answer(zh_json(1)), cut_off(), answer(zh_json(2)), upstream_500()),
+                   ["id", "scored", "fallback", "chrF", "BLEU", "cost", "latency", "FELL BACK", "skipped", "FAILED",
+                    "failed runs cost"]),
+    "full_no_kb": (lambda: Provider(answer(zh_json(1)), answer(APPROVE), cut_off(), answer(zh_json(2)),
+                                    answer(APPROVE), upstream_500()),
+                   ["id", "scored", "fallback", "review loop", "chrF", "BLEU", "cost", "latency", "REVIEW LOOP",
+                    "REVIEW LOOP", "FELL BACK", "skipped", "FAILED", "failed runs cost"]),
+    "full": (lambda: Provider(answer(zh_json(1)), answer(APPROVE), cut_off(), answer(zh_json(2)), answer(APPROVE),
+                              upstream_500()),
+             ["id", "scored", "fallback", "review loop", "curator", "proposals", "knowledge base", "chrF", "BLEU",
+              "cost", "latency", "REVIEW LOOP", "REVIEW LOOP", "CURATOR", "CURATOR", "FELL BACK", "skipped", "FAILED",
+              "failed runs cost"]),
+}
+
+
+@pytest.mark.parametrize("config_name", SUMMARY_ORDER)
+def test_the_summary_lines_come_in_a_fixed_order_for_every_config(imported, root, tmp_path, config_name):
+    script, expected = SUMMARY_ORDER[config_name]
+
+    result = evaluate(imported, root, tmp_path, script(), [1, 2, 3], config=config_name)
+    result.scores["skipped_pages"].append({"book": BOOK, "page_index": 9, "reason": "no text"})
+
+    lines = harness.format_summary(result).splitlines()
+    kinds = ["id" if i == 0 else next(kind for prefix, kind in SUMMARY_LINES if line.startswith(prefix))
+             for i, line in enumerate(lines)]
+    assert kinds == expected
+    assert lines[0] == f"{result.manifest['eval_id']} -> {result.out_dir}"
+    assert lines[1] == "scored 2 pages, 4 segments"
 
 
 def test_the_summary_of_a_full_eval_that_wrote_nothing_says_the_kb_is_empty(imported, root, tmp_path):

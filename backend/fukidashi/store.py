@@ -19,6 +19,12 @@ def find_page(conn: sqlite3.Connection, book_title: str, page_index: int) -> sql
     ).fetchone()
 
 
+def book_page_indexes(conn: sqlite3.Connection, book_title: str) -> list[int]:
+    """The `page_index` of every page of the book in the database, in page order; empty for an unknown book."""
+    return [r["page_index"] for r in conn.execute(
+        "SELECT page_index FROM pages WHERE book_title = ? ORDER BY page_index", (book_title,))]
+
+
 def page_segments(conn: sqlite3.Connection, page_id: int) -> list[sqlite3.Row]:
     return conn.execute("SELECT * FROM segments WHERE page_id = ? ORDER BY idx", (page_id,)).fetchall()
 
