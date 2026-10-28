@@ -1,0 +1,434 @@
+"""The Curator's rules, one test each, and that `apply` is all or nothing."""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import sqlite3
+
+import pytest
+from kb_support import accept, dump, name, new_kb, new_run, reject, term
+
+from fukidashi import store
+from fukidashi.datasets.importer import import_openmantra
+from fukidashi.kb import KBNotFound, load_snapshot
+from fukidashi.kb.curator import (
+    ACCEPTED, CONFIRMED, CONFLICT, DUPLICATE, PENDING, REJECTED, RESULTS, UNDECIDED, Outcome, apply,
+)
+
+ALL_STATUSES = ("proposed", "approved", "rejected", "pending_human")
+
+
+@pytest.fixture
+def imported(conn, dataset):
+    import_openmantra(conn, dataset)
+    return conn
+
+
+@pytest.fixture
+def kb(imported):
+    return new_kb(imported)
+
+
+@pytest.fixture
+def run_id(imported):
+    return new_run(imported)
+
+
+def results(outcomes):
+    return [o.result for o in outcomes]
+
+
+def accept_all(proposals):
+    return {p.proposal_id: accept() for p in proposals}
+
+
+def proposal_row(conn, proposal):
+    return conn.execute("SELECT * FROM proposals WHERE proposal_id = ?", (proposal.proposal_id,)).fetchone()
+
+
+def entries(conn, kb_id):
+    return store.kb_entries(conn, kb_id, ALL_STATUSES)
+
+
+def profiles(conn, kb_id):
+    return store.kb_profiles(conn, kb_id, ALL_STATUSES)
+
+
+def pages(row):
+    return json.loads(row["evidence_pages"])
+
+
+def history(row):
+    return json.loads(row["history"])
+
+
+def test_the_results_are_the_seven_the_rules_can_give():
+    assert set(RESULTS) == {"duplicate", "confirmed", "conflict", "pending_human", "accepted", "rejected", "undecided"}
+
+
+# --- rule 1: a duplicate id is ignored ---
+
+
+def test_a_retried_page_proposes_the_same_ids_and_writes_nothing_the_second_time(imported, kb, run_id):
+    def page(n):  # built afresh each time, as a retried page would
+        return [term(kb, n, "封印", "封印"), term(kb, n, "魔法", "魔法"), name(kb, n, "ユキ", "小雪", aliases=["ゆき"])]
+
+    first, second = page(1), page(2)
+    assert results(apply(imported, kb, 1, run_id, first, accept_all(first))) == [ACCEPTED, ACCEPTED, PENDING]
+    assert results(apply(imported, kb, 2, run_id, second, accept_all(second))) == [CONFIRMED] * 3
+    before = dump(imported)
+    assert pages(entries(imported, kb)[0]) == [1, 2] and len(history(profiles(imported, kb)[0])) == 2
+
+    for n, proposals in [(2, page(2)), (1, page(1))]:
+        again = apply(imported, kb, n, new_run(imported), proposals, accept_all(proposals))
+        assert results(again) == [DUPLICATE] * 3
+        assert [o.proposal_id for o in again] == [p.proposal_id for p in proposals]
+        assert dump(imported) == before  # entries, profiles, evidence, history and proposals: nothing written
+
+
+def test_a_proposal_listed_twice_in_one_call_is_applied_once(imported, kb, run_id):
+    proposal = term(kb, 1, "封印", "封印")
+
+    outcomes = apply(imported, kb, 1, run_id, [proposal, proposal], accept_all([proposal]))
+
+    assert results(outcomes) == [ACCEPTED, DUPLICATE]
+    assert len(entries(imported, kb)) == 1 and len(store.kb_proposals(imported, kb)) == 1
+
+
+def test_a_proposal_that_stayed_undecided_is_a_duplicate_when_its_page_comes_again(imported, kb, run_id):
+    proposal = term(kb, 1, "封印", "封印")
+    apply(imported, kb, 1, run_id, [proposal])  # the Curator's call failed: no decision
+    before = dump(imported)
+
+    again = apply(imported, kb, 1, run_id, [term(kb, 1, "封印", "封印")], accept_all([proposal]))
+
+    assert results(again) == [DUPLICATE] and dump(imported) == before  # rule 1 comes first, as written
+
+
+# --- rule 2: a confirmation joins the evidence ---
+
+
+def test_a_confirmation_adds_the_page_to_the_evidence_once(imported, kb, run_id):
+    first = term(kb, 1, "封印", "封印", category="magic")
+    apply(imported, kb, 1, run_id, [first], accept_all([first]))
+    second_run = new_run(imported)
+    second = term(kb, 2, "封印", "封印")
+
+    outcomes = apply(imported, kb, 2, second_run, [second])  # no decision needed
+
+    assert results(outcomes) == [CONFIRMED]
+    (entry,) = entries(imported, kb)
+    assert (entry["target_term"], entry["category"], entry["status"], entry["provenance"]) == (
+        "封印", "magic", "approved", "agent")
+    assert pages(entry) == [1, 2]
+    created, confirmed = history(entry)
+    assert (created["event"], created["page"], created["run_id"]) == ("created", 1, run_id)
+    assert (confirmed["event"], confirmed["page"], confirmed["run_id"], confirmed["proposal_id"]) == (
+        "confirmed", 2, second_run, second.proposal_id)
+    row = proposal_row(imported, second)
+    assert (row["status"], row["decided_at"] is not None) == ("approved", True) and "entry" in row["reason"]
+    assert results(apply(imported, kb, 2, second_run, [second])) == [DUPLICATE]
+    assert pages(entries(imported, kb)[0]) == [1, 2] and len(history(entries(imported, kb)[0])) == 2
+
+
+def test_a_decision_does_not_change_a_confirmation(imported, kb, run_id):
+    first = term(kb, 1, "封印", "封印")
+    apply(imported, kb, 1, run_id, [first], accept_all([first]))
+    second = term(kb, 2, "封印", "封印")
+
+    outcomes = apply(imported, kb, 2, run_id, [second], {second.proposal_id: reject("not needed")})
+
+    assert results(outcomes) == [CONFIRMED] and entries(imported, kb)[0]["status"] == "approved"
+
+
+def test_a_confirmed_name_keeps_its_status_and_gains_the_page(imported, kb, run_id):
+    first = name(kb, 1, "ユキ", "小雪", aliases=["ゆき"], notes="轻声细语")
+    apply(imported, kb, 1, run_id, [first])
+    second = name(kb, 2, "ユキ", "小雪", aliases=["雪ちゃん"], notes="大声说话")
+
+    outcomes = apply(imported, kb, 2, run_id, [second])
+
+    assert results(outcomes) == [CONFIRMED]
+    (profile,) = profiles(imported, kb)
+    assert (profile["status"], pages(profile)) == ("pending_human", [1, 2])
+    assert (json.loads(profile["aliases"]), profile["notes"]) == (["ゆき"], "轻声细语")  # the profile is as it was
+    assert [h["event"] for h in history(profile)] == ["created", "confirmed"]
+    assert proposal_row(imported, second)["status"] == "approved"
+
+
+def test_evidence_never_lists_a_page_twice(imported, kb, run_id):
+    first = term(kb, 1, "封印", "封印")
+    apply(imported, kb, 1, run_id, [first], accept_all([first]))
+    entry_id = entries(imported, kb)[0]["id"]
+    before = dump(imported)
+
+    assert store.add_entry_evidence(imported, entry_id, 1, {"event": "confirmed"}) is False
+
+    assert dump(imported) == before
+
+
+# --- rule 3: a conflict goes to a human, the entry stays ---
+
+
+def test_a_conflicting_term_goes_to_the_human_review_queue_and_the_entry_stays(imported, kb, run_id):
+    first = term(kb, 1, "封印", "封印")
+    apply(imported, kb, 1, run_id, [first], accept_all([first]))
+    entry_before = tuple(entries(imported, kb)[0])
+    rival = term(kb, 2, "封印", "封缄")
+
+    outcomes = apply(imported, kb, 2, run_id, [rival], accept_all([rival]))  # even an "accept" cannot override it
+
+    assert results(outcomes) == [CONFLICT]
+    assert [tuple(e) for e in entries(imported, kb)] == [entry_before]
+    row = proposal_row(imported, rival)
+    assert (row["status"], row["decided_at"] is not None) == ("pending_human", True)
+    assert "conflicts with entry" in row["reason"] and "封印" in row["reason"]
+    assert load_snapshot(imported, kb).term("封印").target_term == "封印"  # later pages keep the first rendering
+
+
+def test_of_two_conflicting_proposals_on_one_page_the_first_wins(imported, kb, run_id):
+    first, second = term(kb, 1, "封印", "封印"), term(kb, 1, "封印", "封缄")
+
+    outcomes = apply(imported, kb, 1, run_id, [first, second], accept_all([first, second]))
+
+    assert results(outcomes) == [ACCEPTED, CONFLICT]
+    (entry,) = entries(imported, kb)
+    assert (entry["target_term"], pages(entry)) == ("封印", [1])
+    assert (proposal_row(imported, first)["status"], proposal_row(imported, second)["status"]) == (
+        "approved", "pending_human")
+
+
+def test_the_order_of_the_proposals_decides_which_conflicting_one_wins(imported, kb, run_id):
+    first, second = term(kb, 1, "封印", "封印"), term(kb, 1, "封印", "封缄")
+
+    outcomes = apply(imported, kb, 1, run_id, [second, first], accept_all([first, second]))
+
+    assert results(outcomes) == [ACCEPTED, CONFLICT] and entries(imported, kb)[0]["target_term"] == "封缄"
+
+
+def test_a_conflict_needs_an_entry_so_a_rejected_first_proposal_does_not_win(imported, kb, run_id):
+    first, second = term(kb, 1, "封印", "封印"), term(kb, 1, "封印", "封缄")
+
+    outcomes = apply(imported, kb, 1, run_id, [first, second], {first.proposal_id: reject(), second.proposal_id: accept()})
+
+    assert results(outcomes) == [REJECTED, ACCEPTED] and entries(imported, kb)[0]["target_term"] == "封缄"
+
+
+def test_a_conflicting_name_goes_to_the_human_review_queue_and_the_profile_stays(imported, kb, run_id):
+    apply(imported, kb, 1, run_id, [name(kb, 1, "ユキ", "小雪")])
+    profile_before = tuple(profiles(imported, kb)[0])
+    rival = name(kb, 2, "ユキ", "雪儿")
+
+    outcomes = apply(imported, kb, 2, run_id, [rival], accept_all([rival]))
+
+    assert results(outcomes) == [CONFLICT]
+    assert [tuple(p) for p in profiles(imported, kb)] == [profile_before]
+    row = proposal_row(imported, rival)
+    assert (row["status"], "conflicts with profile" in row["reason"]) == ("pending_human", True)
+
+
+def test_a_term_and_a_name_with_the_same_source_do_not_meet(imported, kb, run_id):
+    apply(imported, kb, 1, run_id, [name(kb, 1, "ユキ", "小雪")])
+    word = term(kb, 2, "ユキ", "雪")
+
+    outcomes = apply(imported, kb, 2, run_id, [word], accept_all([word]))
+
+    assert results(outcomes) == [ACCEPTED]  # terms are compared with entries, names with profiles
+
+
+# --- rule 4: a name becomes a pending profile, whatever the decision says ---
+
+
+@pytest.mark.parametrize("decision", [None, accept("a real name"), reject("not a name")], ids=["none", "accept", "reject"])
+def test_a_new_name_becomes_a_pending_profile_whatever_the_decision(imported, kb, run_id, decision):
+    proposal = name(kb, 4, "ユキ", "小雪", aliases=["ゆき"], notes="轻声细语")
+
+    outcomes = apply(imported, kb, 4, run_id, [proposal], {} if decision is None else {proposal.proposal_id: decision})
+
+    assert results(outcomes) == [PENDING]
+    (profile,) = profiles(imported, kb)
+    assert (profile["name_src"], profile["name_tgt"], profile["status"]) == ("ユキ", "小雪", "pending_human")
+    assert (json.loads(profile["aliases"]), profile["notes"], pages(profile)) == (["ゆき"], "轻声细语", [4])
+    (created,) = history(profile)
+    assert (created["event"], created["page"], created["run_id"], created["proposal_id"]) == (
+        "created", 4, run_id, proposal.proposal_id)
+    row = proposal_row(imported, proposal)
+    assert row["status"] == "pending_human" and row["decided_at"] is not None
+    if decision is not None:
+        assert decision.reason in row["reason"]  # the human gets to read what the Curator thought
+    assert entries(imported, kb) == []
+    snapshot_profile = load_snapshot(imported, kb).character("ゆき")  # readable at once, marked pending
+    assert (snapshot_profile.name_tgt, snapshot_profile.status) == ("小雪", "pending_human")
+
+
+# --- rule 5: a new term is accepted, rejected or left undecided ---
+
+
+def test_an_accepted_term_becomes_an_approved_entry_made_by_the_agent(imported, kb, run_id):
+    proposal = term(kb, 5, "封印", "封印", category="magic")
+
+    outcomes = apply(imported, kb, 5, run_id, [proposal], {proposal.proposal_id: accept("a recurring spell")})
+
+    assert results(outcomes) == [ACCEPTED]
+    (entry,) = entries(imported, kb)
+    assert (entry["source_term"], entry["target_term"], entry["category"]) == ("封印", "封印", "magic")
+    assert (entry["status"], entry["provenance"], pages(entry)) == ("approved", "agent", [5])
+    (created,) = history(entry)
+    assert (created["event"], created["page"], created["run_id"], created["proposal_id"], created["reason"]) == (
+        "created", 5, run_id, proposal.proposal_id, "a recurring spell")
+    row = proposal_row(imported, proposal)
+    assert (row["status"], row["reason"], row["decided_at"] is not None) == ("approved", "a recurring spell", True)
+    assert (row["kind"], row["proposer"], row["page_index"], row["run_id"], row["kb_id"]) == (
+        "term", "translator", 5, run_id, kb)
+    assert json.loads(row["payload"]) == proposal.payload
+    assert load_snapshot(imported, kb).term("封印").status == "approved"
+
+
+def test_a_rejected_term_writes_no_entry_and_keeps_its_reason(imported, kb, run_id):
+    proposal = term(kb, 5, "ありがとう", "谢谢")
+
+    outcomes = apply(imported, kb, 5, run_id, [proposal], {proposal.proposal_id: reject("an everyday word")})
+
+    assert results(outcomes) == [REJECTED]
+    assert entries(imported, kb) == []
+    row = proposal_row(imported, proposal)
+    assert (row["status"], row["reason"], row["decided_at"] is not None) == ("rejected", "an everyday word", True)
+    assert load_snapshot(imported, kb).term("ありがとう") is None
+    later = term(kb, 6, "ありがとう", "谢谢")  # a rejection is not forever: the same pair on another page is new
+    assert results(apply(imported, kb, 6, run_id, [later], accept_all([later]))) == [ACCEPTED]
+
+
+def test_a_term_without_a_decision_stays_proposed(imported, kb, run_id):
+    proposal = term(kb, 5, "封印", "封印")
+
+    outcomes = apply(imported, kb, 5, run_id, [proposal])  # for example the Curator's call failed
+
+    assert results(outcomes) == [UNDECIDED]
+    row = proposal_row(imported, proposal)
+    assert (row["status"], row["reason"], row["decided_at"]) == ("proposed", None, None)
+    assert entries(imported, kb) == []
+    assert load_snapshot(imported, kb).term("封印") is None and store.kb_proposals(imported, kb, "proposed")
+
+
+def test_one_page_with_every_kind_of_outcome(imported, kb, run_id):
+    apply(imported, kb, 1, run_id, [term(kb, 1, "魔法", "魔法")], {term(kb, 1, "魔法", "魔法").proposal_id: accept()})
+    page = [
+        term(kb, 2, "魔法", "魔法"),  # confirmation
+        term(kb, 2, "魔法", "魔术"),  # conflict
+        term(kb, 2, "封印", "封印"),  # accepted
+        term(kb, 2, "王国", "王国"),  # rejected
+        term(kb, 2, "城", "城"),  # undecided
+        name(kb, 2, "ユキ", "小雪"),  # pending profile
+        term(kb, 2, "封印", "封印"),  # the same proposal again
+    ]
+    decisions = {page[2].proposal_id: accept(), page[3].proposal_id: reject("generic")}
+
+    outcomes = apply(imported, kb, 2, run_id, page, decisions)
+
+    assert outcomes == [Outcome(p.proposal_id, r) for p, r in zip(page, [
+        CONFIRMED, CONFLICT, ACCEPTED, REJECTED, UNDECIDED, PENDING, DUPLICATE])]
+    queue = store.kb_proposals(imported, kb, "pending_human")  # the Human Review Queue
+    assert [r["proposal_id"] for r in queue] == [page[1].proposal_id, page[5].proposal_id]
+    snapshot = load_snapshot(imported, kb)
+    assert sorted(e.source_term for e in snapshot.entries) == ["封印", "魔法"]
+    assert [p.name_src for p in snapshot.profiles] == ["ユキ"]
+    assert snapshot.term("王国") is None and snapshot.term("城") is None
+
+
+# --- errors: nothing is written ---
+
+
+def test_a_decision_for_an_unknown_id_is_an_error_and_writes_nothing(imported, kb, run_id):
+    earlier = term(kb, 1, "魔法", "魔法")
+    apply(imported, kb, 1, run_id, [earlier], accept_all([earlier]))
+    before = dump(imported)
+    page = [term(kb, 2, "封印", "封印"), name(kb, 2, "ユキ", "小雪")]
+    stranger = term(kb, 2, "王国", "王国")  # a real proposal, but not among this call's
+
+    for decisions in ({"no-such-id": accept()}, {**accept_all(page), stranger.proposal_id: accept()}):
+        with pytest.raises(ValueError, match="not among this page's"):
+            apply(imported, kb, 2, run_id, page, decisions)
+        assert dump(imported) == before
+        assert not imported.in_transaction
+
+
+def test_a_proposal_that_is_not_this_pages_or_does_not_match_its_id_is_refused_and_writes_nothing(imported, kb, run_id):
+    other_kb = new_kb(imported, "run-2")
+    good = term(kb, 2, "封印", "封印")
+    bad = {
+        "another page": term(kb, 3, "魔法", "魔法"),
+        "another kb": term(other_kb, 2, "魔法", "魔法"),
+        "forged id": dataclasses.replace(term(kb, 2, "魔法", "魔法"), proposal_id="f" * 32),
+        "changed payload": dataclasses.replace(
+            term(kb, 2, "魔法", "魔法"), payload={"source_term": "魔法", "target_term": "魔术", "category": ""}),
+    }
+    before = dump(imported)
+
+    for label, proposal in bad.items():
+        with pytest.raises(ValueError, match="is not a proposal of page 2 of KB"):
+            apply(imported, kb, 2, run_id, [good, proposal], accept_all([good]))
+        assert dump(imported) == before, label
+
+
+def test_an_unknown_kb_is_an_error(imported, run_id):
+    with pytest.raises(KBNotFound):
+        apply(imported, 99, 1, run_id, [], {})
+
+
+def test_no_proposals_write_nothing(imported, kb, run_id):
+    before = dump(imported)
+
+    assert apply(imported, kb, 1, run_id, []) == [] and dump(imported) == before
+    assert not imported.in_transaction
+
+
+def test_apply_does_not_commit_what_the_caller_has_pending(imported, kb, run_id):
+    imported.execute("INSERT INTO books (book_title) VALUES ('pending_book')")  # an open transaction of the caller's
+
+    with pytest.raises(sqlite3.OperationalError, match="within a transaction"):
+        apply(imported, kb, 1, run_id, [term(kb, 1, "封印", "封印")])
+
+    imported.rollback()
+    assert imported.execute("SELECT COUNT(*) FROM books WHERE book_title = 'pending_book'").fetchone()[0] == 0
+    assert store.kb_proposals(imported, kb) == []
+
+
+# --- all or nothing ---
+
+
+@pytest.mark.parametrize("function, fails_on_call", [
+    ("insert_proposal", 5), ("set_proposal_status", 4), ("insert_entry", 1), ("insert_entry", 2),
+    ("insert_profile", 1), ("add_entry_evidence", 1), ("add_profile_evidence", 1),
+])
+def test_when_a_write_fails_partway_nothing_of_the_call_is_stored(imported, kb, run_id, monkeypatch, function, fails_on_call):
+    earlier = [term(kb, 1, "魔法", "魔法"), name(kb, 1, "ハル", "小春")]
+    apply(imported, kb, 1, run_id, earlier, accept_all(earlier))
+    page = [
+        term(kb, 2, "魔法", "魔法"),  # confirms an entry
+        term(kb, 2, "封印", "封印"),  # a new entry
+        name(kb, 2, "ハル", "小春"),  # confirms a profile
+        term(kb, 2, "王国", "王国"),  # another new entry
+        name(kb, 2, "ユキ", "小雪"),  # a new profile
+    ]
+    before = dump(imported)
+    real = getattr(store, function)
+    calls = []
+
+    def failing(*args, **kwargs):
+        calls.append(function)
+        if len(calls) == fails_on_call:
+            raise sqlite3.OperationalError("disk I/O error")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(store, function, failing)
+
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        apply(imported, kb, 2, run_id, page, accept_all(page))
+
+    assert len(calls) == fails_on_call  # the writes before the failure did happen...
+    assert dump(imported) == before  # ...and are gone
+    assert not imported.in_transaction
+    monkeypatch.setattr(store, function, real)  # once the fault is gone the page goes through whole, not as duplicates
+    assert results(apply(imported, kb, 2, run_id, page, accept_all(page))) == [
+        CONFIRMED, ACCEPTED, CONFIRMED, ACCEPTED, PENDING]
