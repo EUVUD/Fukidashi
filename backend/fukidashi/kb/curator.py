@@ -16,7 +16,8 @@ model call and imports no LangChain.
    A name under the wrong kind is a conflict too, across kinds: a term whose source is the name, or an alias, of a
    profile; a character whose name is the source of an entry. The proposal goes to `pending_human`, nothing is written
    for it, the existing profile or entry stays as it is, and the proposal's reason says it is about the kinds (the result
-   is `CONFLICT`). A person decides which kind it is, whatever the decision says. This catches only a collision with what
+   is `CONFLICT_ACROSS_KINDS`, apart from `CONFLICT` so that a count of them needs no reading of reasons). A person
+   decides which kind it is, whatever the decision says. This catches only a collision with what
    the KB already holds, and on one page the earlier proposal counts; whether a term that collides with nothing is really
    a name is the Curator Agent's judgment.
 4. A new name (kind `character`) becomes a profile with status `pending_human`, whatever the decision says.
@@ -43,12 +44,13 @@ from .entities import APPROVED, PENDING_HUMAN, TERM, KBNotFound, Proposal, propo
 DUPLICATE = "duplicate"
 CONFIRMED = "confirmed"
 CONFLICT = "conflict"
+CONFLICT_ACROSS_KINDS = "conflict_across_kinds"  # a name under the wrong kind; what is written is the same as for CONFLICT
 PENDING = PENDING_HUMAN  # a new name, now a pending profile
 ACCEPTED = "accepted"
 REJECTED = "rejected"
 UNDECIDED = "undecided"
 
-RESULTS = (DUPLICATE, CONFIRMED, CONFLICT, PENDING, ACCEPTED, REJECTED, UNDECIDED)
+RESULTS = (DUPLICATE, CONFIRMED, CONFLICT, CONFLICT_ACROSS_KINDS, PENDING, ACCEPTED, REJECTED, UNDECIDED)
 
 
 @dataclass(frozen=True)
@@ -176,4 +178,4 @@ def _wrong_kind(conn: sqlite3.Connection, p: Proposal, what: str) -> str:
     """A conflict across kinds: `p`'s source is already something else in the KB. Nothing is written for it and the
     existing row is not touched; the proposal waits for a human, and its reason says `what` is wrong."""
     store.set_proposal_status(conn, p.proposal_id, status=PENDING_HUMAN, reason=f"conflicts across kinds: {what}")
-    return CONFLICT
+    return CONFLICT_ACROSS_KINDS

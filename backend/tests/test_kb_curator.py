@@ -13,7 +13,8 @@ from fukidashi import store
 from fukidashi.datasets.importer import import_openmantra
 from fukidashi.kb import KBNotFound
 from fukidashi.kb.curator import (
-    ACCEPTED, CONFIRMED, CONFLICT, DUPLICATE, PENDING, REJECTED, RESULTS, UNDECIDED, Outcome, apply,
+    ACCEPTED, CONFIRMED, CONFLICT, CONFLICT_ACROSS_KINDS, DUPLICATE, PENDING, REJECTED, RESULTS, UNDECIDED, Outcome,
+    apply,
 )
 from fukidashi.kb.loader import load_snapshot
 
@@ -64,8 +65,9 @@ def history(row):
     return json.loads(row["history"])
 
 
-def test_the_results_are_the_seven_the_rules_can_give():
-    assert set(RESULTS) == {"duplicate", "confirmed", "conflict", "pending_human", "accepted", "rejected", "undecided"}
+def test_the_results_are_the_eight_the_rules_can_give():
+    assert set(RESULTS) == {"duplicate", "confirmed", "conflict", "conflict_across_kinds", "pending_human", "accepted",
+                            "rejected", "undecided"}
 
 
 # --- rule 1: a duplicate id is ignored ---
@@ -237,7 +239,7 @@ def test_a_term_and_a_name_with_the_same_source_meet_as_a_conflict_across_kinds(
 
     outcomes = apply(imported, kb, 2, run_id, [word], accept_all([word]))
 
-    assert results(outcomes) == [CONFLICT] and entries(imported, kb) == []
+    assert results(outcomes) == [CONFLICT_ACROSS_KINDS] and entries(imported, kb) == []
 
 
 # --- rule 3, across kinds: a name under the wrong kind goes to a person, and nothing is written for it ---
@@ -272,7 +274,7 @@ def test_a_term_whose_source_is_a_profiles_name_goes_to_a_person_and_no_entry_is
 
     outcomes = apply(imported, kb, 2, run_id, [word], {} if decision is None else {word.proposal_id: decision})
 
-    assert results(outcomes) == [CONFLICT]   # whatever the Curator Agent said: the rules are code
+    assert results(outcomes) == [CONFLICT_ACROSS_KINDS]   # whatever the Curator Agent said: the rules are code
     assert entries(imported, kb) == []
     kinds_untouched(imported, kb, before)
     row = proposal_row(imported, word)
@@ -288,7 +290,7 @@ def test_a_term_whose_source_is_a_profiles_alias_goes_to_a_person_and_no_entry_i
 
     outcomes = apply(imported, kb, 2, run_id, [word], accept_all([word]))
 
-    assert results(outcomes) == [CONFLICT] and entries(imported, kb) == []
+    assert results(outcomes) == [CONFLICT_ACROSS_KINDS] and entries(imported, kb) == []
     kinds_untouched(imported, kb, before)
     row = proposal_row(imported, word)
     assert row["status"] == "pending_human" and "across kinds" in row["reason"] and "an alias" in row["reason"]
@@ -304,7 +306,7 @@ def test_a_character_whose_name_is_an_entrys_source_goes_to_a_person_and_no_prof
 
     outcomes = apply(imported, kb, 2, run_id, [person], {} if decision is None else {person.proposal_id: decision})
 
-    assert results(outcomes) == [CONFLICT] and profiles(imported, kb) == []
+    assert results(outcomes) == [CONFLICT_ACROSS_KINDS] and profiles(imported, kb) == []
     kinds_untouched(imported, kb, before)
     row = proposal_row(imported, person)
     assert (row["status"], row["decided_at"] is not None) == ("pending_human", True)
@@ -317,7 +319,7 @@ def test_on_one_page_a_name_then_a_term_with_its_source_meet_as_a_conflict_acros
 
     outcomes = apply(imported, kb, 1, run_id, [person, word], accept_all([person, word]))
 
-    assert results(outcomes) == [PENDING, CONFLICT]   # the earlier proposal counts as existing for the later one
+    assert results(outcomes) == [PENDING, CONFLICT_ACROSS_KINDS]   # the earlier proposal counts as existing for the later one
     assert [p["name_src"] for p in profiles(imported, kb)] == ["ユキ"] and entries(imported, kb) == []
     assert proposal_row(imported, word)["status"] == "pending_human"
 
@@ -327,7 +329,7 @@ def test_on_one_page_a_term_then_a_name_with_its_source_meet_as_a_conflict_acros
 
     outcomes = apply(imported, kb, 1, run_id, [word, person], accept_all([word]))
 
-    assert results(outcomes) == [ACCEPTED, CONFLICT]
+    assert results(outcomes) == [ACCEPTED, CONFLICT_ACROSS_KINDS]
     assert [e["source_term"] for e in entries(imported, kb)] == ["ユキ"] and profiles(imported, kb) == []
     row = proposal_row(imported, person)
     assert row["status"] == "pending_human" and "across kinds" in row["reason"]
@@ -577,3 +579,28 @@ def test_when_a_write_fails_partway_nothing_of_the_call_is_stored(imported, kb, 
     monkeypatch.setattr(store, function, real)  # once the fault is gone the page goes through whole, not as duplicates
     assert results(apply(imported, kb, 2, run_id, page, accept_all(page))) == [
         CONFIRMED, ACCEPTED, CONFIRMED, ACCEPTED, PENDING]
+
+
+# --- a conflict across kinds is a result of its own (task 016), and writes what it always wrote ---
+
+
+def test_a_conflict_across_kinds_is_counted_apart_from_a_conflict_of_one_kind_and_writes_the_same_things(
+        imported, kb, run_id):
+    insert_entry(imported, kb, "封印", "封印术")
+    insert_profile(imported, kb, "ユキ")
+    same_kind, term_as_name, name_as_term = (
+        term(kb, 2, "封印", "封缄"), term(kb, 2, "ユキ", "雪"), name(kb, 2, "封印", "封印"))
+    before = dump(imported)
+
+    outcomes = apply(imported, kb, 2, run_id, [same_kind, term_as_name, name_as_term],
+                     accept_all([same_kind, term_as_name]))
+
+    assert results(outcomes) == [CONFLICT, CONFLICT_ACROSS_KINDS, CONFLICT_ACROSS_KINDS]
+    assert len(RESULTS) == 8 and set(results(outcomes)) <= set(RESULTS)
+    kinds_untouched(imported, kb, before)   # in neither case is an entry or a profile written or changed
+    for proposal in (same_kind, term_as_name, name_as_term):
+        row = proposal_row(imported, proposal)
+        assert (row["status"], row["decided_at"] is not None) == ("pending_human", True)
+    assert proposal_row(imported, same_kind)["reason"].startswith("conflicts with entry")
+    assert proposal_row(imported, term_as_name)["reason"].startswith("conflicts across kinds")
+    assert proposal_row(imported, name_as_term)["reason"].startswith("conflicts across kinds")

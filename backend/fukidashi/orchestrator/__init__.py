@@ -5,6 +5,7 @@ from .flow import (
     CONFIG_NAME,
     FAILED,
     FINAL_STOPS,
+    KB_CONFIG_NAME,
     MAX_SEND_BACKS,
     OK,
     REVIEW,
@@ -19,6 +20,7 @@ from .flow import (
 )
 
 __all__ = [
-    "APPROVED", "CONFIG_NAME", "FAILED", "FINAL_STOPS", "MAX_SEND_BACKS", "OK", "REVIEW", "REVIEW_UNUSABLE", "REVISE",
-    "REVISION_UNUSABLE", "SEND_BACK_LIMIT", "TRANSLATE", "UNUSABLE", "OrchestratorResult", "run_orchestrator",
+    "APPROVED", "CONFIG_NAME", "FAILED", "FINAL_STOPS", "KB_CONFIG_NAME", "MAX_SEND_BACKS", "OK", "REVIEW",
+    "REVIEW_UNUSABLE", "REVISE", "REVISION_UNUSABLE", "SEND_BACK_LIMIT", "TRANSLATE", "UNUSABLE", "OrchestratorResult",
+    "run_orchestrator",
 ]

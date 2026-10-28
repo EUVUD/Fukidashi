@@ -1,6 +1,10 @@
 """Translate pages with `runs.translate_page` (the editor's code path) and score them against the references.
 
 Outputs go to <out_root>/<eval id>/: manifest.json, segments.jsonl and scores.json.
+
+For `full` the harness first creates the run's Knowledge Base (OUTLINE §3.3, §8: one KB per eval run, never shared with
+another run), labelled with the eval id, and passes it to every page in the order of the pages, so that a page reads what
+the earlier pages wrote.
 """
 
 from __future__ import annotations
@@ -14,15 +18,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .. import orchestrator, runs, store, tracing
+from ..agents import curator as curator_agent
 from ..agents import reviewer, translator
 from ..agents.loop import DEFAULT_MAX_STEPS, refuse_tracing
+from ..kb import curator as curator_rules
 from ..llm.client import LLMClient, LLMNotConfigured
 from ..pipeline import baseline
 from . import manifest as manifest_facts
 from .metrics import cost_summary, latency_summary, run_cost, score_corpus
 from .references import OPENCC_CONFIG, to_zh_hans
 
-CONFIGS = runs.CONFIGS  # `full` arrives with the KB
+CONFIGS = runs.CONFIGS
+REVIEWED_CONFIGS = (orchestrator.CONFIG_NAME, runs.FULL)  # the configs that run the Orchestrator's review loop
+KB_STATUSES = ("proposed", "approved", "rejected", "pending_human")  # the states an entry or a profile can be in
+CURATOR_STATUSES = curator_agent.STATUSES
 
 
 class EvalAborted(Exception):
@@ -71,8 +80,16 @@ def run_eval(
     `fallback_reason`) and as a count over the scored pages (`fallback_pages`). For `full_no_kb` that is the first pass;
     a revision never falls back. A `full_no_kb` page row also says how its review loop went (`send_backs`,
     `final_stop`, `final_reviewed`, and the status and verdict of each review), and `scores.json` counts the scored
-    pages by `final_stop` (`final_stops`). Each page row carries the `trace_id` of its trace (null when tracing is
-    off), and the manifest says where the traces went.
+    pages by `final_stop` (`final_stops`); `full` has the same. Each page row carries the `trace_id` of its trace (null
+    when tracing is off), and the manifest says where the traces went.
+
+    `full` makes one new KB for the eval run, after every page has been checked and before the first model call; the
+    manifest records its id and label (`kb`). A scored page's row gives the Curator's status (`curator_status`) and the
+    count of each result of `curator.RESULTS` among its proposals (`proposal_outcomes`, zeros included, so
+    `conflict_across_kinds` is counted apart from `conflict`). `scores.json` gives the totals (`curator_statuses`,
+    `proposal_outcomes`) and the KB's size at the end (`kb`: id, label, entries and profiles by status). Proposals the
+    Curator left `undecided` stay so: an eval KB is used once. The client is built by the first page, so an
+    `LLMNotConfigured` stop comes after the KB was made, and that empty KB stays in the database.
     """
     if config not in CONFIGS:
         raise ValueError(f"unknown config {config!r}; expected one of {CONFIGS}")
@@ -83,9 +100,11 @@ def run_eval(
     params = {"page_budget": baseline.DEFAULT_PAGE_BUDGET, "max_tokens": baseline.DEFAULT_MAX_TOKENS}
     if config == translator.CONFIG_NAME:
         params |= {"agent_budget": translator.DEFAULT_PAGE_BUDGET, "max_steps": DEFAULT_MAX_STEPS}
-    if config == orchestrator.CONFIG_NAME:
+    if config in REVIEWED_CONFIGS:
         params |= {"agent_budget": translator.DEFAULT_PAGE_BUDGET, "review_budget": reviewer.DEFAULT_REVIEW_BUDGET,
                    "max_steps": DEFAULT_MAX_STEPS}
+    if config == runs.FULL:
+        params |= {"curator_budget": curator_agent.DEFAULT_CURATOR_BUDGET}
 
     to_translate: list[int] = []
     skipped: list[dict] = []
@@ -102,6 +121,13 @@ def run_eval(
     if problems:
         raise EvalAborted(problems)
 
+    kb_id = kb_label = None
+    eval_id = None
+    if config == runs.FULL:  # one KB for this eval run: its label is the eval id, which no other KB of the book has
+        eval_id = _free_id(out_root, _eval_base(started_at, config),
+                           taken=lambda label: store.find_kb(conn, book_title=book, purpose="eval", label=label))
+        kb_id, kb_label = store.create_kb(conn, book_title=book, purpose="eval", label=eval_id), eval_id
+
     page_entries: dict[int, dict] = {}  # page_index -> manifest entry
     scored: list[dict] = []  # per-page score rows, in page order
     failed: list[dict] = []
@@ -116,7 +142,8 @@ def run_eval(
         trace_id = None
         try:
             outcome = runs.translate_page(
-                conn, book, page_index, make_client=make_client, dataset_root=dataset_root, config=config, **params
+                conn, book, page_index, make_client=make_client, dataset_root=dataset_root, config=config,
+                **({"kb_id": kb_id} if config == runs.FULL else {}), **params,
             )
         except LLMNotConfigured:
             raise  # raised before any Run exists, and it would be the same for every page
@@ -154,7 +181,8 @@ def run_eval(
         scored.append({"book": book, "page_index": page_index, "run_id": outcome.run_id, "trace_id": trace_id,
                        "segments": len(rows), "calls": run["calls"], "unknown_usage_calls": run["unknown_usage_calls"],
                        "fell_back": fallback_reason is not None, "fallback_reason": fallback_reason,
-                       **(_review_loop(run) if config == orchestrator.CONFIG_NAME else {}),
+                       **(_review_loop(run) if config in REVIEWED_CONFIGS else {}),
+                       **(_curation(run) if config == runs.FULL else {}),
                        "cost_usd": cost, "latency_s": round(latency, 3)})
         log(f"  run {outcome.run_id}: {len(rows)} segments, {latency:.1f}s")
     for entry in skipped:
@@ -169,7 +197,13 @@ def run_eval(
         "segments_scored": len(segment_lines),
         "fallback_pages": sum(p["fell_back"] for p in scored),  # scored pages whose Run fell back to baseline
         **({"final_stops": {stop: sum(p["final_stop"] == stop for p in scored) for stop in orchestrator.FINAL_STOPS}}
-           if config == orchestrator.CONFIG_NAME else {}),  # scored pages by why their review loop ended
+           if config in REVIEWED_CONFIGS else {}),  # scored pages by why their review loop ended
+        **({"curator_statuses": {status: sum(p["curator_status"] == status for p in scored)
+                                 for status in CURATOR_STATUSES},
+            "proposal_outcomes": {result: sum(p["proposal_outcomes"][result] for p in scored)
+                                  for result in curator_rules.RESULTS},
+            "kb": _kb_size(conn, kb_id, kb_label)}
+           if config == runs.FULL else {}),  # the Curator's statuses, the results for the proposals, and the KB's size
         "chrf": {"score": corpus.chrf, "signature": corpus.chrf_signature},
         "bleu": {"score": corpus.bleu, "signature": corpus.bleu_signature},
         "cost": cost_summary([(r["cost_usd"], r["unknown_usage_calls"]) for r in scored_runs])
@@ -183,7 +217,8 @@ def run_eval(
     models_response = sorted({m for r in run_rows if r["response_model"] for m in r["response_model"].split(", ")})
     git = manifest_facts.git_state(repo_root)
     finished_at = _now()
-    eval_id = _free_id(out_root, datetime.fromisoformat(started_at).strftime("%Y%m%dT%H%M%SZ") + f"-{config}")
+    if eval_id is None:
+        eval_id = _free_id(out_root, _eval_base(started_at, config))
     manifest = {
         "eval_id": eval_id,
         "started_at": started_at,
@@ -200,6 +235,7 @@ def run_eval(
         "sacrebleu_signatures": {"chrf": corpus.chrf_signature, "bleu": corpus.bleu_signature},
         "opencc_config": OPENCC_CONFIG,
         "tracing": tracing.describe(),  # whether the traces in `pages` exist, and where they went
+        **({"kb": {"id": kb_id, "label": kb_label}} if config == runs.FULL else {}),  # this eval run's own KB
     }
 
     out_dir = out_root / eval_id
@@ -228,6 +264,23 @@ def _fallback_reason(run: sqlite3.Row | None) -> str | None:
     return None if fallback is None else fallback["reason"]
 
 
+def _curation(run: sqlite3.Row) -> dict:
+    """How a `full` Run's finalize went, read from what it stored: the Curator's status, and how often each result of the
+    rules happened to the page's proposals (every result is a key)."""
+    finalize = _attempts(run)["finalize"]
+    return {"curator_status": finalize["curator"]["status"],
+            "proposal_outcomes": runs.outcome_counts(finalize["outcomes"])}
+
+
+def _kb_size(conn: sqlite3.Connection, kb_id: int, label: str) -> dict:
+    """The KB as the eval left it: its entries and profiles, counted by status (every status is a key)."""
+    def by_status(rows) -> dict[str, int]:
+        return {status: sum(r["status"] == status for r in rows) for status in KB_STATUSES}
+
+    return {"id": kb_id, "label": label, "entries": by_status(store.kb_entries(conn, kb_id, KB_STATUSES)),
+            "profiles": by_status(store.kb_profiles(conn, kb_id, KB_STATUSES))}
+
+
 def _review_loop(run: sqlite3.Row) -> dict:
     """How a `full_no_kb` Run's review loop went, read from what it stored: the send-backs, why the loop ended,
     whether the stored translation got a verdict, and the status and verdict of each review, in order."""
@@ -238,10 +291,15 @@ def _review_loop(run: sqlite3.Row) -> dict:
             "review_statuses": [r["status"] for r in reviews], "review_verdicts": [r["verdict"] for r in reviews]}
 
 
-def _free_id(out_root: Path, base: str) -> str:
-    """`base`, or `base-2`, `base-3`... so a second eval in the same second cannot clobber the first."""
+def _eval_base(started_at: str, config: str) -> str:
+    return datetime.fromisoformat(started_at).strftime("%Y%m%dT%H%M%SZ") + f"-{config}"
+
+
+def _free_id(out_root: Path, base: str, taken: Callable[[str], object] = lambda _: None) -> str:
+    """`base`, or `base-2`, `base-3`... so a second eval in the same second cannot clobber the first. `taken` says
+    whether something else already has a candidate as its name (a KB's label): it must be falsy for the one chosen."""
     candidate, n = base, 1
-    while (out_root / candidate).exists():
+    while (out_root / candidate).exists() or taken(candidate):
         n += 1
         candidate = f"{base}-{n}"
     return candidate
@@ -272,13 +330,26 @@ def format_summary(result: EvalResult) -> str:
     ]
     if s["config"] != baseline.CONFIG_NAME:
         lines.insert(2, f"fallback to baseline  {s['fallback_pages']} of {s['pages_scored']} scored pages")
-    if s["config"] == orchestrator.CONFIG_NAME:
+    if s["config"] in REVIEWED_CONFIGS:
         stops = ", ".join(f"{stop} {n}" for stop, n in s["final_stops"].items())
         lines.insert(3, f"review loop  {stops}; send-backs {sum(p['send_backs'] for p in s['pages'])}")
         for p in s["pages"]:
             reviews = "/".join(verdict or status for verdict, status in zip(p["review_verdicts"], p["review_statuses"]))
             lines.append(f"REVIEW LOOP  {p['book']}/{p['page_index']} (run {p['run_id']}): {p['final_stop']}, "
                          f"{p['send_backs']} send-back(s), reviews {reviews}")
+    if s["config"] == runs.FULL:
+        kb = s["kb"]
+        statuses = ", ".join(f"{status} {n}" for status, n in s["curator_statuses"].items())
+        outcomes = ", ".join(f"{result} {n}" for result, n in s["proposal_outcomes"].items() if n)
+        size = "; ".join(f"{kind} " + ", ".join(f"{status} {n}" for status, n in counts.items() if n)
+                         for kind, counts in (("entries", kb["entries"]), ("profiles", kb["profiles"]))
+                         if any(counts.values()))
+        lines[4:4] = [f"curator  {statuses}", f"proposals  {outcomes or 'none'}",
+                      f"knowledge base {kb['id']} ({kb['label']})  {size or 'empty'}"]
+        for p in s["pages"]:
+            made = ", ".join(f"{result} {n}" for result, n in p["proposal_outcomes"].items() if n)
+            lines.append(f"CURATOR  {p['book']}/{p['page_index']} (run {p['run_id']}): {p['curator_status']}, "
+                         f"proposals {made or 'none'}")
     for p in s["pages"]:
         if p["fell_back"]:
             lines.append(f"FELL BACK  {p['book']}/{p['page_index']} (run {p['run_id']}): {p['fallback_reason']}")

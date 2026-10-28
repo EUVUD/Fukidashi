@@ -313,7 +313,7 @@ def test_a_client_that_cannot_be_built_leaves_no_run_and_no_output(imported, roo
 
 
 def test_only_known_configs_and_distinct_pages_are_accepted(imported, root, tmp_path):
-    for kwargs in ({"config": "full", "page_indexes": [1]}, {"config": "baseline", "page_indexes": [1, 1]}):
+    for kwargs in ({"config": "nonexistent", "page_indexes": [1]}, {"config": "baseline", "page_indexes": [1, 1]}):
         with pytest.raises(ValueError):
             harness.run_eval(imported, book="book_e", make_client=lambda: None, dataset_root=root,
                              out_root=tmp_path / "out", repo_root=config.ROOT, **kwargs)
@@ -500,7 +500,7 @@ def test_cli_lists_its_options_and_rejects_bad_arguments_before_touching_the_dat
     assert helped.returncode == 0
     assert all(option in helped.stdout for option in ("--config", "--book", "--pages", "baseline"))
 
-    rejected = run_cli(tmp_path, "--config", "full", "--book", "book_e", "--pages", "1")
+    rejected = run_cli(tmp_path, "--config", "nonexistent", "--book", "book_e", "--pages", "1")
     assert rejected.returncode == 2 and "invalid choice" in rejected.stderr
     assert not (tmp_path / "cli.db").exists()  # it stopped before touching the database
 

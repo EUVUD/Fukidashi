@@ -7,23 +7,31 @@ path).
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import orchestrator, store, tracing
+from .agents import curator as curator_agent
 from .agents import reviewer, translator
 from .agents.loop import DEFAULT_MAX_STEPS
 from .agents.translator import TranslatorResult
 from .datasets.openmantra import Page, Segment
+from .kb import curator as curator_rules
+from .kb.entities import KEY_FIELDS
+from .kb.loader import load_snapshot
+from .kb.snapshot import KBSnapshot
 from .llm.client import LLMClient
 from .llm.metering import PageBudget
 from .orchestrator import OrchestratorResult
 from .pipeline import baseline
 from .pipeline.baseline import BaselineResult
 
-CONFIGS = (baseline.CONFIG_NAME, translator.CONFIG_NAME, orchestrator.CONFIG_NAME)
-AGENT_CONFIGS = (translator.CONFIG_NAME, orchestrator.CONFIG_NAME)  # the configs whose Translator has earlier pages
+FULL = orchestrator.KB_CONFIG_NAME  # `full_no_kb` with the Knowledge Base and the Curator (OUTLINE §4.2)
+CONFIGS = (baseline.CONFIG_NAME, translator.CONFIG_NAME, orchestrator.CONFIG_NAME, FULL)
+# the configs whose Translator has earlier pages, each read from the Runs of its own config
+AGENT_CONFIGS = (translator.CONFIG_NAME, orchestrator.CONFIG_NAME, FULL)
 
 
 class TranslateError(Exception):
@@ -96,18 +104,28 @@ def run_params(
     max_tokens: int,
     agent_budget: int = translator.DEFAULT_PAGE_BUDGET,
     review_budget: int = reviewer.DEFAULT_REVIEW_BUDGET,
+    curator_budget: int = curator_agent.DEFAULT_CURATOR_BUDGET,
     max_steps: int = DEFAULT_MAX_STEPS,
 ) -> dict:
     """The parameters a Run records. `page_budget` is the token budget of the `baseline` call: the page's own for
-    `baseline`, the fallback's for `translator` and `full_no_kb`, which also have the agent's budget and its Step
-    limit. `full_no_kb` has the Reviewer's budget too, and the number of times a page can be sent back."""
+    `baseline`, the fallback's for `translator`, `full_no_kb` and `full`, which also have the agent's budget and its
+    Step limit. `full_no_kb` has the Reviewer's budget too, and the number of times a page can be sent back; `full` also
+    has the Curator's budget."""
     if config == translator.CONFIG_NAME:
         return {"agent_budget": agent_budget, "fallback_budget": page_budget, "max_steps": max_steps,
                 "max_tokens": max_tokens}
-    if config == orchestrator.CONFIG_NAME:
-        return {"agent_budget": agent_budget, "review_budget": review_budget, "fallback_budget": page_budget,
+    if config in (orchestrator.CONFIG_NAME, FULL):
+        return {"agent_budget": agent_budget, "review_budget": review_budget,
+                **({"curator_budget": curator_budget} if config == FULL else {}), "fallback_budget": page_budget,
                 "max_steps": max_steps, "max_tokens": max_tokens, "max_send_backs": orchestrator.MAX_SEND_BACKS}
     return {"page_budget": page_budget, "max_tokens": max_tokens}
+
+
+def outcome_counts(outcomes: Sequence[Mapping]) -> dict[str, int]:
+    """How often each result of `curator.RESULTS` occurs among a page's proposal outcomes (a `finalize` record's
+    `outcomes`, or any list of {"result"}): every result is a key, those that did not occur are 0."""
+    counted = Counter(o["result"] for o in outcomes)
+    return {result: counted[result] for result in curator_rules.RESULTS}
 
 
 def previous_pages(
@@ -143,16 +161,33 @@ def translate_page(
     max_tokens: int = baseline.DEFAULT_MAX_TOKENS,
     agent_budget: int = translator.DEFAULT_PAGE_BUDGET,
     review_budget: int = reviewer.DEFAULT_REVIEW_BUDGET,
+    curator_budget: int = curator_agent.DEFAULT_CURATOR_BUDGET,
     max_steps: int = DEFAULT_MAX_STEPS,
+    kb_id: int | None = None,
 ) -> Outcome:
-    """Run `config` (`baseline`, `translator` or `full_no_kb`) on one page and store the Run (and its Translations
-    when it succeeds).
+    """Run `config` (`baseline`, `translator`, `full_no_kb` or `full`) on one page and store the Run (and its
+    Translations when it succeeds).
 
     `agent_budget` and `max_steps` are the Translator's; `page_budget` is `baseline`'s, which is the fallback's
-    budget for the `translator` and `full_no_kb`; `review_budget` is each review's, in `full_no_kb`. A `translator`
-    Run that fell back to `baseline` is still a `translator` Run: its `attempts_json` says so. A `full_no_kb` Run is
-    one Run for the whole page: its `attempts_json` has every stage, and a failure in any stage fails it (see
-    `orchestrator.run_orchestrator`). An unknown `config` is a `ValueError`, raised before anything else happens.
+    budget for the `translator`, `full_no_kb` and `full`; `review_budget` is each review's, in `full_no_kb` and `full`;
+    `curator_budget` is the Curator's, in `full`. A `translator` Run that fell back to `baseline` is still a
+    `translator` Run: its `attempts_json` says so. A `full_no_kb` Run is one Run for the whole page: its
+    `attempts_json` has every stage, and a failure in any stage fails it (see `orchestrator.run_orchestrator`). An
+    unknown `config` is a `ValueError`, raised before anything else happens.
+
+    `full` is `full_no_kb` with the Knowledge Base `kb_id`, which must belong to the page's book (a `ValueError`,
+    before any Run, when it is missing or another book's; a `kb_id` with any other config is one too). The KB is read
+    once, before the page, as a snapshot: the Translator and the Reviewer see the KB as it was when the page started.
+    When the Orchestrator's page succeeded, the Run finalizes (OUTLINE §3.6): the Curator Agent judges the page's term
+    proposals on the Run's client, so its calls and cost are the Run's; then `curator.apply` writes the KB once, in a
+    transaction of its own; then the Run is finished. A Curator that gives no answer does not fail the Run: its terms
+    stay undecided, and `apply` still applies names, confirmations and conflicts by rule. A failure in `apply` fails the
+    Run (`RunCrashed`), with nothing stored and nothing written to the KB. A page whose Orchestrator failed has no
+    proposals, no Curator call and no write. The `attempts_json` is the Orchestrator's plus
+      "finalize": null (the Orchestrator failed) | {"kb_id",
+        "curator": {"status", "error", "asked": [proposal ids], "decisions": [{"id", "accept", "reason"}],
+                    "attempts": <the Curator Agent's record>},
+        "outcomes": [{"proposal_id", "kind", "source", "target", "result"}, ...]}   # in the order of the proposals
 
     `make_client` is a factory so that every Run gets its own client and Meter, and its usage is its own.
     It is called after the page is validated and before the Run row exists, so a client that cannot be
@@ -168,12 +203,13 @@ def translate_page(
     """
     if config not in CONFIGS:
         raise ValueError(f"unknown config {config!r}; expected one of {CONFIGS}")
+    _check_kb(conn, book_title, config, kb_id)
     with tracing.page_span(book=book_title, page_index=page_index, config=config) as span:
         try:
             return _translate_page(
                 conn, book_title, page_index, span, make_client=make_client, dataset_root=dataset_root, config=config,
                 page_budget=page_budget, max_tokens=max_tokens, agent_budget=agent_budget,
-                review_budget=review_budget, max_steps=max_steps,
+                review_budget=review_budget, curator_budget=curator_budget, max_steps=max_steps, kb_id=kb_id,
             )
         except Exception as e:
             try:
@@ -196,7 +232,9 @@ def _translate_page(
     max_tokens: int,
     agent_budget: int,
     review_budget: int,
+    curator_budget: int,
     max_steps: int,
+    kb_id: int | None,
 ) -> Outcome:
     trace_id = None if span is None else span.trace_id
     valid = validate_page(conn, book_title, page_index, dataset_root)
@@ -209,11 +247,12 @@ def _translate_page(
     )
 
     previous = previous_pages(conn, book_title, page_index, config) if config in AGENT_CONFIGS else []
+    kb = load_snapshot(conn, kb_id) if config == FULL else None  # once, before the page: the whole page reads this
     client = make_client()
     run_id = store.start_run(
         conn, page_id=page_row["id"], config=config, model=client.config.model,
         params=run_params(config, page_budget=page_budget, max_tokens=max_tokens, agent_budget=agent_budget,
-                          review_budget=review_budget, max_steps=max_steps),
+                          review_budget=review_budget, curator_budget=curator_budget, max_steps=max_steps),
     )
     if span is not None:
         span.set(run_id=run_id)
@@ -231,11 +270,16 @@ def _translate_page(
                 page, client, previous=previous, agent_budget=agent_budget, fallback_budget=page_budget,
                 max_tokens=max_tokens, max_steps=max_steps,
             )
-        elif config == orchestrator.CONFIG_NAME:
+        elif config in (orchestrator.CONFIG_NAME, FULL):
             result = orchestrator.run_orchestrator(
                 page, client, previous=previous, agent_budget=agent_budget, review_budget=review_budget,
-                fallback_budget=page_budget, max_tokens=max_tokens, max_steps=max_steps,
+                fallback_budget=page_budget, max_tokens=max_tokens, max_steps=max_steps, kb=kb,
             )
+            if kb is not None:
+                result.attempts["finalize"] = None if not result.ok else _finalize(
+                    conn, page, kb, run_id, result, client, curator_budget=curator_budget, max_tokens=max_tokens,
+                    max_steps=max_steps,
+                )
         else:
             result = baseline.run_baseline(
                 page, client, PageBudget(page.page_id, page_budget), max_tokens=max_tokens
@@ -259,12 +303,58 @@ def _translate_page(
     return Outcome(run_id, result, trace_id)
 
 
+def _check_kb(conn: sqlite3.Connection, book_title: str, config: str, kb_id: int | None) -> None:
+    """`full` reads and writes one Knowledge Base, which must be the page's book's; no other config has one."""
+    if config != FULL:
+        if kb_id is not None:
+            raise ValueError(f"config {config!r} has no Knowledge Base; `kb_id` goes with {FULL!r}")
+        return
+    if kb_id is None:
+        raise ValueError(f"config {FULL!r} needs a `kb_id`: the Knowledge Base the page is translated with")
+    kb = store.get_kb(conn, kb_id)
+    if kb is None:
+        raise ValueError(f"no knowledge base has id {kb_id}")
+    if kb["book_title"] != book_title:
+        raise ValueError(f"knowledge base {kb_id} is for the book {kb['book_title']!r}, not {book_title!r}")
+
+
+def _finalize(
+    conn: sqlite3.Connection, page: Page, kb: KBSnapshot, run_id: int, result: OrchestratorResult, client: LLMClient, *,
+    curator_budget: int, max_tokens: int, max_steps: int,
+) -> dict:
+    """The page's finalize, in this order: the Curator Agent's one call on the Run's client, then `curator.apply` in its
+    own transaction (none is open here), which is the only write to the KB. Returns the `finalize` part of the record
+    (see `translate_page`). A Curator that gave no decisions is not an error: `apply` runs without them. An exception
+    from either step propagates, and the caller fails the Run."""
+    curated = curator_agent.run_curator(
+        page, result.translations, result.proposals, client, kb=kb, curator_budget=curator_budget,
+        max_tokens=max_tokens, max_steps=max_steps,
+    )
+    decisions = {d["id"]: curator_rules.Decision(d["accept"], d["reason"]) for d in curated.decisions}
+    outcomes = ([] if not result.proposals else
+                curator_rules.apply(conn, kb.kb_id, page.page_index, run_id, result.proposals, decisions))
+    by_id = {p.proposal_id: p for p in result.proposals}
+    records = []
+    for outcome in outcomes:
+        proposal = by_id[outcome.proposal_id]
+        source, target = (proposal.payload[field] for field in KEY_FIELDS[proposal.kind])
+        records.append({"proposal_id": outcome.proposal_id, "kind": proposal.kind, "source": source, "target": target,
+                        "result": outcome.result})
+    return {
+        "kb_id": kb.kb_id,
+        "curator": {"status": curated.status, "error": curated.error, "asked": list(curated.proposal_ids),
+                    "decisions": curated.decisions, "attempts": curated.attempts},
+        "outcomes": records,
+    }
+
+
 def _describe_run(
     span: tracing.PageSpan | None, client: LLMClient, status: str, error: str | None,
     result: BaselineResult | TranslatorResult | OrchestratorResult | None = None,
 ) -> None:
-    """What the page's root span says about the Run: its status and calls, for a `translator` why it stopped, and for
-    `full_no_kb` how often the page was sent back and why the loop ended."""
+    """What the page's root span says about the Run: its status and calls, for a `translator` why it stopped, for
+    `full_no_kb` how often the page was sent back and why the loop ended, and for `full` also the Curator's status and
+    how often each result happened to a proposal."""
     if span is None:
         return
     span.set(run_status=status, calls=client.meter.summary()["calls"])
@@ -272,5 +362,9 @@ def _describe_run(
         span.set(stop_reason=result.attempts["agent"]["stop_reason"], fallback_reason=result.fallback_reason)
     elif isinstance(result, OrchestratorResult):
         span.set(send_backs=result.send_backs, final_stop=result.final_stop, fallback_reason=result.fallback_reason)
+        if result.attempts.get("finalize") is not None:
+            finalize = result.attempts["finalize"]
+            span.set(curator_status=finalize["curator"]["status"],
+                     **{f"proposals_{r}": n for r, n in outcome_counts(finalize["outcomes"]).items()})
     if error is not None:
         span.fail(error)
