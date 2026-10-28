@@ -421,3 +421,188 @@ def test_the_smoke_script_run_is_one_trace_when_tracing_is_on(monkeypatch, tmp_p
     assert top.name == "translate_page m2_tool_smoke/0"
     calls = [s for s in spans if s.instrumentation_scope.name == "openinference.instrumentation.openai"]
     assert len(calls) == 3  # the agent's two calls and the repair request
+
+
+# --- scripts/m3_review_smoke.py -------------------------------------------------------------------------------
+
+spec = importlib.util.spec_from_file_location("m3_review_smoke", config.ROOT / "scripts" / "m3_review_smoke.py")
+m3 = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m3)
+
+import base64  # noqa: E402
+
+from conftest import mock_llm_client  # noqa: E402
+from test_agent_loop import Provider, answer, ask, call, upstream_500  # noqa: E402
+
+from fukidashi import runs  # noqa: E402
+from fukidashi.agents import reviewer, translator  # noqa: E402
+from fukidashi.datasets.importer import import_openmantra  # noqa: E402
+
+M3_TRANSLATIONS = json.dumps({"translations": [{"id": 0, "zh": "你好"}, {"id": 1, "zh": "再见"}]}, ensure_ascii=False)
+M3_REVISE = json.dumps({"verdict": "revise", "issues": [
+    {"id": 1, "comment": "太生硬", "suggestion": "回头见"}]}, ensure_ascii=False)
+
+
+def m3_setup(monkeypatch, tmp_path, dataset, db_path, *args):
+    monkeypatch.setattr(sys, "argv", ["m3_review_smoke.py", "--book", "book_a", "--page", "1", *args])
+    monkeypatch.setattr(m3, "ROOT", tmp_path)  # the ledger and the output file go here, not into runs/
+    monkeypatch.setattr(m3, "get_page", lambda book, index: get_page(book, index, dataset))
+    monkeypatch.setattr(m3.config, "DB_PATH", db_path)  # the real database is never opened
+
+
+def m3_run(monkeypatch, tmp_path, dataset, db_path, capsys, provider):
+    """The script on a scripted provider. Returns (exit code, output, the saved file, if there is one)."""
+    m3_setup(monkeypatch, tmp_path, dataset, db_path)
+    monkeypatch.setattr(m3, "load_dotenv", lambda path: None)
+    monkeypatch.setattr(m3, "LLMClient", lambda config, meter: LLMClient(
+        config, meter, http_client=httpx.Client(transport=httpx.MockTransport(provider))))
+    for name, value in {"LLM_BASE_URL": "http://provider.test/v1", "LLM_API_KEY": "sk-test", "LLM_MODEL": "mock-model",
+                        "LLM_PRICE_INPUT_PER_M": "1.0", "LLM_PRICE_OUTPUT_PER_M": "2.0"}.items():
+        monkeypatch.setenv(name, value)
+    code = 0
+    try:
+        m3.main()
+    except SystemExit as exited:
+        code = exited.code
+    saved = list((tmp_path / "runs" / "smoke").glob("*.json"))
+    return code, capsys.readouterr().out, (json.loads(saved[0].read_text(encoding="utf-8")) if saved else None)
+
+
+def run_count(db_path):
+    from fukidashi.db import connect
+
+    c = connect(db_path)
+    try:
+        return c.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+    finally:
+        c.close()
+
+
+def test_the_review_smoke_dry_run_prints_both_first_requests_with_the_image_replaced_and_sends_nothing(
+        monkeypatch, tmp_path, dataset, db_path, conn, capsys):
+    import_openmantra(conn, dataset)
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("a dry run must send nothing")
+
+    m3_setup(monkeypatch, tmp_path, dataset, db_path, "--dry-run")
+    monkeypatch.setattr(m3, "LLMClient", refuse)  # no real client,
+    monkeypatch.setattr(m3, "load_dotenv", refuse)  # no .env,
+    monkeypatch.setattr(httpx.Client, "send", refuse)  # and not a single HTTP request
+
+    m3.main()
+
+    out = capsys.readouterr().out
+    shown = json.loads(out[: out.rindex("}") + 1])
+    first, second = shown["translator_first_request"], shown["reviewer_first_request"]
+    assert [m["role"] for m in first["messages"]] == ["system", "user"]
+    assert first["messages"][0]["content"] == translator.FLAG_SYSTEM_PROMPT
+    assert [t["function"]["name"] for t in first["tools"]] == ["get_previous_context", "flag_uncertain"]
+    assert first["json_output"] is True and "budget" not in first
+    assert second["messages"][0]["content"] == reviewer.SYSTEM_PROMPT and second["tools"] is None
+    for request in (first, second):
+        image, text = request["messages"][1]["content"]
+        assert image["image_url"]["url"].endswith("base64 omitted)") and "000.jpg" in image["image_url"]["url"]
+        assert "こんにちは" in text["text"]
+    assert "(placeholder translation of region 0)" in second["messages"][1]["content"][1]["text"]
+    assert "(placeholder flag)" in second["messages"][1]["content"][1]["text"]
+    assert "data:image" not in out and base64.b64encode(b"\xff\xd8fake-jpeg").decode() not in out  # the image is gone
+    assert "REF-ZH" not in out and "REF-EN" not in out
+    assert out.rstrip().endswith("Dry run: nothing was sent.")
+    assert not (tmp_path / "runs").exists() and run_count(db_path) == 0  # no file, no ledger, no Run
+
+
+def test_the_review_smoke_reads_the_earlier_runs_and_does_not_need_a_database(monkeypatch, tmp_path, dataset, db_path, conn):
+    m3_setup(monkeypatch, tmp_path, dataset, db_path)
+    import_openmantra(conn, dataset)
+    assert m3.earlier_pages("book_a", 2) == [translator.PreviousPage(
+        1, (translator.PreviousRegion(0, "こんにちは", None), translator.PreviousRegion(1, "さようなら", None)),
+        translated=False)]  # page 1 is there, with no translator Run yet
+    assert runs.translate_page(
+        conn, "book_a", 1, make_client=lambda: mock_llm_client(Provider(answer(M3_TRANSLATIONS))),
+        dataset_root=dataset, config="translator").result.ok
+    before = run_count(db_path)
+
+    (page,) = m3.earlier_pages("book_a", 2)
+
+    assert (page.page_index, page.translated) == (1, True) and [r.zh for r in page.regions] == ["你好", "再见"]
+    assert run_count(db_path) == before  # read only
+    monkeypatch.setattr(m3.config, "DB_PATH", tmp_path / "no-such.db")
+    assert m3.earlier_pages("book_a", 2) == [] and not (tmp_path / "no-such.db").exists()
+
+
+def test_the_review_smoke_end_to_end_on_a_mock_provider(monkeypatch, tmp_path, dataset, db_path, conn, capsys):
+    import_openmantra(conn, dataset)
+    provider = Provider(
+        ask(call("f1", {"id": 1, "reason": "迷い"}, name="flag_uncertain"), reasoning_content="SENTINEL-REASONING"),
+        answer(M3_TRANSLATIONS),
+        answer(M3_REVISE),
+    )
+
+    code, out, saved = m3_run(monkeypatch, tmp_path, dataset, db_path, capsys, provider)
+
+    assert code == 0 and len(provider.bodies) == 3
+    assert "Translator: stop reason final, 2 steps, 2 calls, 200 input / 40 output tokens, cost $0.0003" in out
+    assert "flagged: 迷い" in out and "flags: 1" in out
+    assert "Reviewer: stop reason final, 1 steps, 1 calls, 100 input / 20 output tokens, cost $0.0001" in out
+    assert "verdict: revise, 1 issue(s)" in out and "[1] 太生硬" in out and "suggestion: 回头见" in out
+    assert "Total: 3 calls, 300 input / 60 output tokens, cost $0.0004" in out
+    assert "Saved runs/smoke/" in out and "-review-book_a-001.json" in out
+    assert saved["translator"]["flags"] == [{"id": 1, "reason": "迷い"}] and saved["translator"]["steps"] == 2
+    assert saved["reviewer"]["verdict"] == "revise" and saved["reviewer"]["issues"][0]["suggestion"] == "回头见"
+    assert (saved["translator"]["calls"], saved["reviewer"]["calls"], saved["meter"]["calls"]) == (2, 1, 3)
+    assert saved["reviewer"]["stop_reason"] == "final" and saved["reviewer"]["latency_s"] >= 0
+    assert [r["flags"] for r in saved["regions"]] == [[], ["迷い"]]
+    assert "sk-test" not in json.dumps(saved) and "REF-ZH" not in json.dumps(saved)
+    assert len((tmp_path / "runs" / "usage.jsonl").read_text(encoding="utf-8").splitlines()) == 3
+    assert "SENTINEL-REASONING" not in json.dumps(provider.bodies[2], ensure_ascii=False)  # the Reviewer's own request
+    assert run_count(db_path) == 0  # no Run
+
+
+def test_the_review_smoke_run_is_one_trace_when_tracing_is_on(monkeypatch, tmp_path, dataset, db_path, conn, capsys):
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from fukidashi import tracing
+
+    import_openmantra(conn, dataset)
+    exporter = InMemorySpanExporter()
+    monkeypatch.setitem(tracing.BACKENDS, "memory", lambda: tracing.Backend(exporter, {}, {"backend": "memory"}))
+    monkeypatch.setenv("FUKIDASHI_TRACING", "memory")
+    try:
+        code, _, _ = m3_run(monkeypatch, tmp_path, dataset, db_path, capsys,
+                            Provider(answer(M3_TRANSLATIONS), answer(M3_REVISE)))
+        tracing.flush()
+        spans = exporter.get_finished_spans()
+    finally:
+        tracing.shutdown()
+
+    assert code == 0
+    assert len({s.context.trace_id for s in spans}) == 1  # the Translator and the Reviewer share one trace
+    (top,) = [s for s in spans if s.parent is None]
+    assert top.name == "translate_page book_a/1"
+    calls = [s for s in spans if s.instrumentation_scope.name == "openinference.instrumentation.openai"]
+    assert len(calls) == 2
+
+
+def test_the_review_smoke_stops_before_the_review_when_the_translator_fails(monkeypatch, tmp_path, dataset, db_path, conn, capsys):
+    import_openmantra(conn, dataset)
+    provider = Provider(upstream_500(), answer(M3_REVISE))
+
+    code, out, saved = m3_run(monkeypatch, tmp_path, dataset, db_path, capsys, provider)
+
+    assert code == 1 and len(provider.bodies) == 1
+    assert "failed: " in out and "API error 500" in out and "Reviewer: not run" in out
+    assert saved["reviewer"] is None and saved["translator"]["ok"] is False and saved["translator"]["stop_reason"] == "provider_error"
+    assert run_count(db_path) == 0
+
+
+def test_the_review_smoke_reports_an_unusable_review_and_exits_1(monkeypatch, tmp_path, dataset, db_path, conn, capsys):
+    import_openmantra(conn, dataset)
+    provider = Provider(answer(M3_TRANSLATIONS), answer("not json"), answer("still not json"), answer(M3_REVISE))
+
+    code, out, saved = m3_run(monkeypatch, tmp_path, dataset, db_path, capsys, provider)
+
+    assert code == 1 and len(provider.bodies) == 3  # the translation, the verdict, its one repair
+    assert "review unusable: unparseable" in out
+    assert saved["reviewer"]["status"] == "unusable" and saved["reviewer"]["verdict"] is None
+    assert saved["reviewer"]["calls"] == 2 and saved["reviewer"]["steps"] == 1
