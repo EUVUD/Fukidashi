@@ -9,6 +9,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from fukidashi import tracing
 from fukidashi.agents.loop import TRACING_VARIABLES
 from fukidashi.api.deps import get_client_factory, get_dataset_root, get_db
 from fukidashi.datasets.importer import import_openmantra
@@ -26,9 +27,14 @@ SEGMENTS = [
 
 @pytest.fixture(autouse=True)
 def no_tracing(monkeypatch):
-    """The agent loop refuses to run with LangSmith tracing on; a shell that has it set must not fail the suite."""
-    for name in TRACING_VARIABLES:
+    """The suite does not depend on what the shell exports. The agent loop refuses to run with LangSmith tracing on,
+    `FUKIDASHI_TRACING` / `PHOENIX_*` would switch our own tracing on, and `LLM_JSON_MODE` changes what the
+    provider is sent."""
+    for name in (*TRACING_VARIABLES, "FUKIDASHI_TRACING", "PHOENIX_COLLECTOR_ENDPOINT", "PHOENIX_PROJECT_NAME",
+                 "LLM_JSON_MODE"):
         monkeypatch.delenv(name, raising=False)
+    yield
+    tracing.shutdown()  # whatever a test switched on is switched off again, even when the test failed
 
 
 @pytest.fixture

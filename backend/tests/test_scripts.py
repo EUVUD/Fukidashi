@@ -246,3 +246,178 @@ def test_the_smoke_script_without_json_output_sends_no_response_format_and_says_
 
     assert all("response_format" not in b for b in bodies) and "JSON output together" not in out
     assert (saved["response_format_sent"], saved["json_output_with_tools"]) == (False, None)
+
+
+# --- scripts/m2_tool_smoke.py --repair-check -------------------------------------------------------------------
+
+def tool_call_reply():
+    return httpx.Response(200, json={
+        "id": "c", "object": "chat.completion", "created": 0, "model": "mock-model-1",
+        "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+            "role": "assistant", "content": None, "reasoning_content": "look it up",
+            "tool_calls": [{"id": "call_1", "type": "function", "function": {
+                "name": "lookup_term", "arguments": '{"term": "カゲミザワ"}'}}]}}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}})
+
+
+def chat_reply(text, finish_reason="stop"):
+    return httpx.Response(200, json={
+        "id": "c", "object": "chat.completion", "created": 0, "model": "mock-model-1",
+        "choices": [{"index": 0, "finish_reason": finish_reason, "message": {"role": "assistant", "content": text}}],
+        "usage": {"prompt_tokens": 150, "completion_tokens": 10, "total_tokens": 160}})
+
+
+JSON_ANSWER = '{"translations": [{"id": 0, "zh": "阴泽前辈，今天也在屋顶上吗？"}]}'
+
+
+def repair_run(monkeypatch, tmp_path, capsys, replies, *args, json_mode=None):
+    """The smoke script with --repair-check on a mock provider that plays `replies`. Returns
+    (exit code or None, output, saved file, request bodies)."""
+    bodies, queue = [], iter(replies)
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return next(queue)
+
+    monkeypatch.setattr(sys, "argv", ["m2_tool_smoke.py", "--repair-check", *args])
+    monkeypatch.setattr(m2, "load_dotenv", lambda path: None)
+    monkeypatch.setattr(m2, "ROOT", tmp_path)
+    monkeypatch.setattr(m2, "LLMClient", lambda config, meter: LLMClient(
+        config, meter, http_client=httpx.Client(transport=httpx.MockTransport(handler))))
+    env = {"LLM_BASE_URL": "http://provider.test/v1", "LLM_API_KEY": "sk-test", "LLM_MODEL": "mock-model",
+           "LLM_PRICE_INPUT_PER_M": "1.0", "LLM_PRICE_OUTPUT_PER_M": "2.0"}
+    if json_mode is not None:
+        env["LLM_JSON_MODE"] = json_mode
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    code = None
+    try:
+        m2.main()
+    except SystemExit as exited:
+        code = exited.code
+    (saved,) = (tmp_path / "runs" / "m2").glob("*.json")
+    return code, capsys.readouterr().out, json.loads(saved.read_text(encoding="utf-8")), bodies
+
+
+def test_the_repair_check_dry_run_prints_both_requests_and_sends_nothing(monkeypatch, capsys):
+    def no_network(*args, **kwargs):
+        raise AssertionError("the dry run sent a request")
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", no_network)
+    monkeypatch.setattr(sys, "argv", ["m2_tool_smoke.py", "--repair-check", "--dry-run"])
+    monkeypatch.setattr(m2, "load_dotenv", None)  # a dry run reads no .env
+
+    m2.main()
+
+    out = capsys.readouterr().out
+    requests = json.loads(out[: out.rindex("}\n}") + 3])
+    first, repair = requests["first_request"], requests["repair_request"]
+    assert [t["function"]["name"] for t in first["tools"]] == ["lookup_term"]
+    assert [m["role"] for m in repair["messages"]] == ["system", "user", "assistant", "tool", "assistant", "user"]
+    assert repair["response_format"] == {"type": "json_object"} and "tools" not in repair
+    assert repair["messages"][2]["tool_calls"] and repair["messages"][3]["tool_call_id"] == "call_dry_run"
+    assert "Your answer could not be used" in repair["messages"][5]["content"]
+    assert ("Repair request roles: system, user, assistant, tool, assistant, user; tools: none; "
+            "response_format: {'type': 'json_object'}") in out
+    assert out.rstrip().endswith("Dry run: nothing was sent.")
+
+
+def test_the_repair_check_dry_run_follows_llm_json_mode(monkeypatch, capsys):
+    monkeypatch.setenv("LLM_JSON_MODE", "none")
+    monkeypatch.setattr(sys, "argv", ["m2_tool_smoke.py", "--repair-check", "--dry-run"])
+
+    m2.main()
+
+    out = capsys.readouterr().out
+    assert "response_format: not sent" in out and "tools: none" in out
+
+
+def test_the_repair_check_reports_a_repair_request_the_provider_accepted(monkeypatch, tmp_path, capsys):
+    replies = [tool_call_reply(), chat_reply("阴泽前辈，今天也在屋顶上吗？"), chat_reply(JSON_ANSWER)]
+
+    code, out, saved, bodies = repair_run(monkeypatch, tmp_path, capsys, replies)
+
+    assert code is None and len(bodies) == 3
+    repair = bodies[2]
+    assert [m["role"] for m in repair["messages"]] == ["system", "user", "assistant", "tool", "assistant", "user"]
+    assert repair["response_format"] == {"type": "json_object"} and "tools" not in repair
+    assert repair["messages"][2]["reasoning_content"] == "look it up"  # the history goes back unchanged
+    assert "Repair request: roles system, user, assistant, tool, assistant, user; no tools; response_format was sent" in out
+    assert "Repair request: accepted by the provider (HTTP 200); the answer parses as JSON: " + JSON_ANSWER in out
+    assert "and it passes parse_translations" in out and "Calls: 3  input tokens: 400" in out
+    check = saved["repair_check"]
+    assert (check["accepted"], check["error"], check["tools_sent"], check["response_format_sent"]) == (
+        True, None, False, True)
+    assert (check["answer_is_json"], check["answer_passes_parse_translations"], check["answer"]) == (
+        True, True, JSON_ANSWER)
+    assert saved["meter"]["calls"] == 3 and "sk-test" not in json.dumps(saved)
+
+
+def test_the_repair_check_reports_the_providers_error_when_it_rejects_the_request(monkeypatch, tmp_path, capsys):
+    rejected = httpx.Response(400, json={"error": {"message": "tool messages need tools"}})
+    replies = [tool_call_reply(), chat_reply("阴泽前辈，今天也在屋顶上吗？"), rejected]
+
+    code, out, saved, bodies = repair_run(monkeypatch, tmp_path, capsys, replies)
+
+    assert code is None and len(bodies) == 3  # a finding, not a failure of the script
+    assert "Repair request: not accepted (HTTP 400): Bad request:" in out and "tool messages need tools" in out
+    check = saved["repair_check"]
+    assert (check["accepted"], check["status_code"]) == (False, 400)
+    assert "tool messages need tools" in check["error"] and check["answer"] is None
+    assert saved["meter"]["calls"] == 3
+
+
+def test_the_repair_check_does_not_call_an_answer_that_is_not_json_accepted(monkeypatch, tmp_path, capsys):
+    replies = [tool_call_reply(), chat_reply("阴泽前辈，今天也在屋顶上吗？"), chat_reply("sorry, plain text")]
+
+    _, out, saved, _ = repair_run(monkeypatch, tmp_path, capsys, replies)
+
+    assert "Repair request: HTTP 200, but the answer is not JSON: 'sorry, plain text'" in out
+    assert (saved["repair_check"]["accepted"], saved["repair_check"]["answer_is_json"]) == (False, False)
+
+
+def test_the_repair_check_says_when_response_format_was_not_sent(monkeypatch, tmp_path, capsys):
+    replies = [tool_call_reply(), chat_reply("阴泽前辈，今天也在屋顶上吗？"), chat_reply(JSON_ANSWER)]
+
+    _, out, saved, bodies = repair_run(monkeypatch, tmp_path, capsys, replies, json_mode="none")
+
+    assert "response_format" not in bodies[2]
+    assert "response_format was NOT sent (LLM_JSON_MODE=none)" in out
+    assert saved["repair_check"]["response_format_sent"] is False
+
+
+def test_the_repair_check_is_not_sent_when_the_agent_never_answered(monkeypatch, tmp_path, capsys):
+    code, out, saved, bodies = repair_run(monkeypatch, tmp_path, capsys, [chat_reply("cut", finish_reason="length")])
+
+    assert code == 1 and len(bodies) == 1
+    assert "Repair request: not sent, because the agent did not finish with an answer" in out
+    assert saved["repair_check"] is None
+
+
+def test_without_the_flag_the_smoke_script_saves_no_repair_check(monkeypatch, tmp_path, capsys):
+    _, saved, bodies = smoke_run(monkeypatch, tmp_path, capsys)
+
+    assert saved["repair_check"] is None and len(bodies) == 2
+
+
+def test_the_smoke_script_run_is_one_trace_when_tracing_is_on(monkeypatch, tmp_path, capsys):
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from fukidashi import tracing
+
+    exporter = InMemorySpanExporter()
+    monkeypatch.setitem(tracing.BACKENDS, "memory", lambda: tracing.Backend(exporter, {}, {"backend": "memory"}))
+    monkeypatch.setenv("FUKIDASHI_TRACING", "memory")
+    try:
+        repair_run(monkeypatch, tmp_path, capsys,
+                   [tool_call_reply(), chat_reply("阴泽前辈，今天也在屋顶上吗？"), chat_reply(JSON_ANSWER)])
+        tracing.flush()
+        spans = exporter.get_finished_spans()
+    finally:
+        tracing.shutdown()
+
+    assert len({s.context.trace_id for s in spans}) == 1
+    (top,) = [s for s in spans if s.parent is None]
+    assert top.name == "translate_page m2_tool_smoke/0"
+    calls = [s for s in spans if s.instrumentation_scope.name == "openinference.instrumentation.openai"]
+    assert len(calls) == 3  # the agent's two calls and the repair request

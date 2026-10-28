@@ -13,9 +13,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .. import runs, store
+from .. import runs, store, tracing
 from ..agents import translator
-from ..agents.loop import DEFAULT_MAX_STEPS
+from ..agents.loop import DEFAULT_MAX_STEPS, refuse_tracing
 from ..llm.client import LLMClient, LLMNotConfigured
 from ..pipeline import baseline
 from . import manifest as manifest_facts
@@ -63,16 +63,19 @@ def run_eval(
 ) -> EvalResult:
     """Translate the pages one after another, score the succeeded ones, and write the outputs.
 
-    Raises `EvalAborted` before any model call when a page does not exist or its image is missing. A page
-    without text regions is skipped. A failed or crashed Run is listed under `failed_pages` and left out of
-    the scores; its cost is reported apart, under `cost.failed_runs`. A `translator` Run that fell back to
-    `baseline` is scored like any other, and flagged: per page (`fell_back`, `fallback_reason`) and as a count
-    over the scored pages (`fallback_pages`).
+    Raises `EvalAborted` before any model call when a page does not exist or its image is missing, and
+    `TracingEnabled` before the first Run when a LangSmith tracing variable is on (prompts would leave the machine,
+    and every `translator` page would fail). A page without text regions is skipped. A failed or crashed Run is
+    listed under `failed_pages` and left out of the scores; its cost is reported apart, under `cost.failed_runs`.
+    A `translator` Run that fell back to `baseline` is scored like any other, and flagged: per page (`fell_back`,
+    `fallback_reason`) and as a count over the scored pages (`fallback_pages`). Each page row carries the
+    `trace_id` of its trace (null when tracing is off), and the manifest says where the traces went.
     """
     if config not in CONFIGS:
         raise ValueError(f"unknown config {config!r}; expected one of {CONFIGS}")
     if len(set(page_indexes)) != len(page_indexes):
         raise ValueError(f"duplicate pages in {page_indexes}")
+    refuse_tracing()
     started_at = _now()
     params = {"page_budget": baseline.DEFAULT_PAGE_BUDGET, "max_tokens": baseline.DEFAULT_MAX_TOKENS}
     if config == translator.CONFIG_NAME:
@@ -104,6 +107,7 @@ def run_eval(
         log(f"translating {book}/{page_index} ...")
         start = time.monotonic()
         outcome = None
+        trace_id = None
         try:
             outcome = runs.translate_page(
                 conn, book, page_index, make_client=make_client, dataset_root=dataset_root, config=config, **params
@@ -111,11 +115,11 @@ def run_eval(
         except LLMNotConfigured:
             raise  # raised before any Run exists, and it would be the same for every page
         except runs.RunCrashed as e:  # the Run exists: failed, or still running if the database failed too
-            run_id, error = e.run_id, e.error
+            run_id, error, trace_id = e.run_id, e.error, e.trace_id
         except Exception as e:  # no Run row exists yet (make_client or start_run raised); keep the other pages
             run_id, error = None, f"{type(e).__name__}: {e}"
         else:
-            run_id, error = outcome.run_id, outcome.result.error
+            run_id, error, trace_id = outcome.run_id, outcome.result.error, outcome.trace_id
         latency = time.monotonic() - start
         run = None if run_id is None else store.get_run(conn, run_id)
         if run is not None:
@@ -124,10 +128,10 @@ def run_eval(
         ok = outcome is not None and outcome.result.ok
         fallback_reason = _fallback_reason(run)
         page_entries[page_index] = {"book": book, "page_index": page_index,
-                                    "status": "scored" if ok else "failed", "run_id": run_id}
+                                    "status": "scored" if ok else "failed", "run_id": run_id, "trace_id": trace_id}
         if not ok:
-            failed.append({"book": book, "page_index": page_index, "run_id": run_id, "error": error,
-                           "fell_back": fallback_reason is not None, "fallback_reason": fallback_reason,
+            failed.append({"book": book, "page_index": page_index, "run_id": run_id, "trace_id": trace_id,
+                           "error": error, "fell_back": fallback_reason is not None, "fallback_reason": fallback_reason,
                            "latency_s": round(latency, 3), "cost_usd": cost})
             if run is not None:
                 failed_runs.append(run)
@@ -141,14 +145,14 @@ def run_eval(
                 "ref_zh_hans": to_zh_hans(r["text_zh_hant"]), "ref_zh_hant": r["text_zh_hant"],
             })
         scored_runs.append(run)
-        scored.append({"book": book, "page_index": page_index, "run_id": outcome.run_id, "segments": len(rows),
-                       "calls": run["calls"], "unknown_usage_calls": run["unknown_usage_calls"],
+        scored.append({"book": book, "page_index": page_index, "run_id": outcome.run_id, "trace_id": trace_id,
+                       "segments": len(rows), "calls": run["calls"], "unknown_usage_calls": run["unknown_usage_calls"],
                        "fell_back": fallback_reason is not None, "fallback_reason": fallback_reason,
                        "cost_usd": cost, "latency_s": round(latency, 3)})
         log(f"  run {outcome.run_id}: {len(rows)} segments, {latency:.1f}s")
     for entry in skipped:
         page_entries[entry["page_index"]] = {"book": book, "page_index": entry["page_index"],
-                                             "status": "skipped", "run_id": None}
+                                             "status": "skipped", "run_id": None, "trace_id": None}
 
     corpus = score_corpus([s["hyp"] for s in segment_lines], [s["ref_zh_hans"] for s in segment_lines])
     scores = {
@@ -186,6 +190,7 @@ def run_eval(
         "git_dirty": git["dirty"],
         "sacrebleu_signatures": {"chrf": corpus.chrf_signature, "bleu": corpus.bleu_signature},
         "opencc_config": OPENCC_CONFIG,
+        "tracing": tracing.describe(),  # whether the traces in `pages` exist, and where they went
     }
 
     out_dir = out_root / eval_id

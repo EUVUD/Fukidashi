@@ -90,7 +90,7 @@ def run_agent(
 
     Raises `TracingEnabled`, before any request, when LangSmith tracing is switched on in the environment.
     """
-    _refuse_tracing()
+    refuse_tracing()
     if max_steps < 1:
         raise ValueError("max_steps must be at least 1")
     lc_tools = [_langchain_tool(t) for t in tools]
@@ -137,7 +137,9 @@ def run_agent(
     return AgentResult(text=text, stop_reason=stop_reason, error=error, steps=steps, messages=history)
 
 
-def _refuse_tracing() -> None:
+def refuse_tracing() -> None:
+    """Raise `TracingEnabled` when a LangSmith tracing variable is on. `run_agent` starts with this; so does the eval
+    harness, so that a whole eval stops before its first Run instead of failing once per page."""
     on = [name for name in TRACING_VARIABLES if os.environ.get(name, "").strip().lower() not in _OFF_VALUES]
     if on:
         raise TracingEnabled(

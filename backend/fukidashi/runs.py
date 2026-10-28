@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import store
+from . import store, tracing
 from .agents import translator
 from .agents.loop import DEFAULT_MAX_STEPS
 from .agents.translator import TranslatorResult
@@ -45,19 +45,22 @@ class RunCrashed(RuntimeError):
 
     Not a `TranslateError`: those mean no Run was recorded. The message is the error stored on the Run, and
     the original exception is the `__cause__`. When the write that marks the Run failed raised too, the Run
-    stays `running`, nothing was stored, and the message says so.
+    stays `running`, nothing was stored, and the message says so. `trace_id` is the page's trace, None when
+    tracing is off.
     """
 
-    def __init__(self, run_id: int, error: str):
+    def __init__(self, run_id: int, error: str, trace_id: str | None = None):
         super().__init__(error)
         self.run_id = run_id
         self.error = error
+        self.trace_id = trace_id
 
 
 @dataclass(frozen=True)
 class Outcome:
     run_id: int
     result: BaselineResult | TranslatorResult  # ok, error and attempts of the config's run
+    trace_id: str | None = None  # the page's trace; None when tracing is off
 
 
 @dataclass(frozen=True)
@@ -147,9 +150,34 @@ def translate_page(
     marks that Run failed and is raised as `RunCrashed`. The one case that leaves a Run `running` is a
     database that fails the write marking it failed too: `RunCrashed` is still raised, with the `run_id`
     and a message that says the Run was not marked.
+
+    With tracing on, the whole call is one trace (`tracing.page_span`); `Outcome.trace_id` and `RunCrashed.trace_id`
+    name it.
     """
     if config not in CONFIGS:
         raise ValueError(f"unknown config {config!r}; expected one of {CONFIGS}")
+    with tracing.page_span(book=book_title, page_index=page_index, config=config) as span:
+        return _translate_page(
+            conn, book_title, page_index, span, make_client=make_client, dataset_root=dataset_root, config=config,
+            page_budget=page_budget, max_tokens=max_tokens, agent_budget=agent_budget, max_steps=max_steps,
+        )
+
+
+def _translate_page(
+    conn: sqlite3.Connection,
+    book_title: str,
+    page_index: int,
+    span: tracing.PageSpan | None,
+    *,
+    make_client: Callable[[], LLMClient],
+    dataset_root: Path,
+    config: str,
+    page_budget: int,
+    max_tokens: int,
+    agent_budget: int,
+    max_steps: int,
+) -> Outcome:
+    trace_id = None if span is None else span.trace_id
     valid = validate_page(conn, book_title, page_index, dataset_root)
     page_row = valid.row
     segment_ids = {s["idx"]: s["id"] for s in valid.segment_rows}
@@ -166,6 +194,8 @@ def translate_page(
         params=run_params(config, page_budget=page_budget, max_tokens=max_tokens, agent_budget=agent_budget,
                           max_steps=max_steps),
     )
+    if span is not None:
+        span.set(run_id=run_id)
 
     def finish(translations: dict[int, str] | None, error: str | None, attempts: list[dict] | dict) -> None:
         store.finish_run(
@@ -192,8 +222,26 @@ def translate_page(
         try:
             finish(None, error, [])
         except Exception as recovery:  # the database is failing: the Run stays 'running', the caller still gets its id
+            _describe_run(span, client, "running", error)
             raise RunCrashed(
-                run_id, f"{error} (marking the Run failed also failed: {type(recovery).__name__}: {recovery})"
+                run_id, f"{error} (marking the Run failed also failed: {type(recovery).__name__}: {recovery})",
+                trace_id,
             ) from e
-        raise RunCrashed(run_id, error) from e
-    return Outcome(run_id, result)
+        _describe_run(span, client, "failed", error)
+        raise RunCrashed(run_id, error, trace_id) from e
+    _describe_run(span, client, "succeeded" if result.ok else "failed", result.error, result)
+    return Outcome(run_id, result, trace_id)
+
+
+def _describe_run(
+    span: tracing.PageSpan | None, client: LLMClient, status: str, error: str | None,
+    result: BaselineResult | TranslatorResult | None = None,
+) -> None:
+    """What the page's root span says about the Run: its status and calls, and for a `translator` why it stopped."""
+    if span is None:
+        return
+    span.set(run_status=status, calls=client.meter.summary()["calls"])
+    if isinstance(result, TranslatorResult):
+        span.set(stop_reason=result.attempts["agent"]["stop_reason"], fallback_reason=result.fallback_reason)
+    if error is not None:
+        span.fail(error)

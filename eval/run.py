@@ -8,6 +8,9 @@ This makes real model calls: one per page for baseline, several for translator (
 and the fallback to baseline when it comes to that). Outputs go to runs/eval/<id>/: manifest.json, segments.jsonl,
 scores.json. The logic lives in fukidashi.evaluation; the exit code is 0 when every page was scored or
 skipped, 1 when a page failed, 2 when the harness could not start.
+
+With FUKIDASHI_TRACING=phoenix (shell or .env) and a Phoenix running on this machine, every page leaves one trace there;
+its ID is in the outputs.
 """
 
 from __future__ import annotations
@@ -15,7 +18,10 @@ from __future__ import annotations
 import argparse
 import sys
 
-from fukidashi import config
+from dotenv import load_dotenv
+
+from fukidashi import config, tracing
+from fukidashi.agents.loop import TracingEnabled
 from fukidashi.api.deps import get_client_factory
 from fukidashi.db import connect, init_db
 from fukidashi.evaluation.harness import CONFIGS, EvalAborted, format_summary, run_eval
@@ -39,6 +45,15 @@ def main() -> int:
     ap.add_argument("--pages", required=True, type=parse_pages, help="page_index values, e.g. 2,3,4")
     args = ap.parse_args()
 
+    load_dotenv(config.ROOT / ".env")
+    try:
+        tracing.setup()
+    except tracing.TracingError as e:
+        print(f"Stopped before any model call: {e}", file=sys.stderr)
+        return 2
+    if (traced := tracing.describe())["enabled"]:
+        print("Tracing on: " + ", ".join(f"{k} {v}" for k, v in traced.items() if k != "enabled"), flush=True)
+
     conn = connect(config.DB_PATH)
     init_db(conn)
     try:
@@ -52,11 +67,12 @@ def main() -> int:
         print("Stopped before any model call:", *e.problems, sep="\n  ", file=sys.stderr)
         print("(If pages are missing, import the dataset: uv run python scripts/import_openmantra.py)", file=sys.stderr)
         return 2
-    except LLMNotConfigured as e:
+    except (LLMNotConfigured, TracingEnabled) as e:
         print(f"Stopped before any model call: {e}", file=sys.stderr)
         return 2
     finally:
         conn.close()
+        tracing.shutdown()  # sends the last spans; with no Phoenix listening this waits for the exporter's timeout
 
     print(format_summary(result))
     return result.exit_code
