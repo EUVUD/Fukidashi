@@ -1,6 +1,6 @@
 # Fukidashi — Project Outline
 
-> v0.14 · 2026-10-28
+> v0.15 · 2026-10-28
 > **v0.2 (2026-10-22):** evaluation changed from a research-style controlled experiment to a standard evaluation framework plus a baseline comparison (plan B); see §4.
 > **v0.3 (2026-10-22):** M0 decisions recorded in §8: name Fukidashi, ja → zh-Hans, an OpenAI-compatible provider, a $100 budget cap.
 > **v0.4 (2026-10-24):** M1 added the term Run (§0).
@@ -14,6 +14,7 @@
 > **v0.12 (2026-10-27):** after M2's tool-calling loop: §0 adds Agent loop, Step and Stop reason; §3.4 records the guardrails as built and the smoke findings; §9 records that `deepseek-flash` can call tools.
 > **v0.13 (2026-10-27):** after the Translator Agent: §0 adds `translator`, Repair and Fallback; §3.2, §3.4 and §4.2 record the Translator Agent as built (`flag_uncertain` moves to M3); §8 decides the tracing tool (Arize Phoenix, local).
 > **v0.14 (2026-10-28):** M2 done (§7, `docs/m2.md`); §3.5 records tracing as built.
+> **v0.15 (2026-10-28):** §3.5: spans reach the local endpoint without any proxy, and a page that fails before its Run exists keeps its trace ID.
 > Convention: code, docs, commit messages and reports use the canonical terms in §0.
 
 ---
@@ -201,7 +202,7 @@ Fukidashi is a product, so it is evaluated with general, objective metrics rathe
 ### 3.5 Metering & Tracing
 
 - **Metering is ours:** every LLM call records the model ID, input / output / cached tokens and cost. When the provider returns no usage, including a request that failed or timed out, the call is recorded as **unknown** and counted separately, never as 0. Cost per page comes from this data.
-- **Tracing uses an off-the-shelf tool:** Arize Phoenix, run locally (§8), replacing custom trace JSONL. LangSmith is never used: `run_agent` refuses to start while its tracing variables are on. **Built in M2** (`tracing/`): off unless `FUKIDASHI_TRACING=phoenix`; each `translate_page` is one trace whose root span carries book, page, config, Run id, status and, for `translator`, the stop reason and fallback reason; OpenInference adds a span per provider call and the agent's node and tool spans; an exporter wrapper removes page images and the API key; eval rows and the manifest record the trace ID. One trace per page; agent steps, tool calls and review rounds are spans. Eval results store the trace ID, so a score links straight to its trace.
+- **Tracing uses an off-the-shelf tool:** Arize Phoenix, run locally (§8), replacing custom trace JSONL. LangSmith is never used: `run_agent` refuses to start while its tracing variables are on. **Built in M2** (`tracing/`): off unless `FUKIDASHI_TRACING=phoenix`; each `translate_page` is one trace whose root span carries book, page, config, Run id, status and, for `translator`, the stop reason and fallback reason; OpenInference adds a span per provider call and the agent's node and tool spans; an exporter wrapper removes page images and the API key, and spans go straight to the local endpoint, never through a proxy; eval rows and the manifest record the trace ID, also for a page that fails before its Run exists. One trace per page; agent steps, tool calls and review rounds are spans. Eval results store the trace ID, so a score links straight to its trace.
 - **Choosing:** Phoenix runs locally as one Python process, which is light on an 8 GB Mac. Self-hosting Langfuse needs more components, and Langfuse Cloud sends traces to a third party.
 - The editor's live agent trace (SSE) is a **product feature** and separate from the tracing tool: the first is for users, the second for development and evaluation.
 

@@ -63,7 +63,7 @@ PHOENIX_HOST=127.0.0.1 PHOENIX_TELEMETRY_ENABLED=false uvx --from arize-phoenix 
 FUKIDASHI_TRACING=phoenix uv run python eval/run.py --config translator --book tojime_no_siora --pages 3
 ```
 
-Tracing is off by default and never fails a translation. Page images and the API key are removed from every span, and the endpoint must be on this machine. If your shell uses an HTTP proxy, also set `NO_PROXY=localhost,127.0.0.1`. The eval outputs record each page's trace ID.
+Tracing is off by default and never fails a translation. Page images and the API key are removed from every span, and the endpoint must be on this machine. Spans go straight to it, even when your shell uses an HTTP proxy. The eval outputs record each page's trace ID.
 
 ```bash
 uv run pytest                                       # no network, no real LLM calls
