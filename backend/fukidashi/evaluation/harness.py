@@ -24,6 +24,7 @@ from ..agents import curator as curator_agent
 from ..agents import reviewer, translator
 from ..agents.loop import DEFAULT_MAX_STEPS, refuse_tracing
 from ..kb import curator as curator_rules
+from ..kb.entities import CHARACTER, KINDS, TERM
 from ..llm.client import LLMClient, LLMNotConfigured
 from ..pipeline import baseline
 from . import manifest as manifest_facts
@@ -34,6 +35,14 @@ CONFIGS = runs.CONFIGS
 REVIEWED_CONFIGS = (orchestrator.CONFIG_NAME, runs.FULL)  # the configs that run the Orchestrator's review loop
 KB_STATUSES = ("proposed", "approved", "rejected", "pending_human")  # the states an entry or a profile can be in
 CURATOR_STATUSES = curator_agent.STATUSES
+SNIPPET_STATUSES = ("approved", "pending")  # the two readable states, as a Run's `kb_snippets` names them
+# The KB lookups, and what a found one returns as the item's kind and key (agents/kb_tools.py); a test pins the names.
+LOOKUP_TOOLS = {"lookup_term": (TERM, "source_term"), "lookup_character": (CHARACTER, "name_src")}
+# The agent each kind of Orchestrator stage is: the Translator makes the first pass and every revision, the Reviewer the
+# reviews.
+STAGE_AGENTS = {orchestrator.TRANSLATE: "translator", orchestrator.REVISE: "translator",
+                orchestrator.REVIEW: "reviewer"}
+LOOKUP_AGENTS = tuple(dict.fromkeys(STAGE_AGENTS.values()))
 
 
 class EvalAborted(Exception):
@@ -93,6 +102,11 @@ def run_eval(
     Curator left `undecided` stay so: an eval KB is used once. The first client is built before the KB is made, so an
     `LLMNotConfigured` stop leaves no KB (and no output directory) behind.
 
+    A scored `full` page also says how far the KB reached it (`kb_reach`, read from the stored Run; see `_kb_reach`):
+    the snippets its agents were shown (null for a Run stored before the Run recorded them), the lookups the agents
+    made and whether each found something, and the items that reached the page through either. `scores.json` totals
+    them (`kb_reach`; see `_kb_reach_totals`).
+
     The outputs are written page by page, in the order of `page_indexes`. Once every page has been checked and the first
     client built, the harness makes the output directory and writes the three files for zero pages done: `manifest.json`
     with every page `pending` and `finished_at` null, a `scores.json` that scored nothing, and an empty `segments.jsonl`.
@@ -148,137 +162,147 @@ def run_eval(
         kb_id, kb_label = store.create_kb(conn, book_title=book, purpose="eval", label=eval_id), eval_id
     out_dir = out_root / eval_id
     out_dir.mkdir(parents=True)
-    git = manifest_facts.git_state(repo_root)  # as the eval starts: the code that runs is the code of this moment
-    annotation_sha256 = manifest_facts.file_sha256(dataset_root / "annotation.json")
-    traced = tracing.describe()  # whether the traces in `pages` exist, and where they went
+    try:
+        git = manifest_facts.git_state(repo_root)  # as the eval starts: the code that runs is the code of this moment
+        annotation_sha256 = manifest_facts.file_sha256(dataset_root / "annotation.json")
+        traced = tracing.describe()  # whether the traces in `pages` exist, and where they went
 
-    page_entries: dict[int, dict] = {  # page_index -> manifest entry; `pending` until the page is done
-        i: {"book": book, "page_index": i, "status": "pending", "run_id": None, "trace_id": None} for i in page_indexes}
-    scored: list[dict] = []  # per-page score rows, in page order
-    failed: list[dict] = []
-    skipped: list[dict] = []
-    segment_lines: list[dict] = []
-    run_rows: list[sqlite3.Row] = []  # every Run that was started and recorded, failed ones included
-    scored_runs: list[sqlite3.Row] = []
-    failed_runs: list[sqlite3.Row] = []  # failed or crashed; they cost money even though they are not scored
+        page_entries: dict[int, dict] = {  # page_index -> manifest entry; `pending` until the page is done
+            i: {"book": book, "page_index": i, "status": "pending", "run_id": None, "trace_id": None}
+            for i in page_indexes}
+        scored: list[dict] = []  # per-page score rows, in page order
+        failed: list[dict] = []
+        skipped: list[dict] = []
+        segment_lines: list[dict] = []
+        run_rows: list[sqlite3.Row] = []  # every Run that was started and recorded, failed ones included
+        scored_runs: list[sqlite3.Row] = []
+        failed_runs: list[sqlite3.Row] = []  # failed or crashed; they cost money even though they are not scored
 
-    def write_outputs(finished_at: str | None = None) -> tuple[dict, dict]:
-        """Replace `scores.json` and then `manifest.json` with what covers the pages done so far."""
-        corpus = score_corpus([s["hyp"] for s in segment_lines], [s["ref_zh_hans"] for s in segment_lines])
-        scores = {
-            "config": config,
-            "book": book,
-            "pages_scored": len(scored),
-            "segments_scored": len(segment_lines),
-            "fallback_pages": sum(p["fell_back"] for p in scored),  # scored pages whose Run fell back to baseline
-            **({"final_stops": {stop: sum(p["final_stop"] == stop for p in scored)
-                                for stop in orchestrator.FINAL_STOPS}}
-               if config in REVIEWED_CONFIGS else {}),  # scored pages by why their review loop ended
-            **({"curator_statuses": {status: sum(p["curator_status"] == status for p in scored)
-                                     for status in CURATOR_STATUSES},
-                "proposal_outcomes": {result: sum(p["proposal_outcomes"][result] for p in scored)
-                                      for result in curator_rules.RESULTS},
-                "kb": _kb_size(conn, kb_id, kb_label)}
-               if config == runs.FULL else {}),  # the Curator's statuses, the results for the proposals, the KB's size
-            "chrf": {"score": corpus.chrf, "signature": corpus.chrf_signature},
-            "bleu": {"score": corpus.bleu, "signature": corpus.bleu_signature},
-            "cost": cost_summary([(r["cost_usd"], r["unknown_usage_calls"]) for r in scored_runs])
-            | {"failed_runs": cost_summary([(r["cost_usd"], r["unknown_usage_calls"]) for r in failed_runs])},
-            "latency": latency_summary([s["latency_s"] for s in scored]),
-            "pages": scored,
-            "failed_pages": failed,
-            "skipped_pages": skipped,
-        }
-        manifest = {
-            "eval_id": eval_id,
-            "started_at": started_at,
-            "finished_at": finished_at,  # null until the last page is done
-            "config_name": config,
-            "config_params": runs.run_params(config, **params),  # as the Runs record them
-            "book": book,
-            "pages": [page_entries[i] for i in page_indexes],
-            "annotation_sha256": annotation_sha256,
-            "requested_models": sorted({r["model"] for r in run_rows}),
-            "response_models": sorted({m for r in run_rows if r["response_model"]
-                                       for m in r["response_model"].split(", ")}),
-            "git_commit": git["commit"],
-            "git_dirty": git["dirty"],
-            "sacrebleu_signatures": {"chrf": corpus.chrf_signature, "bleu": corpus.bleu_signature},
-            "opencc_config": OPENCC_CONFIG,
-            "tracing": traced,
-            **({"kb": {"id": kb_id, "label": kb_label}} if config == runs.FULL else {}),  # this eval run's own KB
-        }
-        _write_json(out_dir / "scores.json", scores)
-        _write_json(out_dir / "manifest.json", manifest)
-        return manifest, scores
+        def write_outputs(finished_at: str | None = None) -> tuple[dict, dict]:
+            """Replace `scores.json` and then `manifest.json` with what covers the pages done so far."""
+            corpus = score_corpus([s["hyp"] for s in segment_lines], [s["ref_zh_hans"] for s in segment_lines])
+            scores = {
+                "config": config,
+                "book": book,
+                "pages_scored": len(scored),
+                "segments_scored": len(segment_lines),
+                "fallback_pages": sum(p["fell_back"] for p in scored),  # scored pages whose Run fell back to baseline
+                **({"final_stops": {stop: sum(p["final_stop"] == stop for p in scored)
+                                    for stop in orchestrator.FINAL_STOPS}}
+                   if config in REVIEWED_CONFIGS else {}),  # scored pages by why their review loop ended
+                **({"curator_statuses": {status: sum(p["curator_status"] == status for p in scored)
+                                         for status in CURATOR_STATUSES},
+                    "proposal_outcomes": {result: sum(p["proposal_outcomes"][result] for p in scored)
+                                          for result in curator_rules.RESULTS},
+                    "kb": _kb_size(conn, kb_id, kb_label), "kb_reach": _kb_reach_totals(scored)}
+                   if config == runs.FULL else {}),  # the Curator's statuses, the results for the proposals, the KB's
+                   # size, and how far the KB reached the pages
+                "chrf": {"score": corpus.chrf, "signature": corpus.chrf_signature},
+                "bleu": {"score": corpus.bleu, "signature": corpus.bleu_signature},
+                "cost": cost_summary([(r["cost_usd"], r["unknown_usage_calls"]) for r in scored_runs])
+                | {"failed_runs": cost_summary([(r["cost_usd"], r["unknown_usage_calls"]) for r in failed_runs])},
+                "latency": latency_summary([s["latency_s"] for s in scored]),
+                "pages": scored,
+                "failed_pages": failed,
+                "skipped_pages": skipped,
+            }
+            manifest = {
+                "eval_id": eval_id,
+                "started_at": started_at,
+                "finished_at": finished_at,  # null until the last page is done
+                "config_name": config,
+                "config_params": runs.run_params(config, **params),  # as the Runs record them
+                "book": book,
+                "pages": [page_entries[i] for i in page_indexes],
+                "annotation_sha256": annotation_sha256,
+                "requested_models": sorted({r["model"] for r in run_rows}),
+                "response_models": sorted({m for r in run_rows if r["response_model"]
+                                           for m in r["response_model"].split(", ")}),
+                "git_commit": git["commit"],
+                "git_dirty": git["dirty"],
+                "sacrebleu_signatures": {"chrf": corpus.chrf_signature, "bleu": corpus.bleu_signature},
+                "opencc_config": OPENCC_CONFIG,
+                "tracing": traced,
+                **({"kb": {"id": kb_id, "label": kb_label}} if config == runs.FULL else {}),  # this eval run's own KB
+            }
+            _write_json(out_dir / "scores.json", scores)
+            _write_json(out_dir / "manifest.json", manifest)
+            return manifest, scores
 
-    (out_dir / "segments.jsonl").touch()
-    write_outputs()
-    translated = 0
-    for page_index in page_indexes:
-        if page_index in skip_reasons:
-            entry = {"book": book, "page_index": page_index, "reason": skip_reasons[page_index]}
-            skipped.append(entry)
-            page_entries[page_index] = {"book": book, "page_index": page_index, "status": "skipped", "run_id": None,
-                                        "trace_id": None}
-            write_outputs()
-            continue
-        translated += 1
-        log(f"translating {book}/{page_index} ({translated} of {len(to_translate)}) ...")
-        start = time.monotonic()
-        outcome = None
-        trace_id = None
-        make_page_client, client_for_page = client_for_page, make_client  # only the first page gets the early client
-        try:
-            outcome = runs.translate_page(
-                conn, book, page_index, make_client=make_page_client, dataset_root=dataset_root, config=config,
-                **({"kb_id": kb_id} if config == runs.FULL else {}), **params,
-            )
-        except LLMNotConfigured:
-            raise  # raised before any Run exists, and it would be the same for every page
-        except runs.RunCrashed as e:  # the Run exists: failed, or still running if the database failed too
-            run_id, error, trace_id = e.run_id, e.error, e.trace_id
-        except Exception as e:  # no Run row exists yet (make_client or start_run raised); keep the other pages
-            run_id, error, trace_id = None, f"{type(e).__name__}: {e}", getattr(e, "trace_id", None)
-        else:
-            run_id, error, trace_id = outcome.run_id, outcome.result.error, outcome.trace_id
-        latency = time.monotonic() - start
-        run = None if run_id is None else store.get_run(conn, run_id)
-        if run is not None:
-            run_rows.append(run)
-        cost = None if run is None else run_cost(run["cost_usd"], run["unknown_usage_calls"])
-        ok = outcome is not None and outcome.result.ok
-        fallback_reason = _fallback_reason(run)
-        page_entries[page_index] = {"book": book, "page_index": page_index,
-                                    "status": "scored" if ok else "failed", "run_id": run_id, "trace_id": trace_id}
-        if not ok:
-            failed.append({"book": book, "page_index": page_index, "run_id": run_id, "trace_id": trace_id,
-                           "error": error, "fell_back": fallback_reason is not None, "fallback_reason": fallback_reason,
-                           "latency_s": round(latency, 3), "cost_usd": cost})
-            if run is not None:
-                failed_runs.append(run)
-        else:
-            page_row = store.find_page(conn, book, page_index)
-            rows = store.segments_with_translations(conn, page_row["id"], outcome.run_id)
-            page_lines = [{
-                "book": book, "page_index": page_index, "idx": r["idx"], "run_id": outcome.run_id,
-                "ja": r["text_ja"], "hyp": r["text_zh_hans"],
-                "ref_zh_hans": to_zh_hans(r["text_zh_hant"]), "ref_zh_hant": r["text_zh_hant"],
-            } for r in rows]
-            segment_lines += page_lines
-            _append_lines(out_dir / "segments.jsonl", page_lines)
-            scored_runs.append(run)
-            scored.append({"book": book, "page_index": page_index, "run_id": outcome.run_id, "trace_id": trace_id,
-                           "segments": len(rows), "calls": run["calls"],
-                           "unknown_usage_calls": run["unknown_usage_calls"],
-                           "fell_back": fallback_reason is not None, "fallback_reason": fallback_reason,
-                           **(_review_loop(run) if config in REVIEWED_CONFIGS else {}),
-                           **(_curation(run) if config == runs.FULL else {}),
-                           "cost_usd": cost, "latency_s": round(latency, 3)})
-            log(f"  run {outcome.run_id}: {len(rows)} segments, {latency:.1f}s")
+        (out_dir / "segments.jsonl").touch()
         write_outputs()
-    manifest, scores = write_outputs(finished_at=_now())
-    return EvalResult(out_dir, manifest, scores, failed)
+        translated = 0
+        for page_index in page_indexes:
+            if page_index in skip_reasons:
+                entry = {"book": book, "page_index": page_index, "reason": skip_reasons[page_index]}
+                skipped.append(entry)
+                page_entries[page_index] = {"book": book, "page_index": page_index, "status": "skipped", "run_id": None,
+                                            "trace_id": None}
+                write_outputs()
+                continue
+            translated += 1
+            log(f"translating {book}/{page_index} ({translated} of {len(to_translate)}) ...")
+            start = time.monotonic()
+            outcome = None
+            trace_id = None
+            make_page_client, client_for_page = client_for_page, make_client  # only page one gets the early client
+            try:
+                outcome = runs.translate_page(
+                    conn, book, page_index, make_client=make_page_client, dataset_root=dataset_root, config=config,
+                    **({"kb_id": kb_id} if config == runs.FULL else {}), **params,
+                )
+            except LLMNotConfigured:
+                raise  # raised before any Run exists, and it would be the same for every page
+            except runs.RunCrashed as e:  # the Run exists: failed, or still running if the database failed too
+                run_id, error, trace_id = e.run_id, e.error, e.trace_id
+            except Exception as e:  # no Run row exists yet (make_client or start_run raised); keep the other pages
+                run_id, error, trace_id = None, f"{type(e).__name__}: {e}", getattr(e, "trace_id", None)
+            else:
+                run_id, error, trace_id = outcome.run_id, outcome.result.error, outcome.trace_id
+            latency = time.monotonic() - start
+            run = None if run_id is None else store.get_run(conn, run_id)
+            if run is not None:
+                run_rows.append(run)
+            cost = None if run is None else run_cost(run["cost_usd"], run["unknown_usage_calls"])
+            ok = outcome is not None and outcome.result.ok
+            fallback_reason = _fallback_reason(run)
+            page_entries[page_index] = {"book": book, "page_index": page_index,
+                                        "status": "scored" if ok else "failed", "run_id": run_id, "trace_id": trace_id}
+            if not ok:
+                failed.append({"book": book, "page_index": page_index, "run_id": run_id, "trace_id": trace_id,
+                               "error": error, "fell_back": fallback_reason is not None,
+                               "fallback_reason": fallback_reason, "latency_s": round(latency, 3), "cost_usd": cost})
+                if run is not None:
+                    failed_runs.append(run)
+            else:
+                page_row = store.find_page(conn, book, page_index)
+                rows = store.segments_with_translations(conn, page_row["id"], outcome.run_id)
+                page_lines = [{
+                    "book": book, "page_index": page_index, "idx": r["idx"], "run_id": outcome.run_id,
+                    "ja": r["text_ja"], "hyp": r["text_zh_hans"],
+                    "ref_zh_hans": to_zh_hans(r["text_zh_hant"]), "ref_zh_hant": r["text_zh_hant"],
+                } for r in rows]
+                segment_lines += page_lines
+                _append_lines(out_dir / "segments.jsonl", page_lines)
+                scored_runs.append(run)
+                scored.append({"book": book, "page_index": page_index, "run_id": outcome.run_id, "trace_id": trace_id,
+                               "segments": len(rows), "calls": run["calls"],
+                               "unknown_usage_calls": run["unknown_usage_calls"],
+                               "fell_back": fallback_reason is not None, "fallback_reason": fallback_reason,
+                               **(_review_loop(run) if config in REVIEWED_CONFIGS else {}),
+                               **(_curation(run) if config == runs.FULL else {}),
+                               **({"kb_reach": _kb_reach(run)} if config == runs.FULL else {}),
+                               "cost_usd": cost, "latency_s": round(latency, 3)})
+                log(f"  run {outcome.run_id}: {len(rows)} segments, {latency:.1f}s")
+            write_outputs()
+        manifest, scores = write_outputs(finished_at=_now())
+        return EvalResult(out_dir, manifest, scores, failed)
+    except BaseException as e:  # Ctrl-C, a crash: the directory exists and holds the pages finished so far
+        try:
+            e.out_dir = out_dir
+        except AttributeError:  # an exception type that takes no attributes: same exception, no directory
+            pass
+        raise
 
 
 def _first_client(make_client: Callable[[], LLMClient], *, book: str, page_index: int,
@@ -339,6 +363,68 @@ def _kb_size(conn: sqlite3.Connection, kb_id: int, label: str) -> dict:
             "profiles": by_status(store.kb_profiles(conn, kb_id, KB_STATUSES))}
 
 
+def _kb_reach(run: sqlite3.Row) -> dict:
+    """How far the KB reached a `full` page, read from what the Run stored:
+      "snippets": {"items", "by_kind": {term, character}, "by_status": {approved, pending}} for the items the page's
+                  snippets part carried (`kb_snippets`), or null for a Run stored without that record: unknown, not 0
+      "lookups": {agent: {tool: {"calls", "found", "not_found"}}} for the Translator (its first pass and its revisions)
+                 and the Reviewer, every agent and tool a key; a call counts when it ran and was not a duplicate (a
+                 call with invalid arguments, a repeat, and a call that never ran do not), and it found something when
+                 its result says so
+      "reached": [{"kind", "key"}] for the distinct items that reached the page, through a snippet or a lookup that
+                 found something, in the order they arrived
+    Every item a page reaches was written on an earlier page: the page's own proposals are invisible to it."""
+    attempts = _attempts(run)
+    shown = attempts.get("kb_snippets")
+    reached: dict[tuple[str, str], None] = {}
+    snippets = None
+    if shown is not None:
+        snippets = {"items": len(shown),
+                    "by_kind": {kind: sum(i["kind"] == kind for i in shown) for kind in KINDS},
+                    "by_status": {status: sum(i["status"] == status for i in shown) for status in SNIPPET_STATUSES}}
+        for item in shown:
+            reached[(item["kind"], item["key"])] = None
+    lookups = {agent: {tool: {"calls": 0, "found": 0, "not_found": 0} for tool in LOOKUP_TOOLS}
+               for agent in LOOKUP_AGENTS}
+    for stage in attempts["stages"]:
+        for step in stage["attempts"]["agent"]["steps"]:
+            for call in step["tool_calls"]:
+                if call["name"] not in LOOKUP_TOOLS or not call["ran"] or call["duplicate"]:
+                    continue
+                counts = lookups[STAGE_AGENTS[stage["kind"]]][call["name"]]
+                counts["calls"] += 1
+                item = _found_item(call)
+                counts["found" if item else "not_found"] += 1
+                if item:
+                    reached[item] = None
+    return {"snippets": snippets, "lookups": lookups, "reached": [{"kind": k, "key": key} for k, key in reached]}
+
+
+def _found_item(call: dict) -> tuple[str, str] | None:
+    """The (kind, key) of the item a lookup call found, from its stored result; None when it found nothing."""
+    kind, key = LOOKUP_TOOLS[call["name"]]
+    try:
+        result = json.loads(call["result"])
+    except (TypeError, ValueError):  # no result: the handler raised
+        return None
+    return (kind, result[key]) if isinstance(result, dict) and result.get("found") is True else None
+
+
+def _kb_reach_totals(pages: list[dict]) -> dict:
+    """The page rows' `kb_reach` added up: the pages by what their snippets were (`nonempty`, `empty`, or `unknown`
+    for a Run with no record), the lookups by agent and tool, and the number of distinct items that reached at least
+    one page. How many entries the KB ended with is `kb`, next to it in `scores.json`."""
+    snippet_pages = {"nonempty": 0, "empty": 0, "unknown": 0}
+    for page in pages:
+        snippets = page["kb_reach"]["snippets"]
+        snippet_pages["unknown" if snippets is None else "nonempty" if snippets["items"] else "empty"] += 1
+    lookups = {agent: {tool: {count: sum(p["kb_reach"]["lookups"][agent][tool][count] for p in pages)
+                              for count in ("calls", "found", "not_found")} for tool in LOOKUP_TOOLS}
+               for agent in LOOKUP_AGENTS}
+    reached = {(i["kind"], i["key"]) for p in pages for i in p["kb_reach"]["reached"]}
+    return {"snippet_pages": snippet_pages, "lookups": lookups, "items_reached": len(reached)}
+
+
 def _review_loop(run: sqlite3.Row) -> dict:
     """How a `full_no_kb` Run's review loop went, read from what it stored: the send-backs, why the loop ended,
     whether the stored translation got a verdict, and the status and verdict of each review, in order."""
@@ -377,6 +463,17 @@ def _append_lines(path: Path, lines: list[dict]) -> None:
         f.write("".join(json.dumps(line, ensure_ascii=False) + "\n" for line in lines))
 
 
+def _kb_reach_line(reach: dict) -> str:
+    pages = reach["snippet_pages"]
+    known, unknown = pages["nonempty"] + pages["empty"], pages["unknown"]
+    snippets = (f"snippets unknown on {unknown} pages" if unknown and not known
+                else f"snippets on {pages['nonempty']} of {known} pages" + (f" ({unknown} unknown)" if unknown else ""))
+    found = sum(c["found"] for tools in reach["lookups"].values() for c in tools.values())
+    not_found = sum(c["not_found"] for tools in reach["lookups"].values() for c in tools.values())
+    return (f"kb reach  {snippets}; lookups found {found}, not found {not_found}; "
+            f"{reach['items_reached']} items reached a later page")
+
+
 def format_summary(result: EvalResult) -> str:
     s = result.scores
     cost, lat = s["cost"], s["latency"]
@@ -405,7 +502,8 @@ def format_summary(result: EvalResult) -> str:
                          for kind, counts in (("entries", kb["entries"]), ("profiles", kb["profiles"]))
                          if any(counts.values()))
         lines += [f"curator  {statuses}", f"proposals  {outcomes or 'none'}",
-                  f"knowledge base {kb['id']} ({kb['label']})  {size or 'empty'}"]
+                  f"knowledge base {kb['id']} ({kb['label']})  {size or 'empty'}",
+                  _kb_reach_line(s["kb_reach"])]
     lines += [
         f"chrF  {num(s['chrf']['score'], '.2f')}{sig(s['chrf']['signature'])}",
         f"BLEU  {num(s['bleu']['score'], '.2f')}{sig(s['bleu']['signature'])}",

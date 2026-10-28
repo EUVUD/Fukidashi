@@ -14,6 +14,7 @@ from fukidashi.datasets.importer import import_openmantra
 from fukidashi.kb import KBNotFound, KBSnapshot
 from fukidashi.kb.curator import apply
 from fukidashi.kb.loader import load_snapshot
+from fukidashi.kb.snapshot import item_line
 
 
 @pytest.fixture
@@ -305,3 +306,31 @@ def test_snippets_hold_only_what_the_snapshot_holds(imported, kb):
     out = snapshot.snippets(TEXT, 10_000)
     assert "隠し" not in out and "隐藏" not in out  # rejected
     assert out.count("[pending]") == 2
+
+
+# --- the items behind the snippets (task 018) ------------------------------------------------------------------------
+
+def test_snippet_items_are_the_items_the_snippets_print_in_the_same_order_and_cut_at_the_same_line(imported, kb):
+    snapshot = kb_with_a_bit_of_everything(imported, kb)
+    all_lines = snapshot.snippets(TEXT, 10_000).split("\n")
+
+    items = snapshot.snippet_items(TEXT, 10_000)
+
+    keys = [(type(i).__name__, getattr(i, "source_term", None) or i.name_src, i.status) for i in items]
+    assert keys == [
+        ("CharacterProfile", "ユキ", "approved"), ("GlossaryEntry", "魔法", "approved"),
+        ("GlossaryEntry", "王国", "approved"), ("GlossaryEntry", "封印", "pending_human"),
+        ("CharacterProfile", "ハル", "pending_human")]   # approved first, then by where each first occurs
+    assert [item_line(i) for i in items] == all_lines
+    for budget in range(-1, len(snapshot.snippets(TEXT, 10_000)) + 3):   # every cut, mid-list ones included
+        fitting = max(k for k in range(len(all_lines) + 1) if len("\n".join(all_lines[:k])) <= max(budget, 0))
+        kept = snapshot.snippet_items(TEXT, budget)
+        assert [item_line(i) for i in kept] == all_lines[:fitting]
+        assert snapshot.snippets(TEXT, budget) == "\n".join(all_lines[:fitting])
+    assert 0 < len(snapshot.snippet_items(TEXT, 80)) < len(all_lines)   # the budget really cuts in the middle here
+
+
+def test_snippet_items_of_a_text_with_nothing_in_it_are_empty(imported, kb):
+    snapshot = kb_with_a_bit_of_everything(imported, kb)
+
+    assert snapshot.snippet_items("何もない", 1000) == () == snapshot.snippet_items("", 1000)

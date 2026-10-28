@@ -52,10 +52,11 @@ class KBSnapshot:
         """The profile with `name` as its name or as one of its aliases, or None."""
         return self._names.get(normalise(name))
 
-    def snippets(self, text_ja: str, char_budget: int) -> str:
-        """One line for each entry and profile whose source term, name or alias occurs in `text_ja`, approved before
-        pending, then by where it first occurs, joined by newlines. A line that would take the text past `char_budget`
-        characters ends it, so the text is never longer than the budget and never has half a line."""
+    def snippet_items(self, text_ja: str, char_budget: int) -> tuple[GlossaryEntry | CharacterProfile, ...]:
+        """The entries and profiles whose source term, name or alias occurs in `text_ja`, approved before pending, then
+        by where each first occurs, cut after the last whole line that fits in `char_budget` characters (a line that
+        would take the text past it ends the list). `snippets` is these items' lines, so what is recorded as shown to a
+        page is what its prompt carried."""
         text = normalise(text_ja)
         ranked = []
         for kind, items in ((0, self.entries), (1, self.profiles)):
@@ -63,15 +64,19 @@ class KBSnapshot:
                 found = [at for key in item.keys if key and (at := text.find(key)) >= 0]
                 if found:
                     ranked.append(((item.status != APPROVED, min(found), kind, item.id), item))
-        lines: list[str] = []
+        kept: list[GlossaryEntry | CharacterProfile] = []
         used = 0
         for _, item in sorted(ranked, key=lambda pair: pair[0]):
-            line = entry_line(item) if isinstance(item, GlossaryEntry) else profile_line(item)
-            used += len(line) + bool(lines)  # the newline before every line but the first
+            used += len(item_line(item)) + bool(kept)  # the newline before every line but the first
             if used > char_budget:
                 break
-            lines.append(line)
-        return "\n".join(lines)
+            kept.append(item)
+        return tuple(kept)
+
+    def snippets(self, text_ja: str, char_budget: int) -> str:
+        """One line for each of `snippet_items`, joined by newlines: never longer than `char_budget` characters and
+        never with half a line."""
+        return "\n".join(item_line(item) for item in self.snippet_items(text_ja, char_budget))
 
 
 def entry_line(entry: GlossaryEntry) -> str:
@@ -88,3 +93,7 @@ def profile_line(profile: CharacterProfile) -> str:
     if profile.notes:
         line += f"; {profile.notes}"
     return line + (" [pending]" if profile.status == PENDING_HUMAN else "")
+
+
+def item_line(item: GlossaryEntry | CharacterProfile) -> str:
+    return entry_line(item) if isinstance(item, GlossaryEntry) else profile_line(item)
