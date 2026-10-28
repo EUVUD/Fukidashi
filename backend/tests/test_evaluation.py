@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
+import sqlite3
 import subprocess
 import sys
 
@@ -14,10 +16,11 @@ from sacrebleu.metrics import BLEU, CHRF
 
 from fukidashi import config, store
 from fukidashi.datasets.importer import import_openmantra
+from fukidashi.db import connect, init_db
 from fukidashi.evaluation import harness, metrics
 from fukidashi.evaluation.manifest import git_state
 from fukidashi.evaluation.references import to_zh_hans
-from fukidashi.llm.client import LLMNotConfigured
+from fukidashi.llm.client import LLMConfig, LLMNotConfigured
 from fukidashi.llm.metering import Usage
 
 # Page 1 and page 3 have text; page 2 has none. The references are Traditional, as in OpenMantra.
@@ -358,7 +361,15 @@ def test_log_reports_progress(imported, root, tmp_path):
     lines: list[str] = []
     evaluate(imported, root, tmp_path, [FakeClient([reply(1)])], [1], log=lines.append)
 
-    assert lines[0] == "translating book_e/1 ..."
+    assert lines[0] == "translating book_e/1 (1 of 1) ..."
+
+
+def test_log_says_where_each_translated_page_is_among_them_and_a_skipped_page_is_not_counted(imported, root, tmp_path):
+    lines: list[str] = []
+    evaluate(imported, root, tmp_path, [FakeClient([reply(1)]), FakeClient([reply(3)])], [1, 2, 3], log=lines.append)
+
+    assert [line for line in lines if line.startswith("translating")] == [
+        "translating book_e/1 (1 of 2) ...", "translating book_e/3 (2 of 2) ..."]  # page 2 has no text
 
 
 def test_summary_prints_scores_signatures_and_failures(imported, root, tmp_path):
@@ -484,6 +495,254 @@ def test_cost_summary_over_no_runs_costs_nothing_but_an_unknown_run_still_makes_
         assert metrics.cost_summary(runs)["total_usd"] is None
 
 
+# --- Page by page: the outputs of a stopped eval, the first client, the order of the summary (task 017) -------------
+
+WIDE = "book_w"
+
+
+def wide_reply(page_index):
+    return json.dumps({"translations": [{"id": 0, "zh": f"译文{page_index}"}]}, ensure_ascii=False)
+
+
+def make_wide_root(tmp_path, page_order=(1, 2, 3, 4)):
+    """A dataset with the book `book_w`: one region on each page, the pages listed in `page_order`."""
+    root = tmp_path / "wide-dataset"
+    (root / "images" / WIDE / "ja").mkdir(parents=True)
+    pages = []
+    for page_index in page_order:
+        image = f"images/{WIDE}/ja/{page_index - 1:03d}.jpg"
+        (root / image).write_bytes(b"\xff\xd8fake-jpeg")
+        text = [{"x": 1, "y": 2, "w": 3, "h": 4, "text_ja": f"日本語{page_index}", "text_en": "EN",
+                 "text_zh": f"參考{page_index}"}]
+        pages.append({"page_index": page_index, "image_paths": {"ja": image}, "frame": [], "text": text})
+    (root / "annotation.json").write_text(json.dumps([{"book_title": WIDE, "pages": pages}]), encoding="utf-8")
+    return root
+
+
+@pytest.fixture
+def wide(conn, tmp_path):
+    root = make_wide_root(tmp_path)
+    import_openmantra(conn, root)
+    return root
+
+
+def evaluate_wide(conn, root, tmp_path, make_client, pages=(1, 2, 3, 4)):
+    return harness.run_eval(conn, config="baseline", book=WIDE, page_indexes=list(pages), make_client=make_client,
+                            dataset_root=root, out_root=tmp_path / "out", repo_root=config.ROOT)
+
+
+class InterruptedClient(FakeClient):
+    def chat(self, messages, **kwargs):
+        raise KeyboardInterrupt
+
+
+def disk_state(out_root):
+    """What the output directory holds right now; None while it does not exist."""
+    if not out_root.exists():
+        return None
+    (out_dir,) = out_root.iterdir()
+    scores = json.loads((out_dir / "scores.json").read_text(encoding="utf-8"))
+    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    return {"files": sorted(p.name for p in out_dir.iterdir()),
+            "segment_pages": [line["page_index"] for line in read_lines(out_dir / "segments.jsonl")],
+            "score_pages": [p["page_index"] for p in scores["pages"]], "pages_scored": scores["pages_scored"],
+            "skipped_pages": [p["page_index"] for p in scores["skipped_pages"]],
+            "statuses": [p["status"] for p in manifest["pages"]], "finished_at": manifest["finished_at"]}
+
+
+FILES = ["manifest.json", "scores.json", "segments.jsonl"]
+
+
+def test_book_page_indexes_lists_the_pages_of_one_book_in_page_order(conn, tmp_path, root):
+    import_openmantra(conn, root)  # book_e: pages 1, 2, 3
+    import_openmantra(conn, make_wide_root(tmp_path, page_order=(3, 1, 4, 2)))  # annotated out of order
+
+    assert store.book_page_indexes(conn, "book_e") == [1, 2, 3]
+    assert store.book_page_indexes(conn, WIDE) == [1, 2, 3, 4]
+    assert store.book_page_indexes(conn, "no_such_book") == []
+
+
+def test_an_interrupted_eval_keeps_the_outputs_of_the_pages_it_finished(conn, wide, tmp_path):
+    clients = iter([FakeClient([wide_reply(1)]), FakeClient([wide_reply(2)]), InterruptedClient([]),
+                    FakeClient([wide_reply(4)])])
+
+    with pytest.raises(KeyboardInterrupt):  # the 3rd of 4 pages
+        evaluate_wide(conn, wide, tmp_path, lambda: next(clients))
+
+    (out_dir,) = (tmp_path / "out").iterdir()
+    assert sorted(p.name for p in out_dir.iterdir()) == FILES
+    lines = read_lines(out_dir / "segments.jsonl")
+    assert [(s["page_index"], s["idx"], s["hyp"]) for s in lines] == [(1, 0, "译文1"), (2, 0, "译文2")]
+    scores = json.loads((out_dir / "scores.json").read_text(encoding="utf-8"))
+    corpus = metrics.score_corpus([s["hyp"] for s in lines], [s["ref_zh_hans"] for s in lines])
+    assert corpus.chrf is not None
+    assert (scores["pages_scored"], scores["segments_scored"]) == (2, 2)
+    assert [p["page_index"] for p in scores["pages"]] == [1, 2]
+    assert scores["chrf"] == {"score": corpus.chrf, "signature": corpus.chrf_signature}
+    assert scores["bleu"] == {"score": corpus.bleu, "signature": corpus.bleu_signature}
+    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    run_ids = [r["id"] for r in conn.execute("SELECT id FROM runs ORDER BY id")]
+    assert [(p["page_index"], p["status"], p["run_id"]) for p in manifest["pages"]] == [
+        (1, "scored", run_ids[0]), (2, "scored", run_ids[1]), (3, "pending", None), (4, "pending", None)]
+    assert manifest["finished_at"] is None
+    assert manifest["sacrebleu_signatures"] == {"chrf": corpus.chrf_signature, "bleu": corpus.bleu_signature}
+
+
+def test_after_every_page_the_files_on_disk_cover_exactly_the_pages_done(conn, wide, tmp_path):
+    clients = iter([FakeClient([wide_reply(p)]) for p in (1, 2, 3, 4)])
+    seen = []
+
+    def make_client():
+        seen.append(disk_state(tmp_path / "out"))  # when page len(seen) starts
+        return next(clients)
+
+    result = evaluate_wide(conn, wide, tmp_path, make_client)
+
+    assert seen[0] is None  # the first page's client is built before the directory exists
+    for k in (2, 3, 4):
+        assert seen[k - 1] == {
+            "files": FILES, "segment_pages": list(range(1, k)), "score_pages": list(range(1, k)),
+            "pages_scored": k - 1, "skipped_pages": [], "statuses": ["scored"] * (k - 1) + ["pending"] * (5 - k),
+            "finished_at": None}
+    assert disk_state(tmp_path / "out") == {
+        "files": FILES, "segment_pages": [1, 2, 3, 4], "score_pages": [1, 2, 3, 4], "pages_scored": 4,
+        "skipped_pages": [], "statuses": ["scored"] * 4, "finished_at": result.manifest["finished_at"]}
+
+
+def test_the_files_exist_before_the_first_page_is_translated_with_every_page_pending(conn, wide, tmp_path):
+    seen = []
+
+    class Watching(FakeClient):
+        def chat(self, messages, **kwargs):
+            seen.append(disk_state(tmp_path / "out"))  # the first request of the first page
+            return super().chat(messages, **kwargs)
+
+    evaluate_wide(conn, wide, tmp_path, lambda: Watching([wide_reply(1)]), pages=[1])
+
+    assert seen == [{"files": FILES, "segment_pages": [], "score_pages": [], "pages_scored": 0, "skipped_pages": [],
+                     "statuses": ["pending"], "finished_at": None}]
+
+
+def test_finished_at_is_null_until_the_last_page_is_done(conn, wide, tmp_path):
+    seen = []
+
+    class Watching(FakeClient):
+        def chat(self, messages, **kwargs):
+            seen.append(disk_state(tmp_path / "out")["finished_at"])
+            return super().chat(messages, **kwargs)
+
+    result = evaluate_wide(conn, wide, tmp_path, lambda: Watching([wide_reply(1)]), pages=[1])
+    on_disk = json.loads((result.out_dir / "manifest.json").read_text(encoding="utf-8"))
+
+    assert seen == [None]
+    assert on_disk["finished_at"] is not None and on_disk["started_at"] <= on_disk["finished_at"]
+    assert result.manifest == on_disk and on_disk["eval_id"] == result.out_dir.name
+    assert not list(result.out_dir.glob("*.tmp"))  # the temporary files were renamed over the files
+
+
+def test_a_skipped_page_is_recorded_as_it_is_passed(imported, root, tmp_path):
+    seen = []
+    clients = iter([FakeClient([reply(1)]), FakeClient([reply(3)])])
+
+    def make_client():
+        seen.append(disk_state(tmp_path / "out"))
+        return next(clients)
+
+    result = harness.run_eval(imported, config="baseline", book="book_e", page_indexes=[2, 1, 3],
+                              make_client=make_client, dataset_root=root, out_root=tmp_path / "out",
+                              repo_root=config.ROOT)
+
+    assert seen[1] == {"files": FILES, "segment_pages": [1, 1], "score_pages": [1], "pages_scored": 1,  # 2 regions
+                       "skipped_pages": [2], "statuses": ["skipped", "scored", "pending"], "finished_at": None}
+    assert [p["status"] for p in result.manifest["pages"]] == ["skipped", "scored", "scored"]
+    assert [p["page_index"] for p in result.scores["skipped_pages"]] == [2]
+
+
+def test_a_missing_llm_setting_on_a_later_page_stops_the_eval_and_keeps_the_pages_before_it(conn, wide, tmp_path):
+    clients = iter([FakeClient([wide_reply(1)])])
+
+    def make_client():
+        try:
+            return next(clients)
+        except StopIteration:
+            raise LLMNotConfigured("Set LLM_API_KEY in .env") from None
+
+    with pytest.raises(LLMNotConfigured):
+        evaluate_wide(conn, wide, tmp_path, make_client, pages=[1, 2])
+
+    assert disk_state(tmp_path / "out") == {
+        "files": FILES, "segment_pages": [1], "score_pages": [1], "pages_scored": 1, "skipped_pages": [],
+        "statuses": ["scored", "pending"], "finished_at": None}
+    assert conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+
+
+def test_every_page_gets_exactly_one_client_in_page_order(conn, wide, tmp_path):
+    made = []
+
+    def make_client():
+        made.append(1)
+        n = len(made)
+        return FakeClient([wide_reply(n)], config=LLMConfig("http://fake", "key", f"model-{n}"))
+
+    result = evaluate_wide(conn, wide, tmp_path, make_client)
+
+    assert len(made) == 4 and result.exit_code == 0
+    assert [tuple(r) for r in conn.execute(
+        "SELECT p.page_index, r.model FROM runs r JOIN pages p ON p.id = r.page_id ORDER BY r.id")] == [
+        (1, "model-1"), (2, "model-2"), (3, "model-3"), (4, "model-4")]
+    assert result.manifest["requested_models"] == ["model-1", "model-2", "model-3", "model-4"]
+
+
+def test_a_skipped_page_gets_no_client_and_the_next_page_gets_the_next_one(imported, root, tmp_path):
+    made = []
+
+    def make_client():
+        made.append(1)
+        n = len(made)
+        return FakeClient([reply(1 if n == 1 else 3)], config=LLMConfig("http://fake", "key", f"model-{n}"))
+
+    harness.run_eval(imported, config="baseline", book="book_e", page_indexes=[2, 1, 3], make_client=make_client,
+                     dataset_root=root, out_root=tmp_path / "out", repo_root=config.ROOT)
+
+    assert len(made) == 2
+    assert [tuple(r) for r in imported.execute(
+        "SELECT p.page_index, r.model FROM runs r JOIN pages p ON p.id = r.page_id ORDER BY r.id")] == [
+        (1, "model-1"), (3, "model-2")]
+
+
+def test_an_eval_whose_pages_are_all_skipped_builds_no_client_and_still_writes_its_outputs(imported, root, tmp_path):
+    def no_client():
+        raise AssertionError("make_client must not be called")
+
+    result = harness.run_eval(imported, config="baseline", book="book_e", page_indexes=[2], make_client=no_client,
+                              dataset_root=root, out_root=tmp_path / "out", repo_root=config.ROOT)
+
+    assert result.exit_code == 0 and imported.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+    assert disk_state(tmp_path / "out") == {
+        "files": FILES, "segment_pages": [], "score_pages": [], "pages_scored": 0, "skipped_pages": [2],
+        "statuses": ["skipped"], "finished_at": result.manifest["finished_at"]}
+    assert result.manifest["finished_at"] is not None
+
+
+def test_a_client_that_fails_to_build_for_the_first_page_fails_that_page_and_the_next_page_gets_its_own(
+        conn, wide, tmp_path):
+    made = []
+
+    def make_client():
+        made.append(1)
+        if len(made) == 1:
+            raise RuntimeError("cannot build the client")
+        return FakeClient([wide_reply(2)], config=LLMConfig("http://fake", "key", "model-2"))
+
+    result = evaluate_wide(conn, wide, tmp_path, make_client, pages=[1, 2])
+
+    assert len(made) == 2 and result.exit_code == 1
+    (failed,) = result.scores["failed_pages"]
+    assert (failed["page_index"], failed["run_id"], failed["error"]) == (1, None, "RuntimeError: cannot build the client")
+    assert [(p["page_index"], p["status"]) for p in result.manifest["pages"]] == [(1, "failed"), (2, "scored")]
+    assert [tuple(r) for r in conn.execute("SELECT model FROM runs")] == [("model-2",)]
+
+
 # `eval/run.py` loads .env at start; the child gets a `load_dotenv` that reads nothing, so no test reads the real one.
 CLI_CHILD = ("import dotenv, runpy, sys; dotenv.load_dotenv = lambda *a, **k: False; "
              "sys.argv = sys.argv[1:]; runpy.run_path(sys.argv[0], run_name='__main__')")
@@ -506,3 +765,48 @@ def test_cli_lists_its_options_and_rejects_bad_arguments_before_touching_the_dat
 
     bad_pages = run_cli(tmp_path, "--config", "baseline", "--book", "book_e", "--pages", "1,x")
     assert bad_pages.returncode == 2 and "comma-separated" in bad_pages.stderr
+
+
+def load_cli():
+    """`eval/run.py` as a module in this process (the tests above run it as a script in a child), with .env reading off."""
+    spec = importlib.util.spec_from_file_location("eval_run_under_test", config.ROOT / "eval" / "run.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.load_dotenv = lambda *args, **kwargs: False
+    return module
+
+
+@pytest.mark.parametrize("args, expected", [([], [1, 2, 3, 4]), (["--pages", "4,2"], [4, 2])])
+def test_cli_without_pages_evaluates_every_page_of_the_book_in_page_order(tmp_path, monkeypatch, args, expected):
+    conn = connect(tmp_path / "cli.db")
+    init_db(conn)
+    import_openmantra(conn, make_wide_root(tmp_path, page_order=(3, 1, 4, 2)))  # imported out of order
+    conn.close()
+    cli, asked = load_cli(), []
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "cli.db")
+    monkeypatch.setattr(cli, "run_eval", lambda conn, **kwargs: asked.append(kwargs) or harness.EvalResult(tmp_path, {}, {}))
+    monkeypatch.setattr(cli, "format_summary", lambda result: "")
+    monkeypatch.setattr(sys, "argv", ["run.py", "--config", "baseline", "--book", WIDE, *args])
+
+    assert cli.main() == 0
+    assert [(kwargs["book"], kwargs["page_indexes"]) for kwargs in asked] == [(WIDE, expected)]  # --pages as given
+
+
+def test_cli_stops_with_exit_code_2_before_any_run_for_a_book_with_no_pages(tmp_path):
+    eval_dir = config.ROOT / "runs" / "eval"
+    before = sorted(p.name for p in eval_dir.iterdir()) if eval_dir.exists() else None
+
+    stopped = run_cli(tmp_path, "--config", "baseline", "--book", "no_such_book")
+
+    assert stopped.returncode == 2
+    assert "Stopped before any model call" in stopped.stderr and "'no_such_book'" in stopped.stderr
+    assert "scripts/import_openmantra.py" in stopped.stderr
+    assert (sorted(p.name for p in eval_dir.iterdir()) if eval_dir.exists() else None) == before  # no output directory
+    with sqlite3.connect(tmp_path / "cli.db") as db:
+        assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+
+
+def test_cli_help_says_what_leaving_pages_out_does(tmp_path):
+    helped = run_cli(tmp_path, "--help")
+
+    assert "[--pages PAGES]" in helped.stdout and "every page of the book" in " ".join(helped.stdout.split())

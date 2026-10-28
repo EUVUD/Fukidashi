@@ -1,6 +1,7 @@
 """Translate pages with `runs.translate_page` (the editor's code path) and score them against the references.
 
-Outputs go to <out_root>/<eval id>/: manifest.json, segments.jsonl and scores.json.
+Outputs go to <out_root>/<eval id>/: manifest.json, segments.jsonl and scores.json. They are written page by page (see
+`run_eval`), so an eval that stops early leaves the outputs of the pages it finished.
 
 For `full` the harness first creates the run's Knowledge Base (OUTLINE §3.3, §8: one KB per eval run, never shared with
 another run), labelled with the eval id, and passes it to every page in the order of the pages, so that a page reads what
@@ -10,6 +11,7 @@ the earlier pages wrote.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from collections.abc import Callable
@@ -88,8 +90,20 @@ def run_eval(
     count of each result of `curator.RESULTS` among its proposals (`proposal_outcomes`, zeros included, so
     `conflict_across_kinds` is counted apart from `conflict`). `scores.json` gives the totals (`curator_statuses`,
     `proposal_outcomes`) and the KB's size at the end (`kb`: id, label, entries and profiles by status). Proposals the
-    Curator left `undecided` stay so: an eval KB is used once. The client is built by the first page, so an
-    `LLMNotConfigured` stop comes after the KB was made, and that empty KB stays in the database.
+    Curator left `undecided` stay so: an eval KB is used once. The first client is built before the KB is made, so an
+    `LLMNotConfigured` stop leaves no KB (and no output directory) behind.
+
+    The outputs are written page by page, in the order of `page_indexes`. Once every page has been checked and the first
+    client built, the harness makes the output directory and writes the three files for zero pages done: `manifest.json`
+    with every page `pending` and `finished_at` null, a `scores.json` that scored nothing, and an empty `segments.jsonl`.
+    After each page (scored, failed or skipped) it appends that page's lines to `segments.jsonl`, then replaces
+    `scores.json` and `manifest.json`, in that order and each in one step (a temporary file, then a rename), so they
+    cover the pages done so far and a reader never sees half a file; the manifest comes last because it says which pages
+    are done. An eval that stops early (Ctrl-C, a crash, a killed process; the exception propagates) therefore leaves a
+    directory with the outputs of the pages it finished, the pages it did not reach `pending` and `finished_at` null,
+    and the Run of the page in flight may stay `running`. It is not continued: to finish it, run the whole eval again.
+    Only the last write sets `finished_at`; a finished directory has the same three files and keys as any other.
+    `log` gets one line per page that is translated, with its place among them.
     """
     if config not in CONFIGS:
         raise ValueError(f"unknown config {config!r}; expected one of {CONFIGS}")
@@ -107,13 +121,13 @@ def run_eval(
         params |= {"curator_budget": curator_agent.DEFAULT_CURATOR_BUDGET}
 
     to_translate: list[int] = []
-    skipped: list[dict] = []
+    skip_reasons: dict[int, str] = {}
     problems: list[str] = []
     for page_index in page_indexes:
         try:
             runs.validate_page(conn, book, page_index, dataset_root)
         except runs.NothingToTranslate as e:
-            skipped.append({"book": book, "page_index": page_index, "reason": str(e)})
+            skip_reasons[page_index] = str(e)
         except runs.TranslateError as e:
             problems.append(f"{book}/{page_index}: {e}")
         else:
@@ -121,28 +135,103 @@ def run_eval(
     if problems:
         raise EvalAborted(problems)
 
-    kb_id = kb_label = None
-    eval_id = None
-    if config == runs.FULL:  # one KB for this eval run: its label is the eval id, which no other KB of the book has
-        eval_id = _free_id(out_root, _eval_base(started_at, config),
-                           taken=lambda label: store.find_kb(conn, book_title=book, purpose="eval", label=label))
-        kb_id, kb_label = store.create_kb(conn, book_title=book, purpose="eval", label=eval_id), eval_id
+    # The first page's client is built now, before the KB and the output directory exist: a missing LLM configuration
+    # (LLMNotConfigured) then stops the eval with nothing left behind. Every page still gets one client from one call.
+    client_for_page = (_first_client(make_client, book=book, page_index=to_translate[0], config=config)
+                       if to_translate else make_client)
 
-    page_entries: dict[int, dict] = {}  # page_index -> manifest entry
+    eval_id = _free_id(out_root, _eval_base(started_at, config),
+                       taken=lambda label: config == runs.FULL
+                       and store.find_kb(conn, book_title=book, purpose="eval", label=label))
+    kb_id = kb_label = None
+    if config == runs.FULL:  # one KB for this eval run: its label is the eval id, which no other KB of the book has
+        kb_id, kb_label = store.create_kb(conn, book_title=book, purpose="eval", label=eval_id), eval_id
+    out_dir = out_root / eval_id
+    out_dir.mkdir(parents=True)
+    git = manifest_facts.git_state(repo_root)  # as the eval starts: the code that runs is the code of this moment
+    annotation_sha256 = manifest_facts.file_sha256(dataset_root / "annotation.json")
+    traced = tracing.describe()  # whether the traces in `pages` exist, and where they went
+
+    page_entries: dict[int, dict] = {  # page_index -> manifest entry; `pending` until the page is done
+        i: {"book": book, "page_index": i, "status": "pending", "run_id": None, "trace_id": None} for i in page_indexes}
     scored: list[dict] = []  # per-page score rows, in page order
     failed: list[dict] = []
+    skipped: list[dict] = []
     segment_lines: list[dict] = []
     run_rows: list[sqlite3.Row] = []  # every Run that was started and recorded, failed ones included
     scored_runs: list[sqlite3.Row] = []
     failed_runs: list[sqlite3.Row] = []  # failed or crashed; they cost money even though they are not scored
-    for page_index in to_translate:
-        log(f"translating {book}/{page_index} ...")
+
+    def write_outputs(finished_at: str | None = None) -> tuple[dict, dict]:
+        """Replace `scores.json` and then `manifest.json` with what covers the pages done so far."""
+        corpus = score_corpus([s["hyp"] for s in segment_lines], [s["ref_zh_hans"] for s in segment_lines])
+        scores = {
+            "config": config,
+            "book": book,
+            "pages_scored": len(scored),
+            "segments_scored": len(segment_lines),
+            "fallback_pages": sum(p["fell_back"] for p in scored),  # scored pages whose Run fell back to baseline
+            **({"final_stops": {stop: sum(p["final_stop"] == stop for p in scored)
+                                for stop in orchestrator.FINAL_STOPS}}
+               if config in REVIEWED_CONFIGS else {}),  # scored pages by why their review loop ended
+            **({"curator_statuses": {status: sum(p["curator_status"] == status for p in scored)
+                                     for status in CURATOR_STATUSES},
+                "proposal_outcomes": {result: sum(p["proposal_outcomes"][result] for p in scored)
+                                      for result in curator_rules.RESULTS},
+                "kb": _kb_size(conn, kb_id, kb_label)}
+               if config == runs.FULL else {}),  # the Curator's statuses, the results for the proposals, the KB's size
+            "chrf": {"score": corpus.chrf, "signature": corpus.chrf_signature},
+            "bleu": {"score": corpus.bleu, "signature": corpus.bleu_signature},
+            "cost": cost_summary([(r["cost_usd"], r["unknown_usage_calls"]) for r in scored_runs])
+            | {"failed_runs": cost_summary([(r["cost_usd"], r["unknown_usage_calls"]) for r in failed_runs])},
+            "latency": latency_summary([s["latency_s"] for s in scored]),
+            "pages": scored,
+            "failed_pages": failed,
+            "skipped_pages": skipped,
+        }
+        manifest = {
+            "eval_id": eval_id,
+            "started_at": started_at,
+            "finished_at": finished_at,  # null until the last page is done
+            "config_name": config,
+            "config_params": runs.run_params(config, **params),  # as the Runs record them
+            "book": book,
+            "pages": [page_entries[i] for i in page_indexes],
+            "annotation_sha256": annotation_sha256,
+            "requested_models": sorted({r["model"] for r in run_rows}),
+            "response_models": sorted({m for r in run_rows if r["response_model"]
+                                       for m in r["response_model"].split(", ")}),
+            "git_commit": git["commit"],
+            "git_dirty": git["dirty"],
+            "sacrebleu_signatures": {"chrf": corpus.chrf_signature, "bleu": corpus.bleu_signature},
+            "opencc_config": OPENCC_CONFIG,
+            "tracing": traced,
+            **({"kb": {"id": kb_id, "label": kb_label}} if config == runs.FULL else {}),  # this eval run's own KB
+        }
+        _write_json(out_dir / "scores.json", scores)
+        _write_json(out_dir / "manifest.json", manifest)
+        return manifest, scores
+
+    (out_dir / "segments.jsonl").touch()
+    write_outputs()
+    translated = 0
+    for page_index in page_indexes:
+        if page_index in skip_reasons:
+            entry = {"book": book, "page_index": page_index, "reason": skip_reasons[page_index]}
+            skipped.append(entry)
+            page_entries[page_index] = {"book": book, "page_index": page_index, "status": "skipped", "run_id": None,
+                                        "trace_id": None}
+            write_outputs()
+            continue
+        translated += 1
+        log(f"translating {book}/{page_index} ({translated} of {len(to_translate)}) ...")
         start = time.monotonic()
         outcome = None
         trace_id = None
+        make_page_client, client_for_page = client_for_page, make_client  # only the first page gets the early client
         try:
             outcome = runs.translate_page(
-                conn, book, page_index, make_client=make_client, dataset_root=dataset_root, config=config,
+                conn, book, page_index, make_client=make_page_client, dataset_root=dataset_root, config=config,
                 **({"kb_id": kb_id} if config == runs.FULL else {}), **params,
             )
         except LLMNotConfigured:
@@ -168,84 +257,53 @@ def run_eval(
                            "latency_s": round(latency, 3), "cost_usd": cost})
             if run is not None:
                 failed_runs.append(run)
-            continue
-        page_row = store.find_page(conn, book, page_index)
-        rows = store.segments_with_translations(conn, page_row["id"], outcome.run_id)
-        for r in rows:
-            segment_lines.append({
+        else:
+            page_row = store.find_page(conn, book, page_index)
+            rows = store.segments_with_translations(conn, page_row["id"], outcome.run_id)
+            page_lines = [{
                 "book": book, "page_index": page_index, "idx": r["idx"], "run_id": outcome.run_id,
                 "ja": r["text_ja"], "hyp": r["text_zh_hans"],
                 "ref_zh_hans": to_zh_hans(r["text_zh_hant"]), "ref_zh_hant": r["text_zh_hant"],
-            })
-        scored_runs.append(run)
-        scored.append({"book": book, "page_index": page_index, "run_id": outcome.run_id, "trace_id": trace_id,
-                       "segments": len(rows), "calls": run["calls"], "unknown_usage_calls": run["unknown_usage_calls"],
-                       "fell_back": fallback_reason is not None, "fallback_reason": fallback_reason,
-                       **(_review_loop(run) if config in REVIEWED_CONFIGS else {}),
-                       **(_curation(run) if config == runs.FULL else {}),
-                       "cost_usd": cost, "latency_s": round(latency, 3)})
-        log(f"  run {outcome.run_id}: {len(rows)} segments, {latency:.1f}s")
-    for entry in skipped:
-        page_entries[entry["page_index"]] = {"book": book, "page_index": entry["page_index"],
-                                             "status": "skipped", "run_id": None, "trace_id": None}
-
-    corpus = score_corpus([s["hyp"] for s in segment_lines], [s["ref_zh_hans"] for s in segment_lines])
-    scores = {
-        "config": config,
-        "book": book,
-        "pages_scored": len(scored),
-        "segments_scored": len(segment_lines),
-        "fallback_pages": sum(p["fell_back"] for p in scored),  # scored pages whose Run fell back to baseline
-        **({"final_stops": {stop: sum(p["final_stop"] == stop for p in scored) for stop in orchestrator.FINAL_STOPS}}
-           if config in REVIEWED_CONFIGS else {}),  # scored pages by why their review loop ended
-        **({"curator_statuses": {status: sum(p["curator_status"] == status for p in scored)
-                                 for status in CURATOR_STATUSES},
-            "proposal_outcomes": {result: sum(p["proposal_outcomes"][result] for p in scored)
-                                  for result in curator_rules.RESULTS},
-            "kb": _kb_size(conn, kb_id, kb_label)}
-           if config == runs.FULL else {}),  # the Curator's statuses, the results for the proposals, and the KB's size
-        "chrf": {"score": corpus.chrf, "signature": corpus.chrf_signature},
-        "bleu": {"score": corpus.bleu, "signature": corpus.bleu_signature},
-        "cost": cost_summary([(r["cost_usd"], r["unknown_usage_calls"]) for r in scored_runs])
-        | {"failed_runs": cost_summary([(r["cost_usd"], r["unknown_usage_calls"]) for r in failed_runs])},
-        "latency": latency_summary([s["latency_s"] for s in scored]),
-        "pages": scored,
-        "failed_pages": failed,
-        "skipped_pages": skipped,
-    }
-    models_requested = sorted({r["model"] for r in run_rows})
-    models_response = sorted({m for r in run_rows if r["response_model"] for m in r["response_model"].split(", ")})
-    git = manifest_facts.git_state(repo_root)
-    finished_at = _now()
-    if eval_id is None:
-        eval_id = _free_id(out_root, _eval_base(started_at, config))
-    manifest = {
-        "eval_id": eval_id,
-        "started_at": started_at,
-        "finished_at": finished_at,
-        "config_name": config,
-        "config_params": runs.run_params(config, **params),  # as the Runs record them
-        "book": book,
-        "pages": [page_entries[i] for i in page_indexes],
-        "annotation_sha256": manifest_facts.file_sha256(dataset_root / "annotation.json"),
-        "requested_models": models_requested,
-        "response_models": models_response,
-        "git_commit": git["commit"],
-        "git_dirty": git["dirty"],
-        "sacrebleu_signatures": {"chrf": corpus.chrf_signature, "bleu": corpus.bleu_signature},
-        "opencc_config": OPENCC_CONFIG,
-        "tracing": tracing.describe(),  # whether the traces in `pages` exist, and where they went
-        **({"kb": {"id": kb_id, "label": kb_label}} if config == runs.FULL else {}),  # this eval run's own KB
-    }
-
-    out_dir = out_root / eval_id
-    out_dir.mkdir(parents=True)
-    _write_json(out_dir / "manifest.json", manifest)
-    _write_json(out_dir / "scores.json", scores)
-    with (out_dir / "segments.jsonl").open("w", encoding="utf-8") as f:
-        for line in segment_lines:
-            f.write(json.dumps(line, ensure_ascii=False) + "\n")
+            } for r in rows]
+            segment_lines += page_lines
+            _append_lines(out_dir / "segments.jsonl", page_lines)
+            scored_runs.append(run)
+            scored.append({"book": book, "page_index": page_index, "run_id": outcome.run_id, "trace_id": trace_id,
+                           "segments": len(rows), "calls": run["calls"],
+                           "unknown_usage_calls": run["unknown_usage_calls"],
+                           "fell_back": fallback_reason is not None, "fallback_reason": fallback_reason,
+                           **(_review_loop(run) if config in REVIEWED_CONFIGS else {}),
+                           **(_curation(run) if config == runs.FULL else {}),
+                           "cost_usd": cost, "latency_s": round(latency, 3)})
+            log(f"  run {outcome.run_id}: {len(rows)} segments, {latency:.1f}s")
+        write_outputs()
+    manifest, scores = write_outputs(finished_at=_now())
     return EvalResult(out_dir, manifest, scores, failed)
+
+
+def _first_client(make_client: Callable[[], LLMClient], *, book: str, page_index: int,
+                  config: str) -> Callable[[], LLMClient]:
+    """Call `make_client` now and return the factory `runs.translate_page` gets for the first page, `page_index`.
+
+    `LLMNotConfigured` is raised here, at once; it leaves through the first page's root span, as it did when
+    `translate_page` built the client, so it still carries a `trace_id` and the trace shows the stop. Any other
+    exception comes out of the returned factory instead, inside `translate_page`, so that page fails with it exactly
+    as it would have if `translate_page` had built the client.
+    """
+    try:
+        client = make_client()
+    except LLMNotConfigured as e:
+        with tracing.page_span(book=book, page_index=page_index, config=config) as span:
+            e.trace_id = None if span is None else span.trace_id
+            raise
+    except Exception as e:
+        error = e  # `e` is gone when the block ends
+
+        def fail() -> LLMClient:
+            raise error
+
+        return fail
+    return lambda: client
 
 
 def _attempts(run: sqlite3.Row | None) -> list | dict | None:
@@ -306,7 +364,17 @@ def _free_id(out_root: Path, base: str, taken: Callable[[str], object] = lambda 
 
 
 def _write_json(path: Path, data: dict) -> None:
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    """Replace `path` in one step: write a temporary file next to it, then rename it over, so a reader sees the old file
+    or the new one, never half of either."""
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _append_lines(path: Path, lines: list[dict]) -> None:
+    """Append the lines, one JSON object each, with a single write."""
+    with path.open("a", encoding="utf-8") as f:
+        f.write("".join(json.dumps(line, ensure_ascii=False) + "\n" for line in lines))
 
 
 def format_summary(result: EvalResult) -> str:
@@ -319,33 +387,38 @@ def format_summary(result: EvalResult) -> str:
     def sig(value):
         return "" if value is None else f"   {value}"
 
+    reviewed, curated = s["config"] in REVIEWED_CONFIGS, s["config"] == runs.FULL
     lines = [
         f"{result.manifest['eval_id']} -> {result.out_dir}",
         f"scored {s['pages_scored']} pages, {s['segments_scored']} segments",
-        f"chrF  {num(s['chrf']['score'], '.2f')}{sig(s['chrf']['signature'])}",
-        f"BLEU  {num(s['bleu']['score'], '.2f')}{sig(s['bleu']['signature'])}",
-        f"cost  total ${num(cost['total_usd'], '.6f')}, ${num(cost['per_page_usd'], '.6f')} per page"
-        f" (unknown-cost runs {cost['unknown_cost_runs']}, unknown_usage_calls {cost['unknown_usage_calls']})",
-        f"latency per page  p50 {num(lat['p50_s'], '.1f')}s  p95 {num(lat['p95_s'], '.1f')}s",
     ]
     if s["config"] != baseline.CONFIG_NAME:
-        lines.insert(2, f"fallback to baseline  {s['fallback_pages']} of {s['pages_scored']} scored pages")
-    if s["config"] in REVIEWED_CONFIGS:
+        lines.append(f"fallback to baseline  {s['fallback_pages']} of {s['pages_scored']} scored pages")
+    if reviewed:
         stops = ", ".join(f"{stop} {n}" for stop, n in s["final_stops"].items())
-        lines.insert(3, f"review loop  {stops}; send-backs {sum(p['send_backs'] for p in s['pages'])}")
-        for p in s["pages"]:
-            reviews = "/".join(verdict or status for verdict, status in zip(p["review_verdicts"], p["review_statuses"]))
-            lines.append(f"REVIEW LOOP  {p['book']}/{p['page_index']} (run {p['run_id']}): {p['final_stop']}, "
-                         f"{p['send_backs']} send-back(s), reviews {reviews}")
-    if s["config"] == runs.FULL:
+        lines.append(f"review loop  {stops}; send-backs {sum(p['send_backs'] for p in s['pages'])}")
+    if curated:
         kb = s["kb"]
         statuses = ", ".join(f"{status} {n}" for status, n in s["curator_statuses"].items())
         outcomes = ", ".join(f"{result} {n}" for result, n in s["proposal_outcomes"].items() if n)
         size = "; ".join(f"{kind} " + ", ".join(f"{status} {n}" for status, n in counts.items() if n)
                          for kind, counts in (("entries", kb["entries"]), ("profiles", kb["profiles"]))
                          if any(counts.values()))
-        lines[4:4] = [f"curator  {statuses}", f"proposals  {outcomes or 'none'}",
-                      f"knowledge base {kb['id']} ({kb['label']})  {size or 'empty'}"]
+        lines += [f"curator  {statuses}", f"proposals  {outcomes or 'none'}",
+                  f"knowledge base {kb['id']} ({kb['label']})  {size or 'empty'}"]
+    lines += [
+        f"chrF  {num(s['chrf']['score'], '.2f')}{sig(s['chrf']['signature'])}",
+        f"BLEU  {num(s['bleu']['score'], '.2f')}{sig(s['bleu']['signature'])}",
+        f"cost  total ${num(cost['total_usd'], '.6f')}, ${num(cost['per_page_usd'], '.6f')} per page"
+        f" (unknown-cost runs {cost['unknown_cost_runs']}, unknown_usage_calls {cost['unknown_usage_calls']})",
+        f"latency per page  p50 {num(lat['p50_s'], '.1f')}s  p95 {num(lat['p95_s'], '.1f')}s",
+    ]
+    if reviewed:
+        for p in s["pages"]:
+            reviews = "/".join(verdict or status for verdict, status in zip(p["review_verdicts"], p["review_statuses"]))
+            lines.append(f"REVIEW LOOP  {p['book']}/{p['page_index']} (run {p['run_id']}): {p['final_stop']}, "
+                         f"{p['send_backs']} send-back(s), reviews {reviews}")
+    if curated:
         for p in s["pages"]:
             made = ", ".join(f"{result} {n}" for result, n in p["proposal_outcomes"].items() if n)
             lines.append(f"CURATOR  {p['book']}/{p['page_index']} (run {p['run_id']}): {p['curator_status']}, "
