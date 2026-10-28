@@ -1,6 +1,6 @@
 # Design Diagrams
 
-> 2026-10-27 · Matches the code at the end of M2: the eval harness v0, the Run status and cost fixes, provider and malformed-response error handling, the tool-calling loop, the Translator Agent and tracing. Diagrams are Mermaid and render on GitHub.
+> 2026-10-28 · Matches the code at the end of M3. M2 added the eval harness v0, the Run status and cost fixes, provider and malformed-response error handling, the tool-calling loop, the Translator Agent and tracing. M3 added the Reviewer, the Orchestrator, the Knowledge Base and the Curator. Diagrams are Mermaid and render on GitHub.
 > **Solid = implemented; dashed = planned** (milestones in [OUTLINE.md](../OUTLINE.md) §7). Terms follow OUTLINE §0.
 
 Fukidashi translates Japanese manga into Simplified Chinese (zh-Hans). Each page has several Segments (one line of dialogue in one oracle box); the model looks at the whole page image and translates them together, and the user checks the translations against the boxes in the browser.
@@ -38,29 +38,37 @@ classDiagram
     class Translation {
         text_zh_hans
     }
-    class KnowledgeBase:::planned {
+    class KnowledgeBase {
         Glossary
         Character Profiles
     }
-    class ReviewComment:::planned {
-        text
+    class Proposal {
+        kind
+        source and target
+        status
+    }
+    class Issue {
+        comment
+        suggestion
     }
 
     Book "1" --> "*" Page : contains
-    Book "1" --> "0..1" KnowledgeBase : has
+    Book "1" --> "*" KnowledgeBase : has
+    Run "1" --> "*" Proposal : proposes
+    KnowledgeBase "1" --> "*" Proposal : decides
     Page "1" --> "*" Segment : has
     Page "1" --> "*" Run : translated by
     Run "1" --> "*" Translation : produces
     Segment "1" <-- "*" Translation : translates
-    Translation "1" --> "*" ReviewComment : gets
+    Run "1" --> "*" Issue : review finds
 
-    classDef planned fill:#f4f4f4,stroke:#999,stroke-dasharray:5 5,color:#777
 ```
 
 - A page has many **Segments**. Every click on Translate creates a **Run**, and the Run gives each Segment one **Translation**. The page shows its latest successful Run.
 - **Reference translations** (OpenMantra's zh-Hant and en translations) belong to the Segment and are used only for comparison and evaluation, never in a prompt.
-- `Run.config` is `baseline` (one call per page, no tools, no KB) or `translator` (the Translator Agent alone, M2's smoke config); `full` and `full_no_kb` arrive in M3.
-- The dashed **KnowledgeBase** (M3) and **ReviewComment** (M3) do not exist yet.
+- `Run.config` is `baseline` (one call per page, no tools, no KB), `translator` (the Translator Agent alone, M2's smoke config), `full_no_kb` (Translator, Reviewer, Send-backs) or `full` (the same with a Knowledge Base).
+- A book has one **KnowledgeBase** per use: each `full` eval run makes a new one, and the editor will keep one per book (M7). A `full` Run **proposes** entries; at finalize the Curator and the rules **decide** each Proposal, and only then can it become a Glossary entry or a Character Profile.
+- A review's **Issues** (a comment and a suggestion for one region) are kept in the Run's record. The editor does not show them yet (M7).
 
 ---
 
@@ -204,15 +212,38 @@ flowchart TD
     S -- provider_error or budget --> X["failed Run, nothing more is sent"]
 ```
 
+**The Orchestrator and finalize** (`translate_page` with config `full_no_kb` or `full`). The Orchestrator is plain code around the two agents; `full` adds the KB snapshot, read once before the page, and finalize after it (OUTLINE §3.2, §3.3, §3.6).
+
+```mermaid
+flowchart TD
+    K["full only: load_snapshot(kb_id), once; one ProposalCollector for the page"] -.-> T
+    T["first pass: flagging Translator, may fall back to baseline"] --> RV{"Reviewer: verdict on the current translation and its flags"}
+    RV -- approve --> DONE["the page's translation"]
+    RV -- unusable --> DONE
+    RV -- revise --> REV["Revision: Translator with the Issues (a Send-back, at most 2)"]
+    REV -- "usable, 1st Revision" --> RV
+    REV -- "usable, 2nd Revision: no 3rd review" --> DONE
+    REV -- "unusable: the previous translation stands" --> DONE
+    T -- "provider error or spent budget, in any stage" --> FAIL["failed Run: nothing stored, no finalize"]
+    DONE --> F{"config full?"}
+    F -- no --> FIN["finish_run: Translations stored"]
+    F -- yes --> C["Curator Agent: one call on the page's term proposals; skipped when there are none"]
+    C --> AP["curator.apply: the rules write the KB in one transaction; not called without proposals"]
+    AP --> FIN
+    AP -- raises --> CR["RunCrashed: Run failed, KB unchanged"]
+```
+
+A Curator without a usable answer does not stop the page: its terms stay undecided, and `curator.apply` still applies the rules to the rest.
+
 ---
 
 ## 4. Object Model
 
-The objects in the code and how they depend on each other (the actual structure at the end of M2).
+The objects in the code and how they depend on each other (the actual structure at the end of M3).
 
 ### 4.1 Backend
 
-Colors mark layers: blue = API, teal = eval, pink = service, green = pipeline, lime = agents, orange = LLM, purple = data, grey = tracing.
+Colors mark layers: blue = API, teal = eval, pink = service (`runs.py` and the Orchestrator), green = pipeline, lime = agents, brown = Knowledge Base, orange = LLM, purple = data, grey = tracing.
 
 ```mermaid
 classDiagram
@@ -257,6 +288,27 @@ classDiagram
         run_translator()
         get_previous_context
     }
+    class Orchestrator:::service {
+        run_orchestrator()
+        MAX_SEND_BACKS = 2
+    }
+    class OrchestratorResult:::service {
+        translations
+        send_backs
+        final_stop
+        proposals
+    }
+    class Reviewer:::agent {
+        run_reviewer()
+    }
+    class Curator:::agent {
+        run_curator()
+    }
+    class KBTools:::agent {
+        lookup_term
+        lookup_character
+        kb_snippets_part()
+    }
     class AgentLoop:::agent {
         run_agent()
     }
@@ -286,6 +338,20 @@ classDiagram
         records CallRecords
     }
     class PageBudget:::llm
+    class KBSnapshot:::kb {
+        entries
+        profiles
+    }
+    class ProposalCollector:::kb {
+        propose()
+    }
+    class KBLoader:::kb {
+        load_snapshot()
+    }
+    class CuratorRules:::kb {
+        apply()
+        RESULTS
+    }
     class Page:::data
     class Segment:::data
     class Store:::data {
@@ -293,6 +359,7 @@ classDiagram
         get_run()
         start_run()
         finish_run()
+        create_kb()
     }
     class SQLite:::data {
         books
@@ -300,6 +367,10 @@ classDiagram
         segments
         runs
         translations
+        kbs
+        glossary_entries
+        character_profiles
+        proposals
     }
     class Importer:::data {
         import_openmantra()
@@ -309,7 +380,7 @@ classDiagram
     PagesRouter ..> Runs : translate
     PagesRouter ..> Store : reads
     EvalHarness ..> Runs : validate, translate
-    EvalHarness ..> Store : reads Runs, Translations
+    EvalHarness ..> Store : reads Runs, Translations; makes the KB (full)
     EvalHarness ..> EvalOutputs : writes
     Runs ..> Tracing : page_span
     Tracing ..> Backend : exporter
@@ -317,8 +388,26 @@ classDiagram
     Runs ..> Store : Runs, Translations
     Runs ..> Baseline : config baseline
     Runs ..> Translator : config translator
+    Runs ..> Orchestrator : config full_no_kb, full
+    Runs ..> KBLoader : full, before the page
+    Runs ..> Curator : full, finalize
+    Runs ..> CuratorRules : full, finalize
+    Orchestrator ..> Translator : first pass, Revisions
+    Orchestrator ..> Reviewer : reviews
+    Orchestrator ..> ProposalCollector : one per page
+    Orchestrator ..> OrchestratorResult : returns
     Translator ..> AgentLoop : run_agent
     Translator ..> Baseline : fallback
+    Translator ..> KBTools : with a snapshot
+    Translator ..> ProposalCollector : propose_entry
+    Reviewer ..> AgentLoop : run_agent
+    Reviewer ..> KBTools : lookups only
+    Curator ..> AgentLoop : run_agent, no tools
+    Curator ..> KBTools : snippets part
+    KBTools ..> KBSnapshot : reads
+    KBLoader ..> Store : reads
+    KBLoader ..> KBSnapshot : builds
+    CuratorRules ..> Store : KB writes, one transaction
     Runs ..> Page : builds
     Baseline ..> Page : reads
     Baseline ..> LLMClient : chat
@@ -343,6 +432,7 @@ classDiagram
     classDef service fill:#fde8f1,stroke:#c4527f,color:#222
     classDef pipeline fill:#e6f4ea,stroke:#3a9d5d,color:#222
     classDef agent fill:#eef6d8,stroke:#7a9a2a,color:#222
+    classDef kb fill:#f6ece2,stroke:#a8743f,color:#222
     classDef llm fill:#fff4e0,stroke:#d08a2a,color:#222
     classDef data fill:#f1e9fb,stroke:#8a5fc4,color:#222
 ```
@@ -357,6 +447,9 @@ classDiagram
 - `Baseline` touches neither HTTP nor SQLite.
 - `AgentLoop` (`agents/loop.py`) is LangChain's `create_agent` with `LLMClientChatModel` as its model, so every agent call goes through `LLMClient` and is metered once; nothing in the loop retries. Its guardrails are the Step limit (`ModelCallLimitMiddleware`), a check that a reply ending for any reason other than `stop` or `tool_calls` is never an answer, and a tool guard that validates arguments against the `Tool`'s pydantic model, passes the model's mistakes back as the tool's result and does not run a duplicate call again. LangChain stays inside `agents/`: callers get an `AgentResult` of plain values with one step per model call. The Translator Agent is its one caller in the code (`scripts/m2_tool_smoke.py` is the other).
 - `Translator` (`agents/translator.py`) is the `translator` config: it gives `AgentLoop` the page (the same user message as `Baseline`) and `get_previous_context`, whose data `Runs` reads from `Store` before the run, so the tool touches no database in LangGraph's worker threads. It checks the answer with `parse_translations`, repairs it once, and otherwise falls back to `Baseline` with a budget of its own; after a provider error or a spent budget it sends nothing more. The Run's `attempts_json` holds the agent's steps, the repair and the fallback, and `EvalHarness` reports the pages that fell back.
+- `Orchestrator` (`orchestrator/flow.py`) runs `full_no_kb` and `full` as plain code: the flagging `Translator`, then `Reviewer` in a fresh conversation, then at most 2 Send-backs. It imports neither LangChain nor the database and returns an `OrchestratorResult` of plain values. With a `KBSnapshot` it makes the page's one `ProposalCollector`, gives the agents their KB tools through `KBTools`, and returns the page's proposals.
+- **Least privilege for the KB.** `Translator` and `Reviewer` get a `KBSnapshot` (immutable, no connection) and, for the Translator, a `ProposalCollector`. `KBLoader` and `CuratorRules` are the only KB modules that use `Store`, and a test checks that loading the agents or the Orchestrator never loads the database module. `CuratorRules.apply` is the only caller of the store's KB write functions, which another test checks.
+- **Finalize** (`full` only) is in `Runs`, after a successful page: `Curator` (one call on the Run's client, no tools; it judges the page's term proposals), then `CuratorRules.apply`, then `Store.finish_run`. `EvalHarness` makes one KB per `full` eval run and passes it to every page in order.
 
 ### 4.2 Frontend
 
@@ -401,19 +494,15 @@ classDiagram
 | Run | `runs` | No class of its own: `Runs.translate_page` writes the row through `Store.start_run` / `finish_run`, using `Meter.summary()` and `BaselineResult` | `RunOut` / `Run` |
 | Translation | `translations` | `BaselineResult.translations` or `TranslatorResult.translations` | `Segment.text_zh_hans` |
 | Manifest | none (`runs/eval/<id>/manifest.json`) | written by `run_eval` | none |
-| Knowledge Base | `kbs` | `kb_id`; `KBSnapshot` (`load_snapshot`) to read it | none yet |
+| Knowledge Base | `kbs` | `kb_id`; `KBSnapshot` (`load_snapshot`) to read it; one per `full` eval run | none yet |
 | Term entry / Character Profile | `glossary_entries` / `character_profiles` | `GlossaryEntry` / `CharacterProfile` (`kb/entities.py`) | none yet |
 | Proposal | `proposals` | `Proposal`, from `ProposalCollector`; written only by `curator.apply` | none yet |
-| Flag, Verdict / Issue | none (inside a `full_no_kb` Run's `attempts_json`) | `TranslatorResult.flags`, `ReviewResult` | none yet |
+| Flag, Verdict / Issue | none (inside a `full_no_kb` or `full` Run's `attempts_json`) | `TranslatorResult.flags`, `ReviewResult` | none yet |
+| Curator decision, proposal outcome | `proposals.status` and reason; also a `full` Run's `attempts_json` (`finalize`) | `CuratorResult.decisions`; `curator.Outcome` (one of 8 results) | none yet |
 
 ### 4.4 Where later milestones plug in
 
 - **M2 (done):** `Translator` built on `AgentLoop` runs beside `Baseline`, and `Tracing` wraps every `translate_page`. `LLMClient`, `Meter` and `PageBudget` stayed as they were, and every agent call goes through them. `Runs.translate_page` picks the pipeline by `config`, and `EvalHarness` accepts each config in `runs.CONFIGS`. An Orchestrator (`orchestrator/` in OUTLINE §6) comes with the Reviewer in M3.
-- **M3 (in progress):**
-  - **Built.**
-    - `Reviewer` (`agents/reviewer.py`), and the `Orchestrator` (`orchestrator/flow.py`), which `Runs.translate_page` calls for `full_no_kb`.
-    - The KB's storage in `kb/`, with `curator.apply` as its only writer.
-    - The KB tools: `Orchestrator` takes a `KBSnapshot`, gives both agents its lookups, gives the Translator a `ProposalCollector`, and returns the page's proposals.
-  - **Next.** The Curator's model call at finalize, and `curator.apply`. `runs.config` `full`, which loads the snapshot for an eval run's KB and is the Orchestrator with the KB on.
-  - The diagrams above still show M2's objects.
+- **M3 (done):** `Orchestrator`, `Reviewer` and `Curator` sit between `Runs` and `AgentLoop`, and the KB modules sit beside `Store`. `Runs.translate_page` gained the configs `full_no_kb` and `full`; for `full` it also loads the snapshot and runs finalize. Nothing in `LLMClient`, `AgentLoop` or the API changed shape: the editor still runs `baseline`.
+- **M4–M5:** COMET, term accuracy and GEMBA-MQM plug into `EvalHarness` and `evaluation/`; prompt tuning changes the agents' prompts and re-baselines the pinned request digests.
 - **M7:** the frontend adds a canvas and editing to `PageView`, plus SSE, which adds an event subscription to the `api` module.

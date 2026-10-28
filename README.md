@@ -4,15 +4,15 @@ English | [简体中文](README.zh-CN.md)
 
 A multi-agent manga translation editor (Japanese → Simplified Chinese), evaluated on the [OpenMantra](https://github.com/mantra-inc/open-mantra-dataset) dataset against a single-call baseline with a standard MT evaluation framework.
 
-> **Status (2026-10-28):** M0, M1 and M2 are done. The vertical slice works end to end: import OpenMantra, translate a page with one model call, and check every line against its box in the browser. M2 added an eval harness that scores configs with chrF / BLEU, a first Translator Agent (the `translator` config) on a tool-calling loop over our metered client, and optional tracing in a local Arize Phoenix ([record](docs/m2.md)). M3 is under way: a gold glossary for the two dev books, a Reviewer Agent, an Orchestrator that runs the `full_no_kb` config, the Knowledge Base's storage, and the agents' KB tools exist; the Curator, the KB write and the `full` config come next.
+> **Status (2026-10-28):** M0, M1 and M2 are done. The vertical slice works end to end: import OpenMantra, translate a page with one model call, and check every line against its box in the browser. M2 added an eval harness that scores configs with chrF / BLEU, a first Translator Agent (the `translator` config) on a tool-calling loop over our metered client, and optional tracing in a local Arize Phoenix ([record](docs/m2.md)). M3 added the multi-agent system ([record](docs/m3.md)): a Reviewer Agent, an Orchestrator that sends pages back for revision, a per-book Knowledge Base with a Curator Agent as its only writer, the `full` and `full_no_kb` configs, and a gold glossary for the two dev books. Next is M4: scoring all three configs on the two dev books.
 
 ## What it does
 
 - **Translate a page in context.** The model sees the whole page image together with the Japanese text and box of every speech bubble, and returns a Simplified Chinese line for each box.
 - **Check it where it belongs.** The editor draws each box on the page and lists source, translation and reference side by side.
 - **A first Translator Agent (M2).** The `translator` config gives the model the same page plus a tool that reads the earlier pages; a bad answer is repaired once, and otherwise the page falls back to `baseline`, visibly.
-- **Translate, review, revise (M3, in progress).** In the `full_no_kb` config an Orchestrator, plain code, runs the Translator, then a Reviewer Agent. The Reviewer works in an independent context: it sees the page, the translation and the regions the Translator flagged as uncertain, never the Translator's reasoning, and comments in Simplified Chinese. A page it sends back is revised, at most twice.
-- **Planned (M3):** the `full` config, in which the agents use a per-book Knowledge Base: the Translator looks up and proposes Glossary entries and Character Profiles, the Reviewer looks them up, and a Curator Agent is the only writer. The storage, the write rules and the agents' tools exist; no config uses them yet.
+- **Translate, review, revise (M3).** In the `full_no_kb` config an Orchestrator, plain code, runs the Translator, then a Reviewer Agent. The Reviewer works in an independent context: it sees the page, the translation and the regions the Translator flagged as uncertain, never the Translator's reasoning, and comments in Simplified Chinese. A page it sends back is revised, at most twice.
+- **A Knowledge Base that fills page by page (M3).** In the `full` config the agents share a per-book Knowledge Base. The Translator looks up Glossary entries and Character Profiles and proposes new ones; the Reviewer can only look them up. Once a page is done, a Curator Agent accepts or rejects each proposed term with a reason, and code rules write the KB once. They send every name, and every conflict with an existing entry, to a person instead. `full_no_kb` is the same system with the KB off, for the ablation.
 
 ## How it is evaluated
 
@@ -28,6 +28,7 @@ Fukidashi is evaluated as a product, not as a research experiment (details in [O
 - **No reference leakage.** Prompts contain only the Japanese text and boxes; the reference translations stored next to them never reach a prompt, and a test checks it.
 - **Runs are recorded, not overwritten.** A Run is inserted as `running` and finished as `succeeded` or `failed`; a failed Run keeps the raw responses, and the page keeps showing the last good translation.
 - **An agent loop that keeps the metering.** Tool calls run on LangChain's `create_agent`, but its model is a thin adapter over `LLMClient`, so every agent call is metered like any other and DeepSeek's reasoning is passed back as its API requires. Guardrails: a step limit, the token budget, duplicate-call detection, and a truncated reply is never taken as an answer.
+- **One writer for the Knowledge Base.** The agents get a read-only snapshot and a way to propose, never a database connection, and a test checks that loading them does not load the database module. Only the Curator's rules write, once per page, after the page is final; names and conflicts wait for a person.
 - **Traces that stay local.** Optional tracing sends one trace per page to an Arize Phoenix on this machine through OpenTelemetry. Page images and the API key are stripped from every span, and the backend is one exporter, so it can be swapped later.
 - **Swappable provider.** Any OpenAI-compatible model with vision, tool calling and JSON output works through `.env`; the current choice is DeepSeek `deepseek-flash` (about $0.0006 per page).
 
@@ -54,9 +55,10 @@ Pick a page and click Translate: the backend runs `baseline` on that page (one c
 uv run python eval/run.py --config baseline --book tojime_no_siora --pages 2,3,4     # real calls: one per page
 uv run python eval/run.py --config translator --book tojime_no_siora --pages 2,3,4   # the Translator Agent: a few calls per page
 uv run python eval/run.py --config full_no_kb --book tojime_no_siora --pages 2,3,4   # Translator + Reviewer: a few more
+uv run python eval/run.py --config full --book tojime_no_siora --pages 2,3,4         # the same with a Knowledge Base and the Curator
 ```
 
-The eval harness translates those pages through the same code path as the editor (each page leaves a Run in SQLite), converts the zh-Hant reference translations to zh-Hans with OpenCC (`t2s`), and prints chrF and BLEU with their sacreBLEU signatures, plus cost per page and latency; for `translator` and `full_no_kb` it also counts the pages that fell back to `baseline`, and for `full_no_kb` how often the Reviewer sent a page back and why the loop stopped. The Manifest, per-Segment outputs and scores go to `runs/eval/<id>/`. The exit code is non-zero if a page failed or the harness could not start.
+The eval harness translates those pages through the same code path as the editor (each page leaves a Run in SQLite), converts the zh-Hant reference translations to zh-Hans with OpenCC (`t2s`), and prints chrF and BLEU with their sacreBLEU signatures, plus cost per page and latency; for the agent configs it also counts the pages that fell back to `baseline`, and for `full_no_kb` and `full` how often the Reviewer sent a page back and why the loop stopped. A `full` eval starts from a new, empty Knowledge Base, passes it through the pages in order, and reports what the Curator decided and what the KB holds at the end. The Manifest, per-Segment outputs and scores go to `runs/eval/<id>/`. The exit code is non-zero if a page failed or the harness could not start.
 
 Optional tracing: one trace per translated page (every model call, agent step and tool call) in an [Arize Phoenix](https://github.com/Arize-ai/phoenix) running on your machine. Start Phoenix in another terminal, set `FUKIDASHI_TRACING=phoenix` (in the shell or `.env`), and open http://localhost:6006:
 
@@ -80,7 +82,7 @@ uv run python eval/glossary.py check                # check the gold glossaries 
 | M0 Decisions & first call | 10/18 | Done ([record](docs/m0.md)) |
 | M1 Vertical slice: page → `baseline` → browser | 10/25 | Done ([record](docs/m1.md)) |
 | M2 Agent layer & eval harness | 11/1 | Done ([record](docs/m2.md)) |
-| M3 Knowledge Base & Reviewer | 11/8 | In progress |
+| M3 Knowledge Base & Reviewer | 11/8 | Done ([record](docs/m3.md)) |
 | M4–M5 Dev evaluation, protocol freeze | 11/22 | Planned |
 | M6–M8 Test run, editor productization, analysis | 1/3 | Planned |
 | M9 Report & release | 1/17 | Planned |
