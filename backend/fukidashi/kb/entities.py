@@ -2,9 +2,10 @@
 
 Nothing here touches a database or a model. An entry or a profile is an immutable value, so a snapshot made of them can
 be shared with worker threads. A proposal's payload is validated and normalised (NFKC, trimmed) when the proposal is
-made, and its id is a hash of the KB, the page index, the kind and the normalised pair, so the same proposal on the same
-page always has the same id (a retry never writes twice) and the same pair on another page, or in another KB, has
-another.
+made, and every string in it must be one line (no newline, tab or other control character), because a stored entry
+reaches an agent's prompt as one snippet line. Its id is a hash of the KB, the page index, the kind and the normalised
+pair, so the same proposal on the same page always has the same id (a retry never writes twice) and the same pair on
+another page, or in another KB, has another.
 """
 
 from __future__ import annotations
@@ -18,7 +19,8 @@ from types import MappingProxyType
 from typing import Annotated, Any
 
 from pydantic import (
-    BaseModel, BeforeValidator, ConfigDict, Field, StringConstraints, ValidationError, ValidationInfo, field_validator,
+    AfterValidator, BaseModel, BeforeValidator, ConfigDict, Field, StringConstraints, ValidationError, ValidationInfo,
+    field_validator,
 )
 
 APPROVED = "approved"
@@ -51,12 +53,30 @@ def _trim(value: Any) -> Any:
     return value.strip() if isinstance(value, str) else value
 
 
+# What breaks a line: control characters (category Cc: \n, \r, \t, ...) and the Unicode line and paragraph separators,
+# which `str.splitlines` also splits on.
+_LINE_BREAKING = ("Cc", "Zl", "Zp")
+
+
+def _one_line(value: str) -> str:
+    """Refuse a control character inside a value. A stored entry reaches an agent's prompt as exactly one snippet line,
+    so a value must not be able to end that line and start another. (Leading and trailing whitespace is already
+    trimmed, so this is about a character in the middle.)"""
+    bad = next((c for c in value if unicodedata.category(c) in _LINE_BREAKING), None)
+    if bad is not None:
+        raise ValueError(f"must be one line of text, without a newline, a tab or another control character "
+                         f"(found U+{ord(bad):04X})")
+    return value
+
+
 # Trimmed by the BeforeValidator, not by StringConstraints(strip_whitespace=True): behind a BeforeValidator that let
 # a blank string through as an empty one (pydantic 2.14), past min_length.
-Name = Annotated[str, BeforeValidator(_nfkc), StringConstraints(min_length=1, max_length=MAX_NAME_CHARS)]
-Category = Annotated[str, BeforeValidator(_nfkc), StringConstraints(max_length=MAX_CATEGORY_CHARS)]
+Name = Annotated[str, BeforeValidator(_nfkc), StringConstraints(min_length=1, max_length=MAX_NAME_CHARS),
+                 AfterValidator(_one_line)]
+Category = Annotated[str, BeforeValidator(_nfkc), StringConstraints(max_length=MAX_CATEGORY_CHARS),
+                     AfterValidator(_one_line)]
 # Notes are prose in the target language: NFKC would turn its full-width punctuation into ASCII, so only trim.
-Notes = Annotated[str, BeforeValidator(_trim), StringConstraints(max_length=MAX_NOTES_CHARS)]
+Notes = Annotated[str, BeforeValidator(_trim), StringConstraints(max_length=MAX_NOTES_CHARS), AfterValidator(_one_line)]
 
 
 class TermPayload(BaseModel):
@@ -163,6 +183,9 @@ def make_proposal(kb_id: int, page_index: int, kind: str, payload: Mapping[str, 
     act on, for an unknown kind or a payload that does not fit."""
     if kind not in PAYLOADS:
         raise ValueError(f"unknown kind {kind!r}; use one of {', '.join(KINDS)}")
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"invalid {kind} proposal: payload: Input should be an object with the fields of a {kind}, "
+                         f"not {type(payload).__name__}")
     try:
         clean = PAYLOADS[kind].model_validate(dict(payload)).model_dump()
     except ValidationError as exc:

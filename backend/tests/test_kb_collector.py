@@ -89,6 +89,62 @@ def test_an_invalid_payload_is_refused_with_a_message_and_nothing_is_kept(kind, 
     assert collector.proposals == ()
 
 
+# Task 014 (task 013's review, finding 1): these lines reach a prompt, so a stored entry must be exactly one line.
+CONTROL_CHARACTERS = ["\n", "\r", "\t", "\r\n", "\x00", "\x0b", "\x0c", "\x1b", "\x1f", "\x7f", "\x85", " ", " "]
+FIELDS = [   # kind, a payload with `{}` where the field under test goes, the path the message names
+    ("term", {"source_term": "{}", "target_term": "x"}, "source_term"),
+    ("term", {"source_term": "a", "target_term": "{}"}, "target_term"),
+    ("term", {"source_term": "a", "target_term": "x", "category": "{}"}, "category"),
+    ("character", {"name_src": "{}", "name_tgt": "x"}, "name_src"),
+    ("character", {"name_src": "a", "name_tgt": "{}"}, "name_tgt"),
+    ("character", {"name_src": "a", "name_tgt": "x", "aliases": ["b", "{}"]}, "aliases.1"),
+    ("character", {"name_src": "a", "name_tgt": "x", "notes": "{}"}, "notes"),
+]
+
+
+def with_value(payload, text):
+    return {k: ([v.replace("{}", text) for v in value] if isinstance(value, list) else value.replace("{}", text))
+            for k, value in payload.items()}
+
+
+@pytest.mark.parametrize("character", CONTROL_CHARACTERS,
+                         ids=[f"U+{ord(c[0]):04X}{'+' if len(c) > 1 else ''}" for c in CONTROL_CHARACTERS])
+@pytest.mark.parametrize("kind, payload, path", FIELDS, ids=[f[2] for f in FIELDS])
+def test_a_control_character_inside_any_payload_field_is_refused_with_a_message_and_nothing_is_kept(
+        kind, payload, path, character):
+    collector = ProposalCollector(1, 3)
+    inside = "封" + character + "印"   # inside the value: at its ends, whitespace is trimmed (see the next test)
+
+    with pytest.raises(ValueError, match=rf"invalid {kind} proposal: {path}: .*one line of text") as refused:
+        collector.add(kind, with_value(payload, inside))
+
+    assert "newline" in str(refused.value) and collector.proposals == ()
+
+
+@pytest.mark.parametrize("kind, payload, path", FIELDS, ids=[f[2] for f in FIELDS])
+def test_whitespace_at_the_ends_of_a_value_is_trimmed_not_refused_and_the_stored_value_is_one_line(kind, payload, path):
+    proposal = ProposalCollector(1, 3).add(kind, with_value(payload, "\n\t 封印 \r\n"))[0]
+
+    stored = []
+    for value in proposal.payload.values():
+        stored += value if isinstance(value, list) else [value]
+    assert "封印" in stored and all(len(v.splitlines()) <= 1 for v in stored)
+
+
+@pytest.mark.parametrize("payload", [None, "封印", ["封印"], 5, 1.5, True, ("封印", "封印")],
+                         ids=["null", "text", "list", "int", "float", "bool", "tuple"])
+@pytest.mark.parametrize("kind", ["term", "character"])
+def test_a_payload_that_is_not_a_mapping_is_refused_with_the_usual_message_not_a_type_error(kind, payload):
+    collector = ProposalCollector(1, 3)
+
+    with pytest.raises(ValueError, match=rf"^invalid {kind} proposal: payload: Input should be an object") as refused:
+        collector.add(kind, payload)
+    with pytest.raises(ValueError, match=f"^invalid {kind} proposal: payload"):
+        make_proposal(1, 3, kind, payload, "translator")
+
+    assert type(payload).__name__ in str(refused.value) and collector.proposals == ()
+
+
 def test_a_character_payload_is_cleaned():
     proposal = ProposalCollector(1, 3).add("character", {
         "name_src": "ユキ", "name_tgt": "小雪", "aliases": ["ユキ", " ゆき ", "ゆき", "ﾕｷ"], "notes": " 说话，温柔 ",

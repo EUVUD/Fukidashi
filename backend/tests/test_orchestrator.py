@@ -126,13 +126,15 @@ def test_the_run_records_every_budget_and_the_send_back_limit(imported, root):
     assert provider.bodies[0]["max_tokens"] == provider.bodies[1]["max_tokens"] == 99
 
 
-def test_the_knowledge_base_is_off_and_cannot_be_switched_on_yet(page_for):
-    provider = Provider(answer(zh_json(3)))
+def test_the_knowledge_base_is_off_unless_a_snapshot_is_given(page_for):
+    # was: `use_kb=True` was refused, because there was no KB; the switch is now the `kb` snapshot (test_kb_tools.py)
+    provider = Provider(answer(zh_json(3)), answer(APPROVE))
 
-    with pytest.raises(ValueError, match="Knowledge Base"):
-        orchestrator.run_orchestrator(page_for(3), mock_llm_client(provider), use_kb=True)
+    result = orchestrator.run_orchestrator(page_for(3), mock_llm_client(provider))
 
-    assert provider.bodies == []
+    assert result.ok and result.attempts["config"] == "full_no_kb" and result.proposals == ()
+    assert [t["function"]["name"] for t in provider.bodies[0]["tools"]] == ["get_previous_context", "flag_uncertain"]
+    assert "tools" not in provider.bodies[1]
 
 
 def test_the_earlier_pages_are_the_ones_of_the_same_config(imported, root):
@@ -147,6 +149,22 @@ def test_the_earlier_pages_are_the_ones_of_the_same_config(imported, root):
     result = json.loads(tool_result(provider.bodies[1], "call_3"))
     assert [p["translated"] for p in result["pages"]] == [True, True]
     assert result["pages"][1]["regions"][0]["zh"] == zh(2, 0)  # not the later `translator` Run's "译文2-0别"
+
+
+def test_a_revisions_get_previous_context_returns_the_same_earlier_pages_as_the_first_pass(imported, root):
+    # task 012's review, finding 1: no test failed when the revision stopped getting `previous`
+    for page_index in (1, 2):
+        assert run_page(imported, root, Provider(answer(zh_json(page_index)), answer(APPROVE)), page_index)[0].result.ok
+    in_the_revision = call("call_r", {"pages_back": 2}, name="get_previous_context")
+    provider = Provider(answer(zh_json(3)), answer(REVISE_TWO), ask(in_the_revision), answer(zh_json(3, "改")),
+                        answer(APPROVE))
+
+    outcome, _ = run_page(imported, root, provider)
+
+    assert outcome.result.ok and [who(b) for b in provider.bodies] == ["translate", "review", "revise", "revise", "review"]
+    result = json.loads(tool_result(provider.bodies[3], "call_r"))
+    assert [(p["page_index"], p["translated"]) for p in result["pages"]] == [(1, True), (2, True)]
+    assert result["pages"][0]["regions"][0]["zh"] == zh(1, 0) and result["pages"][1]["regions"][1]["zh"] == zh(2, 1)
 
 
 # --- AC2: send-backs ------------------------------------------------------------------------------------------------
