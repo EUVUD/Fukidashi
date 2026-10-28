@@ -410,6 +410,10 @@ classDiagram
 
 - **M2 (done):** `Translator` built on `AgentLoop` runs beside `Baseline`, and `Tracing` wraps every `translate_page`. `LLMClient`, `Meter` and `PageBudget` stayed as they were, and every agent call goes through them. `Runs.translate_page` picks the pipeline by `config`, and `EvalHarness` accepts each config in `runs.CONFIGS`. An Orchestrator (`orchestrator/` in OUTLINE §6) comes with the Reviewer in M3.
 - **M3 (in progress):**
-  - **Built.** `Reviewer` (`agents/reviewer.py`) and the `Orchestrator` (`orchestrator/flow.py`), which `Runs.translate_page` calls for `full_no_kb`. The KB's storage in `kb/`, with `curator.apply` as its only writer.
-  - **Next.** The KB tools for the Translator and the Reviewer, over a `KBSnapshot`. The Curator's model call at finalize. `runs.config` `full`, which is the Orchestrator with the KB on. The diagrams above still show M2's objects.
+  - **Built.**
+    - `Reviewer` (`agents/reviewer.py`), and the `Orchestrator` (`orchestrator/flow.py`), which `Runs.translate_page` calls for `full_no_kb`.
+    - The KB's storage in `kb/`, with `curator.apply` as its only writer.
+    - The KB tools: `Orchestrator` takes a `KBSnapshot`, gives both agents its lookups, gives the Translator a `ProposalCollector`, and returns the page's proposals.
+  - **Next.** The Curator's model call at finalize, and `curator.apply`. `runs.config` `full`, which loads the snapshot for an eval run's KB and is the Orchestrator with the KB on.
+  - The diagrams above still show M2's objects.
 - **M7:** the frontend adds a canvas and editing to `PageView`, plus SSE, which adds an event subscription to the `api` module.
