@@ -401,9 +401,15 @@ classDiagram
 | Run | `runs` | No class of its own: `Runs.translate_page` writes the row through `Store.start_run` / `finish_run`, using `Meter.summary()` and `BaselineResult` | `RunOut` / `Run` |
 | Translation | `translations` | `BaselineResult.translations` or `TranslatorResult.translations` | `Segment.text_zh_hans` |
 | Manifest | none (`runs/eval/<id>/manifest.json`) | written by `run_eval` | none |
+| Knowledge Base | `kbs` | `kb_id`; `KBSnapshot` (`load_snapshot`) to read it | none yet |
+| Term entry / Character Profile | `glossary_entries` / `character_profiles` | `GlossaryEntry` / `CharacterProfile` (`kb/entities.py`) | none yet |
+| Proposal | `proposals` | `Proposal`, from `ProposalCollector`; written only by `curator.apply` | none yet |
+| Flag, Verdict / Issue | none (inside a `full_no_kb` Run's `attempts_json`) | `TranslatorResult.flags`, `ReviewResult` | none yet |
 
 ### 4.4 Where later milestones plug in
 
 - **M2 (done):** `Translator` built on `AgentLoop` runs beside `Baseline`, and `Tracing` wraps every `translate_page`. `LLMClient`, `Meter` and `PageBudget` stayed as they were, and every agent call goes through them. `Runs.translate_page` picks the pipeline by `config`, and `EvalHarness` accepts each config in `runs.CONFIGS`. An Orchestrator (`orchestrator/` in OUTLINE §6) comes with the Reviewer in M3.
-- **M3:** the `KB` (Glossary, Character Profiles, Proposal Queue) and the Reviewer / Curator Agents; `runs.config` gains `full` and `full_no_kb`.
+- **M3 (in progress):**
+  - **Built.** `Reviewer` (`agents/reviewer.py`) and the `Orchestrator` (`orchestrator/flow.py`), which `Runs.translate_page` calls for `full_no_kb`. The KB's storage in `kb/`, with `curator.apply` as its only writer.
+  - **Next.** The KB tools for the Translator and the Reviewer, over a `KBSnapshot`. The Curator's model call at finalize. `runs.config` `full`, which is the Orchestrator with the KB on. The diagrams above still show M2's objects.
 - **M7:** the frontend adds a canvas and editing to `PageView`, plus SSE, which adds an event subscription to the `api` module.

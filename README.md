@@ -4,15 +4,15 @@ English | [简体中文](README.zh-CN.md)
 
 A multi-agent manga translation editor (Japanese → Simplified Chinese), evaluated on the [OpenMantra](https://github.com/mantra-inc/open-mantra-dataset) dataset against a single-call baseline with a standard MT evaluation framework.
 
-> **Status (2026-10-28):** M0, M1 and M2 are done. The vertical slice works end to end: import OpenMantra, translate a page with one model call, and check every line against its box in the browser. M2 added an eval harness that scores configs with chrF / BLEU, a first Translator Agent (the `translator` config) on a tool-calling loop over our metered client, and optional tracing in a local Arize Phoenix ([record](docs/m2.md)). M3 is under way: a gold glossary for the two dev books and a Reviewer Agent exist; the Orchestrator and the Knowledge Base come next.
+> **Status (2026-10-28):** M0, M1 and M2 are done. The vertical slice works end to end: import OpenMantra, translate a page with one model call, and check every line against its box in the browser. M2 added an eval harness that scores configs with chrF / BLEU, a first Translator Agent (the `translator` config) on a tool-calling loop over our metered client, and optional tracing in a local Arize Phoenix ([record](docs/m2.md)). M3 is under way: a gold glossary for the two dev books, a Reviewer Agent, an Orchestrator that runs the `full_no_kb` config, and the Knowledge Base's storage exist; the KB tools, the Curator and the `full` config come next.
 
 ## What it does
 
 - **Translate a page in context.** The model sees the whole page image together with the Japanese text and box of every speech bubble, and returns a Simplified Chinese line for each box.
 - **Check it where it belongs.** The editor draws each box on the page and lists source, translation and reference side by side.
 - **A first Translator Agent (M2).** The `translator` config gives the model the same page plus a tool that reads the earlier pages; a bad answer is repaired once, and otherwise the page falls back to `baseline`, visibly.
-- **A Reviewer Agent (M3, in progress).** It checks a page's translation in an independent context: it sees the page, the translation and the regions the Translator flagged as uncertain, never the Translator's reasoning. It is not part of a config yet.
-- **Planned (M3):** an Orchestrator that runs translate → review → finalize, tools for a Glossary and Character Profiles, and a Curator Agent that is the only writer of the per-book Knowledge Base.
+- **Translate, review, revise (M3, in progress).** In the `full_no_kb` config an Orchestrator, plain code, runs the Translator, then a Reviewer Agent. The Reviewer works in an independent context: it sees the page, the translation and the regions the Translator flagged as uncertain, never the Translator's reasoning, and comments in Simplified Chinese. A page it sends back is revised, at most twice.
+- **Planned (M3):** tools for a Glossary and Character Profiles, and a Curator Agent that is the only writer of the per-book Knowledge Base (its storage and write rules exist; nothing uses them yet).
 
 ## How it is evaluated
 
@@ -53,9 +53,10 @@ Pick a page and click Translate: the backend runs `baseline` on that page (one c
 ```bash
 uv run python eval/run.py --config baseline --book tojime_no_siora --pages 2,3,4     # real calls: one per page
 uv run python eval/run.py --config translator --book tojime_no_siora --pages 2,3,4   # the Translator Agent: a few calls per page
+uv run python eval/run.py --config full_no_kb --book tojime_no_siora --pages 2,3,4   # Translator + Reviewer: a few more
 ```
 
-The eval harness translates those pages through the same code path as the editor (each page leaves a Run in SQLite), converts the zh-Hant reference translations to zh-Hans with OpenCC (`t2s`), and prints chrF and BLEU with their sacreBLEU signatures, plus cost per page and latency; for `translator` it also counts the pages that fell back to `baseline`. The Manifest, per-Segment outputs and scores go to `runs/eval/<id>/`. The exit code is non-zero if a page failed or the harness could not start.
+The eval harness translates those pages through the same code path as the editor (each page leaves a Run in SQLite), converts the zh-Hant reference translations to zh-Hans with OpenCC (`t2s`), and prints chrF and BLEU with their sacreBLEU signatures, plus cost per page and latency; for `translator` and `full_no_kb` it also counts the pages that fell back to `baseline`, and for `full_no_kb` how often the Reviewer sent a page back and why the loop stopped. The Manifest, per-Segment outputs and scores go to `runs/eval/<id>/`. The exit code is non-zero if a page failed or the harness could not start.
 
 Optional tracing: one trace per translated page (every model call, agent step and tool call) in an [Arize Phoenix](https://github.com/Arize-ai/phoenix) running on your machine. Start Phoenix in another terminal, set `FUKIDASHI_TRACING=phoenix` (in the shell or `.env`), and open http://localhost:6006:
 
