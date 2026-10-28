@@ -6,16 +6,21 @@ agent stopped without an answer (Step limit, a cut-off reply), the page is trans
 attempts record says so (OUTLINE §3.4). After a provider error or a spent budget nothing more is sent: the request may
 have been billed, and OUTLINE §3.6 leaves resending to the user.
 
+With the `flagging` switch on, the agent also has `flag_uncertain`, which marks regions for the Reviewer to look at
+closely (OUTLINE §3.2). The switch is off for the `translator` config, so its requests stay what they were in M2.
+
 This module imports no LangChain and no database: the earlier pages are read by the caller before the run starts,
 because tool handlers run in LangGraph worker threads.
 """
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from typing import Annotated
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 
 from ..datasets.openmantra import Page
 from ..llm.client import LLMClient
@@ -27,12 +32,25 @@ from .loop import BUDGET, DEFAULT_MAX_STEPS, FINAL, PROVIDER_ERROR, Tool, run_ag
 CONFIG_NAME = "translator"
 DEFAULT_PAGE_BUDGET = 60_000  # tokens for the agent and its repair; the fallback has its own (baseline's)
 MAX_PAGES_BACK = 2
+MAX_REASON_CHARS = 200
 
 SYSTEM_PROMPT = """You translate Japanese manga dialogue into Simplified Chinese (zh-Hans).
 You get one page image and its text regions. Each region has an id, a bounding box [x, y, w, h] in pixels, and the Japanese text.
 Use the image for context: who is speaking, their tone, and what is happening. Translate every region into natural spoken Chinese that fits a speech bubble.
 
 You have one tool, get_previous_context. It returns the Japanese text of up to two earlier pages of this book, and their Chinese translation when there is one. Call it when this page alone leaves something open: a sentence that continues from the previous page, who is speaking, how a name or a term was rendered before. Skip it when the page is clear. When you use what it returns, keep names, terms and speech style consistent with it. The same call always returns the same result, so do not repeat one.
+
+When you are done, answer with only JSON in this shape, with one entry per region id of this page:
+{"translations": [{"id": 0, "zh": "..."}]}"""
+
+# The system prompt when `flagging` is on: the same, with flag_uncertain described next to get_previous_context.
+FLAG_SYSTEM_PROMPT = """You translate Japanese manga dialogue into Simplified Chinese (zh-Hans).
+You get one page image and its text regions. Each region has an id, a bounding box [x, y, w, h] in pixels, and the Japanese text.
+Use the image for context: who is speaking, their tone, and what is happening. Translate every region into natural spoken Chinese that fits a speech bubble.
+
+You have two tools.
+get_previous_context returns the Japanese text of up to two earlier pages of this book, and their Chinese translation when there is one. Call it when this page alone leaves something open: a sentence that continues from the previous page, who is speaking, how a name or a term was rendered before. Skip it when the page is clear. When you use what it returns, keep names, terms and speech style consistent with it. The same call always returns the same result, so do not repeat one.
+flag_uncertain marks one region of this page that you are not sure you translated well: an ambiguous line, a name or term you had to guess, a speaker or tone you could not tell, a pun or an allusion. Give the region id and a short reason in one sentence. A reviewer reads your flags and looks closely at the flagged regions, so flag only the regions that need that, each once, and not the ones you are confident about. A flag does not replace a translation: every region still needs one in your answer.
 
 When you are done, answer with only JSON in this shape, with one entry per region id of this page:
 {"translations": [{"id": 0, "zh": "..."}]}"""
@@ -87,11 +105,54 @@ def previous_context_tool(previous: Sequence[PreviousPage], page_index: int) -> 
     )
 
 
+class FlagUncertainArgs(BaseModel):
+    id: int = Field(description="The id of the region on this page that you are not sure about.")
+    reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_REASON_CHARS)] = Field(
+        description=f"Why, in one short sentence (at most {MAX_REASON_CHARS} characters).",
+    )
+
+
+class FlagCollector:
+    """The flags one run collects through `flag_uncertain`, for the region ids of one page.
+
+    The calls of one reply run in parallel worker threads, so the list is guarded by a lock. An id that is not on the
+    page raises, which the loop passes back to the model as the tool's result; nothing is recorded then.
+    """
+
+    def __init__(self, ids: Sequence[int]):
+        self._ids = frozenset(ids)
+        self._lock = threading.Lock()
+        self._flags: list[dict] = []
+
+    def tool(self) -> Tool:
+        def flag_uncertain(id: int, reason: str) -> dict:
+            if id not in self._ids:
+                raise ValueError(f"region {id} is not on this page; the region ids are {sorted(self._ids)}")
+            with self._lock:
+                self._flags.append({"id": id, "reason": reason})
+            return {"flagged": id}
+
+        return Tool(
+            name="flag_uncertain",
+            description="Mark one region of this page that you are not sure you translated well, with a short reason. "
+                        "A reviewer will look closely at the flagged regions.",
+            args=FlagUncertainArgs,
+            handler=flag_uncertain,
+        )
+
+    @property
+    def flags(self) -> list[dict]:
+        """The flags so far as {"id", "reason"}, in region order (calls that run side by side have no order of their own)."""
+        with self._lock:
+            return sorted(self._flags, key=lambda f: f["id"])  # stable: one region's flags keep the order they came in
+
+
 @dataclass
 class TranslatorResult:
     translations: dict[int, str] | None  # region id -> zh-Hans; None when the run failed
     attempts: dict  # what `runs.py` stores: see run_translator
     error: str | None = None  # why translations is None
+    flags: list[dict] = field(default_factory=list)  # {"id", "reason"}; see run_translator
 
     @property
     def ok(self) -> bool:
@@ -112,6 +173,7 @@ def run_translator(
     fallback_budget: int = baseline.DEFAULT_PAGE_BUDGET,
     max_tokens: int = baseline.DEFAULT_MAX_TOKENS,
     max_steps: int = DEFAULT_MAX_STEPS,
+    flagging: bool = False,
 ) -> TranslatorResult:
     """Translate one page. Never raises for provider errors or bad output: they end up in `error`.
 
@@ -120,14 +182,23 @@ def run_translator(
       "repair": null | {"error", "record", "raw", "parse_error"},        # the one repair call, an attempt
       "fallback": null | {"reason", "attempts"}}                         # `attempts` are run_baseline's
     The agent and its repair share one budget of `agent_budget` tokens; the fallback gets its own.
+
+    With `flagging` on, the agent also has `flag_uncertain` (and `FLAG_SYSTEM_PROMPT` says so), and `flags` holds what
+    it flagged: {"id", "reason"}, in region order. Flags count only when the page's answer is the agent's or its repair's;
+    after a fallback, or a failed run, `flags` is empty (the agent's steps still show the calls). With it off, which
+    is the default, the requests are the M2 `translator`'s.
     """
     ids = [s.index for s in page.segments]
     budget = PageBudget(page.page_id, agent_budget)
+    tools = [previous_context_tool(previous, page.page_index)]
+    collector = FlagCollector(ids) if flagging else None
+    if collector is not None:
+        tools.append(collector.tool())
     agent = run_agent(
         client, budget,
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=FLAG_SYSTEM_PROMPT if flagging else SYSTEM_PROMPT,
         user_message=baseline.build_messages(page)[1]["content"],  # the user message baseline sends, unchanged
-        tools=[previous_context_tool(previous, page.page_index)],
+        tools=tools,
         max_tokens=max_tokens, json_output=True, max_steps=max_steps,
     )
     record: dict = {
@@ -142,7 +213,8 @@ def run_translator(
 
     if agent.stop_reason == FINAL:
         try:
-            return TranslatorResult(baseline.parse_translations(agent.text, ids), record)
+            return TranslatorResult(baseline.parse_translations(agent.text, ids), record,
+                                    flags=collector.flags if collector is not None else [])
         except PARSE_ERRORS as e:
             answer_error = str(e)
         record["agent"]["answer_parse_error"] = answer_error
@@ -159,7 +231,8 @@ def run_translator(
             return TranslatorResult(None, record, e.description)
         record["repair"] = {"error": None, "record": asdict(reply.record), "raw": reply.text, "parse_error": None}
         try:
-            return TranslatorResult(baseline.parse_translations(reply.text, ids), record)
+            return TranslatorResult(baseline.parse_translations(reply.text, ids), record,
+                                    flags=collector.flags if collector is not None else [])
         except PARSE_ERRORS as e:
             record["repair"]["parse_error"] = str(e)
             reason = f"unparseable: the answer ({answer_error}) and its repair ({e}) could not be used"

@@ -606,3 +606,245 @@ def test_the_harness_knows_both_configs_and_the_cli_accepts_translator(tmp_path)
 
     assert "invalid choice" not in stopped.stderr
     assert stopped.returncode == 2 and "Stopped before any model call" in stopped.stderr  # no such page: nothing sent
+
+
+# --- flagging: the `flag_uncertain` tool (task 011) ---------------------------------------------------------------
+
+PREVIOUS_CONTEXT_TOOL = {   # the tool definition of M2, as the provider got it
+    "type": "function",
+    "function": {
+        "name": "get_previous_context",
+        "description": "Get the Japanese text, and the Chinese translation when there is one, of the pages just before "
+                       "this one in the book.",
+        "parameters": {
+            "properties": {"pages_back": {
+                "default": 1, "maximum": 2, "minimum": 1, "type": "integer",
+                "description": "How many pages back to look: 1 is the previous page, 2 also adds the page before that."}},
+            "type": "object"},
+    },
+}
+
+
+def flag(call_id, region, reason="言い回しが曖昧"):
+    return call(call_id, {"id": region, "reason": reason}, name="flag_uncertain")
+
+
+def run_flagging(page_for, provider, *, page_index=3, **options):
+    return translator.run_translator(page_for(page_index), mock_llm_client(provider), flagging=True, **options)
+
+
+@pytest.mark.parametrize("options", [{}, {"flagging": False}], ids=["default", "explicitly-off"])
+def test_with_the_switch_off_the_requests_are_what_they_were_in_m2(page_for, options):
+    provider = Provider(ask(previous_context(3)), answer("not json"), answer(zh_json(3)))
+
+    result = translator.run_translator(page_for(3), mock_llm_client(provider), **options)
+
+    assert result.ok and len(provider.bodies) == 3 and result.flags == []
+    first = provider.bodies[0]
+    assert list(first) == ["model", "messages", "max_tokens", "response_format", "tools"]
+    assert first["messages"][0] == {"role": "system", "content": translator.SYSTEM_PROMPT}
+    assert first["messages"][1] == baseline.build_messages(page_for(3))[1]
+    assert first["tools"] == [PREVIOUS_CONTEXT_TOOL]
+    assert "flag_uncertain" not in json.dumps(provider.bodies) and "flag_uncertain" not in translator.SYSTEM_PROMPT
+    assert provider.bodies[1]["tools"] == [PREVIOUS_CONTEXT_TOOL] and "tools" not in provider.bodies[2]  # and the repair
+
+
+def test_two_flags_in_one_reply_are_both_kept_and_the_first_request_has_both_tools(page_for):
+    provider = Provider(
+        ask(flag("f1", 1, "名前かもしれない"), flag("f0", 0, "言い回しが曖昧")), answer(zh_json(3)))
+
+    result = run_flagging(page_for, provider)
+
+    assert result.ok and result.translations == {0: zh(3, 0), 1: zh(3, 1)}
+    assert result.flags == [{"id": 0, "reason": "言い回しが曖昧"}, {"id": 1, "reason": "名前かもしれない"}]  # region order
+    first = provider.bodies[0]
+    assert [t["function"]["name"] for t in first["tools"]] == ["get_previous_context", "flag_uncertain"]
+    assert first["tools"][0] == PREVIOUS_CONTEXT_TOOL
+    assert first["messages"][0] == {"role": "system", "content": translator.FLAG_SYSTEM_PROMPT}
+    assert translator.FLAG_SYSTEM_PROMPT != translator.SYSTEM_PROMPT
+    assert "get_previous_context" in translator.FLAG_SYSTEM_PROMPT and "flag_uncertain" in translator.FLAG_SYSTEM_PROMPT
+    assert first["messages"][1] == baseline.build_messages(page_for(3))[1]  # the user message is baseline's, as before
+    parameters = first["tools"][1]["function"]["parameters"]
+    assert parameters["required"] == ["id", "reason"]
+    assert (parameters["properties"]["reason"]["minLength"], parameters["properties"]["reason"]["maxLength"]) == (1, 200)
+    assert parameters["properties"]["id"]["type"] == "integer"
+    assert tool_result(provider.bodies[1], "f0") == '{"flagged": 0}'
+    steps = result.attempts["agent"]["steps"]
+    assert [c["ran"] for c in steps[0]["tool_calls"]] == [True, True]
+    assert set(result.attempts) == {"config", "agent", "repair", "fallback"}  # the attempts record keeps its shape
+
+
+def test_a_run_that_flags_nothing_has_no_flags(page_for):
+    result = run_flagging(page_for, Provider(answer(zh_json(3))))
+
+    assert result.ok and result.flags == []
+
+
+def test_an_unknown_region_goes_back_to_the_model_and_is_not_recorded(page_for):
+    provider = Provider(ask(flag("bad", 7)), ask(flag("good", 1, "固有名詞")), answer(zh_json(3)))
+
+    result = run_flagging(page_for, provider)
+
+    assert result.ok and result.flags == [{"id": 1, "reason": "固有名詞"}]
+    message = tool_result(provider.bodies[1], "bad")
+    assert message.startswith("Error: flag_uncertain failed with ValueError:") and "region 7 is not on this page" in message
+    assert "[0, 1]" in message  # the model is told which ids there are
+    (bad_call,) = result.attempts["agent"]["steps"][0]["tool_calls"]
+    assert bad_call["ran"] is True and bad_call["error"] == message
+
+
+@pytest.mark.parametrize("arguments, complaint", [
+    ({"id": 0, "reason": ""}, "reason: String should have at least 1 character"),
+    ({"id": 0, "reason": "   "}, "reason: String should have at least 1 character"),
+    ({"id": 0, "reason": "x" * 201}, "reason: String should have at most 200 characters"),
+    ({"id": 0}, "reason: Field required"),
+    ({"id": "zero", "reason": "x"}, "id: Input should be a valid integer"),
+], ids=["empty", "blank", "too-long", "missing", "id-not-a-number"])
+def test_an_argument_that_does_not_validate_goes_back_to_the_model_and_is_not_recorded(page_for, arguments, complaint):
+    provider = Provider(ask(call("bad", arguments, name="flag_uncertain")), answer(zh_json(3)))
+
+    result = run_flagging(page_for, provider)
+
+    assert result.ok and result.flags == []
+    assert complaint in tool_result(provider.bodies[1], "bad")
+    (bad_call,) = result.attempts["agent"]["steps"][0]["tool_calls"]
+    assert bad_call["ran"] is False and complaint in bad_call["error"]
+
+
+def test_the_longest_reason_is_kept_and_a_padded_one_is_trimmed(page_for):
+    provider = Provider(ask(flag("a", 0, "x" * 200), flag("b", 1, "  迷い  ")), answer(zh_json(3)))
+
+    result = run_flagging(page_for, provider)
+
+    assert result.flags == [{"id": 0, "reason": "x" * 200}, {"id": 1, "reason": "迷い"}]
+
+
+def test_the_same_flag_twice_is_not_run_again_and_not_recorded_twice(page_for):
+    provider = Provider(ask(flag("a", 1, "同じ")), ask(flag("b", 1, "同じ")), answer(zh_json(3)))
+
+    result = run_flagging(page_for, provider)
+
+    assert result.flags == [{"id": 1, "reason": "同じ"}]
+    assert tool_result(provider.bodies[2], "b").startswith("Duplicate call: flag_uncertain")
+    assert [c["ran"] for s in result.attempts["agent"]["steps"] for c in s["tool_calls"]] == [True, False]
+
+
+def test_a_region_flagged_with_two_reasons_keeps_both_in_the_order_they_came(page_for):
+    provider = Provider(ask(flag("a", 1, "一つ目")), ask(flag("b", 1, "二つ目")), answer(zh_json(3)))
+
+    result = run_flagging(page_for, provider)
+
+    assert [f["reason"] for f in result.flags] == ["一つ目", "二つ目"]
+
+
+def test_both_tools_can_be_called_in_one_reply(imported, root, page_for):
+    translate_earlier_pages(imported, root, 1, 2)
+    previous = runs.previous_pages(imported, BOOK, 3, "translator")
+    provider = Provider(ask(previous_context(3), flag("f", 0)), answer(zh_json(3)))
+
+    result = run_flagging(page_for, provider, previous=previous)
+
+    assert result.ok and result.flags == [{"id": 0, "reason": "言い回しが曖昧"}]
+    assert zh(2, 0) in tool_result(provider.bodies[1], "call_3")
+
+
+def test_flags_are_kept_when_the_repair_gives_the_answer(page_for):
+    provider = Provider(ask(flag("f", 1)), answer("not json"), answer(zh_json(3)))
+
+    result = run_flagging(page_for, provider)
+
+    assert result.ok and result.fallback_reason is None and len(provider.bodies) == 3
+    assert result.attempts["repair"]["parse_error"] is None
+    assert result.flags == [{"id": 1, "reason": "言い回しが曖昧"}]
+
+
+@pytest.mark.parametrize("replies, how", [
+    ((answer("not json"), answer("still not json"), answer(zh_json(3))), "unparseable"),
+    ((answer("", finish_reason="length"), answer(zh_json(3))), "incomplete"),
+], ids=["repair-failed", "reply-cut-off"])
+def test_after_a_fallback_there_are_no_flags_but_the_steps_still_show_the_calls(page_for, replies, how):
+    provider = Provider(ask(flag("f", 1)), *replies)
+
+    result = run_flagging(page_for, provider)
+
+    assert result.ok and result.fallback_reason.startswith(how)
+    assert result.flags == []
+    assert result.attempts["agent"]["steps"][0]["tool_calls"][0]["name"] == "flag_uncertain"
+    assert result.attempts["agent"]["steps"][0]["tool_calls"][0]["ran"] is True
+
+
+def test_after_the_step_limit_there_are_no_flags(page_for):
+    provider = Provider(ask(flag("a", 0)), ask(flag("b", 1)), answer(zh_json(3)))
+
+    result = run_flagging(page_for, provider, max_steps=2)
+
+    assert result.ok and result.fallback_reason.startswith("step_limit")
+    assert result.flags == [] and len(provider.bodies) == 3  # two steps, then baseline's call
+
+
+@pytest.mark.parametrize("replies", [(upstream_500(),), (answer("not json"), upstream_500())],
+                         ids=["agent", "repair"])
+def test_a_failed_run_has_no_flags(page_for, replies):
+    provider = Provider(ask(flag("f", 0)), *replies)
+
+    result = run_flagging(page_for, provider)
+
+    assert not result.ok and result.translations is None and result.flags == []
+
+
+def test_the_flag_handler_is_safe_when_many_calls_run_side_by_side():
+    ids = list(range(200))
+    collector = translator.FlagCollector(ids)
+    handler = collector.tool().handler
+    barrier = threading.Barrier(len(ids))
+
+    def flag_one(region):
+        barrier.wait()  # all the threads start together
+        handler(id=region, reason=f"reason {region}")
+
+    threads = [threading.Thread(target=flag_one, args=(i,)) for i in ids]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert [f["id"] for f in collector.flags] == ids
+    assert all(f["reason"] == f"reason {f['id']}" for f in collector.flags)
+    with pytest.raises(ValueError, match="region 200 is not on this page"):
+        handler(id=200, reason="x")
+    assert len(collector.flags) == 200
+
+
+def test_the_flag_handler_runs_in_a_worker_thread(page_for, monkeypatch):
+    threads = []
+    real = translator.FlagCollector.tool
+
+    def spying(self):
+        tool = real(self)
+        return replace(tool, handler=lambda **kw: (threads.append(threading.current_thread()), tool.handler(**kw))[1])
+
+    monkeypatch.setattr(translator.FlagCollector, "tool", spying)
+
+    result = run_flagging(page_for, Provider(ask(flag("a", 0), flag("b", 1)), answer(zh_json(3))))
+
+    assert [f["id"] for f in result.flags] == [0, 1] and len(threads) == 2
+    assert all(t is not threading.main_thread() for t in threads)
+
+
+def test_no_reference_translation_reaches_a_flagging_request(page_for):
+    provider = Provider(ask(flag("f", 0)), answer(zh_json(3)))
+
+    run_flagging(page_for, provider)
+
+    sent = json.dumps(provider.bodies, ensure_ascii=False)
+    assert "REF-ZH" not in sent and "REF-EN" not in sent
+
+
+def test_the_translator_config_does_not_flag(imported, root):
+    provider = Provider(answer(zh_json(1)))
+
+    outcome = translate(imported, root, mock_llm_client(provider), 1)
+
+    assert outcome.result.flags == []
+    assert [t["function"]["name"] for t in provider.bodies[0]["tools"]] == ["get_previous_context"]
+    assert provider.bodies[0]["messages"][0]["content"] == translator.SYSTEM_PROMPT
