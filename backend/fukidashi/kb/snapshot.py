@@ -1,23 +1,18 @@
 """A read-only, in-memory copy of one KB: the only view of the KB an agent gets (OUTLINE 3.2, 3.3).
 
-`load_snapshot` reads the KB's entries and profiles in the readable states (`approved` and `pending_human`, each marked
-with its status; never `proposed` or `rejected`) and returns plain, immutable values. The snapshot holds no database
-connection, so it is safe in worker threads, cannot write, and does not change when the KB does: a run sees the KB as it
-was when the run started.
+`kb.loader.load_snapshot` reads the KB's entries and profiles in the readable states (`approved` and `pending_human`,
+each marked with its status; never `proposed` or `rejected`) and returns plain, immutable values. The snapshot holds no
+database connection, so it is safe in worker threads, cannot write, and does not change when the KB does: a run sees the
+KB as it was when the run started. This module imports no database, so an agent can import the type.
 """
 
 from __future__ import annotations
 
-import json
-import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
-from .. import store
-from .entities import (
-    APPROVED, PENDING_HUMAN, CharacterProfile, GlossaryEntry, KBNotFound, frozen_json, normalise,
-)
+from .entities import APPROVED, PENDING_HUMAN, CharacterProfile, GlossaryEntry, normalise
 
 
 def _rank(item: GlossaryEntry | CharacterProfile) -> tuple[bool, int]:
@@ -93,21 +88,3 @@ def profile_line(profile: CharacterProfile) -> str:
     if profile.notes:
         line += f"; {profile.notes}"
     return line + (" [pending]" if profile.status == PENDING_HUMAN else "")
-
-
-def load_snapshot(conn: sqlite3.Connection, kb_id: int) -> KBSnapshot:
-    """Copy the KB's readable entries and profiles out of the database. Raises KBNotFound for an unknown id."""
-    kb = store.get_kb(conn, kb_id)
-    if kb is None:
-        raise KBNotFound(f"no knowledge base has id {kb_id}")
-    entries = tuple(
-        GlossaryEntry(r["id"], r["source_term"], r["target_term"], r["category"], r["status"], r["provenance"],
-                      tuple(json.loads(r["evidence_pages"])), frozen_json(r["history"]))
-        for r in store.kb_entries(conn, kb_id, store.READABLE_STATUSES)
-    )
-    profiles = tuple(
-        CharacterProfile(r["id"], r["name_src"], r["name_tgt"], tuple(json.loads(r["aliases"])), r["notes"],
-                         r["status"], tuple(json.loads(r["evidence_pages"])), frozen_json(r["history"]))
-        for r in store.kb_profiles(conn, kb_id, store.READABLE_STATUSES)
-    )
-    return KBSnapshot(kb_id, kb["book_title"], entries, profiles)

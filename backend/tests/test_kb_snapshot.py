@@ -11,8 +11,9 @@ from kb_support import accept, name, new_kb, new_run, term
 
 from fukidashi import store
 from fukidashi.datasets.importer import import_openmantra
-from fukidashi.kb import KBNotFound, KBSnapshot, load_snapshot
+from fukidashi.kb import KBNotFound, KBSnapshot
 from fukidashi.kb.curator import apply
+from fukidashi.kb.loader import load_snapshot
 
 
 @pytest.fixture

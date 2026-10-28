@@ -17,11 +17,15 @@ DEFAULT_PROPOSER = "translator"
 
 
 class ProposalCollector:
-    """The proposals made for one page of one KB, each kept once.
+    """The proposals made for one page of one KB, each kept once: what `propose_entry` validates and answers with.
 
     A proposal made twice on the page (the same kind and the same source and target) has the same id and is kept once,
-    the first time it arrives. `proposals` lists them in the order they arrived; calls that run side by side have no
-    order of their own, so that is only the order of the model's replies.
+    the first time it arrives. `proposals` lists them in the order they arrived. The calls of one model reply run side
+    by side, so for them arrival is a race: when two of them give one id other details (a category, aliases, notes),
+    which payload this collector holds depends on timing. That is fine for the tool's answer ("recorded"), which does
+    not show the details, but it is not what gets stored. The page's proposals in the order of the calls, with the first
+    call's payload for each id, are `translator.step_proposals` of the Translator's steps, and `OrchestratorResult`
+    carries them.
     """
 
     def __init__(self, kb_id: int, page_index: int):
@@ -32,8 +36,8 @@ class ProposalCollector:
 
     def add(self, kind: str, payload: Mapping[str, Any], *, proposer: str = DEFAULT_PROPOSER) -> tuple[Proposal, bool]:
         """Validate and keep a proposal. Returns it and whether it is new (False: the page had it already, and the
-        proposal returned is the first one). Raises ValueError, whose message says what is wrong, for an unknown kind
-        or a payload that does not fit; nothing is kept then."""
+        proposal returned is the one that arrived first). Raises ValueError, whose message says what is wrong, for an
+        unknown kind or a payload that does not fit; nothing is kept then."""
         proposal = make_proposal(self.kb_id, self.page_index, kind, payload, proposer)
         with self._lock:
             kept = self._by_id.get(proposal.proposal_id)

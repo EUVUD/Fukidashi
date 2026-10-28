@@ -64,7 +64,7 @@ class OrchestratorResult:
     translations: dict[int, str] | None  # region id -> zh-Hans; None when the Run failed
     attempts: dict  # what `runs.py` stores: see run_orchestrator
     error: str | None = None  # why translations is None
-    proposals: tuple[Proposal, ...] = ()  # the page's KB proposals in the order of the calls; empty when the Run failed
+    proposals: tuple[Proposal, ...] = ()  # the page's KB proposals, once each, in call order; empty when the Run failed
 
     @property
     def ok(self) -> bool:
@@ -105,12 +105,14 @@ def run_orchestrator(
     lookups and `propose_entry`, the Reviewer has the lookups, and both get the KB's entries for the page in their user
     message; without one, every request is what it is without the KB.
 
-    `proposals` of the result are the proposals the Translator's `propose_entry` calls made, each once, ordered by
+    `proposals` of the result are the proposals the Translator's `propose_entry` calls made, each id once, ordered by
     where its call stands: the Translator run (the first pass, then each revision in turn), then the step, then the
-    call's position in the model's reply. The calls of one reply run in parallel, so the order they arrive in is a race
-    and is not used. Every call that `make_proposal` accepted counts, from every Translator run of the page, including a
-    first pass that fell back to `baseline` and a revision that was unusable: whether a proposal fits the stored
-    translation is the Curator's judgment. A Run that failed has none.
+    call's position in the model's reply. When several calls give one id (the same kind, source and target) with other
+    details, the payload kept is the first call's in that order. The calls of one reply run in parallel, so the order
+    they arrive in is a race, and neither the order nor the payload depends on it (`translator.step_proposals`). Every
+    call that `make_proposal` accepted counts, from every Translator run of the page, including a first pass that fell
+    back to `baseline` and a revision that was unusable: whether a proposal fits the stored translation is the Curator's
+    judgment. A Run that failed has none.
 
     The attempts record: {"config": "full_no_kb" ("full" with a `kb`),
       "stages": [{"kind": "translate" | "review" | "revise", "status": "ok" | "unusable" | "failed", "error",
@@ -125,7 +127,7 @@ def run_orchestrator(
     """
     stages: list[dict] = []
     collector = ProposalCollector(kb.kb_id, page.page_index) if kb is not None else None
-    proposal_order: list[str] = []  # the ids of the page's proposals, in the order of the calls, once each
+    made: list[Sequence[Proposal]] = []  # the proposals of each Translator run, in the order the runs happened
 
     def finish(stop: str, *, translations: dict[int, str] | None = None, produced_by: int | None = None,
                reviewed: bool = False, error: str | None = None) -> OrchestratorResult:
@@ -135,14 +137,14 @@ def run_orchestrator(
         attempts = {"config": CONFIG_NAME if kb is None else KB_CONFIG_NAME, "stages": stages,
                     "send_backs": send_backs, "final": final}
         return OrchestratorResult(translations, attempts, error,
-                                  proposals_in_order(collector, proposal_order) if translations is not None else ())
+                                  merge_proposals(*made) if translations is not None else ())
 
     first = translator.run_translator(
         page, client, previous=previous, agent_budget=agent_budget, fallback_budget=fallback_budget,
         max_tokens=max_tokens, max_steps=max_steps, flagging=True, kb=kb, collector=collector,
     )
     stages.append(_translator_stage(TRANSLATE, first))
-    proposal_order += first.proposal_ids
+    made.append(first.proposals)
     if not first.ok:  # a provider error or a spent budget, or the fallback failed too
         return finish(FAILED, error=first.error)
 
@@ -166,7 +168,7 @@ def run_orchestrator(
             flagging=True, revision=translator.Revision(current, review.issues), kb=kb, collector=collector,
         )
         stages.append(_translator_stage(REVISE, revision))
-        proposal_order += revision.proposal_ids  # before anything else: an unusable revision's calls were made too
+        made.append(revision.proposals)  # before anything else: an unusable revision's calls were made too
         if revision.unusable:  # the translation the Reviewer sent back stands
             return finish(REVISION_UNUSABLE, translations=current, produced_by=produced_by, reviewed=True)
         if not revision.ok:
@@ -176,13 +178,15 @@ def run_orchestrator(
             return finish(SEND_BACK_LIMIT, translations=current, produced_by=produced_by)
 
 
-def proposals_in_order(collector: ProposalCollector | None, order: Sequence[str]) -> tuple[Proposal, ...]:
-    """The collector's proposals in `order` (ids, first occurrence). The collector lists them in the order they arrived,
-    which for the calls of one reply is a race; `order` comes from the agents' steps, which keep the model's order."""
-    if collector is None:
-        return ()
-    by_id = {p.proposal_id: p for p in collector.proposals}
-    return tuple(by_id[proposal_id] for proposal_id in dict.fromkeys(order))
+def merge_proposals(*runs: Sequence[Proposal]) -> tuple[Proposal, ...]:
+    """The proposals of one page's Translator runs (each run's `proposals`, in the order the runs happened) as one
+    list: each id once, in the order of the calls, with the payload of the first call that made it. So a repeat in a
+    revision, with other details, does not replace the first pass's."""
+    kept: dict[str, Proposal] = {}
+    for proposals in runs:
+        for proposal in proposals:
+            kept.setdefault(proposal.proposal_id, proposal)
+    return tuple(kept.values())
 
 
 def _translator_stage(kind: str, result: translator.TranslatorResult) -> dict:

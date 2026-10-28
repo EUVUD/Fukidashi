@@ -13,16 +13,25 @@ model call and imports no LangChain.
 3. The same source and another target: a conflict. The proposal goes to the Human Review Queue (`pending_human`) and the
    existing entry stays as it is, so the KB keeps its first rendering. On one page the first proposal wins and the later
    ones conflict, because by then the first one is an entry.
+   A name under the wrong kind is a conflict too, across kinds: a term whose source is the name, or an alias, of a
+   profile; a character whose name is the source of an entry. The proposal goes to `pending_human`, nothing is written
+   for it, the existing profile or entry stays as it is, and the proposal's reason says it is about the kinds (the result
+   is `CONFLICT`). A person decides which kind it is, whatever the decision says. This catches only a collision with what
+   the KB already holds, and on one page the earlier proposal counts; whether a term that collides with nothing is really
+   a name is the Curator Agent's judgment.
 4. A new name (kind `character`) becomes a profile with status `pending_human`, whatever the decision says.
 5. A new term becomes an `approved` entry (provenance `agent`) when accepted; a rejected one writes no entry and its
    proposal keeps the reason; one without a decision stays `proposed`, to be decided later.
 
-An existing entry or profile is one in a readable state (`approved` or `pending_human`), and a term is compared with the
-entries and a name with the profiles: the two kinds are separate namespaces.
+An existing entry or profile is one in a readable state (`approved` or `pending_human`): a `proposed` or `rejected` row is
+not there for these rules. A term is compared with the entries and a name with the profiles (rules 2 and 3), and a
+same-kind match comes first. Only the cross-kind conflict of rule 3 looks at the other kind, and only when the proposal
+would otherwise create a new entry or profile.
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -104,6 +113,10 @@ def _term(conn: sqlite3.Connection, p: Proposal, run_id: int, decision: Decision
         store.add_entry_evidence(conn, existing["id"], p.page_index, _event("confirmed", p, run_id))
         store.set_proposal_status(conn, p.proposal_id, status=APPROVED, reason=f"confirms entry {existing['id']}")
         return CONFIRMED
+    if (profile := _profile_called(conn, p.kb_id, source)) is not None:
+        called = "the name" if source == profile["name_src"] else "an alias"
+        return _wrong_kind(conn, p, f"{source} is proposed as a term, but it is {called} of profile {profile['id']} "
+                                    f"({profile['name_tgt']}), a character")
     if decision is None:
         return UNDECIDED  # stays 'proposed'
     if not decision.accept:
@@ -127,6 +140,9 @@ def _name(conn: sqlite3.Connection, p: Proposal, run_id: int, decision: Decision
         store.add_profile_evidence(conn, existing["id"], p.page_index, _event("confirmed", p, run_id))
         store.set_proposal_status(conn, p.proposal_id, status=APPROVED, reason=f"confirms profile {existing['id']}")
         return CONFIRMED
+    if (entry := store.find_entry(conn, p.kb_id, name)) is not None:
+        return _wrong_kind(conn, p, f"{name} is proposed as a character, but it is the source of entry {entry['id']} "
+                                    f"({entry['target_term']}), a term")
     reason = "a new name waits for a human"
     if decision is not None:  # kept for the human, but it does not change the rule
         reason += f"; the Curator Agent would {'accept' if decision.accept else 'reject'} it: {decision.reason}"
@@ -144,4 +160,20 @@ def _conflict(conn: sqlite3.Connection, p: Proposal, existing: str, rendering: s
     store.set_proposal_status(
         conn, p.proposal_id, status=PENDING_HUMAN, reason=f"conflicts with {existing}, which is {rendering}",
     )
+    return CONFLICT
+
+
+def _profile_called(conn: sqlite3.Connection, kb_id: int, name: str) -> sqlite3.Row | None:
+    """The readable profile that has `name` as its name or as one of its aliases: an approved one before a pending one,
+    then the lowest id, as `store.find_profile` picks. (That one looks at the name only; the aliases are in a JSON
+    column, so they are read here, from the KB's profiles.)"""
+    called = [row for row in store.kb_profiles(conn, kb_id, store.READABLE_STATUSES)
+              if name == row["name_src"] or name in json.loads(row["aliases"])]
+    return min(called, key=lambda row: (row["status"] != APPROVED, row["id"]), default=None)
+
+
+def _wrong_kind(conn: sqlite3.Connection, p: Proposal, what: str) -> str:
+    """A conflict across kinds: `p`'s source is already something else in the KB. Nothing is written for it and the
+    existing row is not touched; the proposal waits for a human, and its reason says `what` is wrong."""
+    store.set_proposal_status(conn, p.proposal_id, status=PENDING_HUMAN, reason=f"conflicts across kinds: {what}")
     return CONFLICT
