@@ -1,6 +1,6 @@
 # Fukidashi — Project Outline
 
-> v0.15 · 2026-10-28
+> v0.16 · 2026-10-28
 > **v0.2 (2026-10-22):** evaluation changed from a research-style controlled experiment to a standard evaluation framework plus a baseline comparison (plan B); see §4.
 > **v0.3 (2026-10-22):** M0 decisions recorded in §8: name Fukidashi, ja → zh-Hans, an OpenAI-compatible provider, a $100 budget cap.
 > **v0.4 (2026-10-24):** M1 added the term Run (§0).
@@ -15,6 +15,7 @@
 > **v0.13 (2026-10-27):** after the Translator Agent: §0 adds `translator`, Repair and Fallback; §3.2, §3.4 and §4.2 record the Translator Agent as built (`flag_uncertain` moves to M3); §8 decides the tracing tool (Arize Phoenix, local).
 > **v0.14 (2026-10-28):** M2 done (§7, `docs/m2.md`); §3.5 records tracing as built.
 > **v0.15 (2026-10-28):** §3.5: spans reach the local endpoint without any proxy, and a page that fails before its Run exists keeps its trace ID.
+> **v0.16 (2026-10-28):** M3 decisions in §8: the dev / test split (§4.1), who drafts the gold glossary (§4.7), a fresh KB for each eval run with readable `pending_human` entries (§3.3), and the Curator as code rules plus one model call per page (§3.3).
 > Convention: code, docs, commit messages and reports use the canonical terms in §0.
 
 ---
@@ -188,7 +189,10 @@ Fukidashi is a product, so it is evaluated with general, objective metrics rathe
   - `CharacterProfile`: `id`, `name_src`, `name_tgt`, `aliases`, `notes` (speech style and so on), `evidence_pages`, `history`
   - `Proposal`: `proposal_id`, `kind`, `payload`, `proposer`, `page_id`, `status`
 - **Write policy:** single-writer + Proposal Queue. Proposals carry IDs and the Curator deduplicates by ID, so a retry never writes twice.
+- **Curator (§8):** the rules are code: deduplication by ID, conflicts and names to the Human Review Queue, and one KB write per page, at finalize (§3.6). The model is called once per page, without tools, to accept or reject each remaining proposal with a reason; code applies its decisions and enforces the rules whatever the model answers.
 - **Conflicts:** two proposals with different target terms for the same source term, or anything involving a name, go to the Human Review Queue instead of being merged automatically.
+- **Readable states:** lookups and KB snippets return `approved` and `pending_human` entries, the latter marked as pending; `proposed` and `rejected` entries are not returned. So a name proposed on one page reaches later pages before a human has confirmed it (§8).
+- **One KB per eval run:** each eval run starts every book with an empty KB, which fills page by page in page order; nothing carries over between eval runs. The editor keeps one KB per book (M7).
 - **Retrieval:** relevant terms and characters are matched against the source text and truncated to a character budget; the agent looks up the rest with tools. No vector database, and the report says why: terms and names are identifiers, where exact match beats embeddings.
 
 ### 3.4 Agent Loop Guardrails
@@ -236,7 +240,7 @@ Every vision component is a swappable **adapter**.
 
 - **OpenMantra:** Japanese source text with professional English and Chinese translations and bounding boxes; **CC BY-NC 4.0**. Fields and statistics in `docs/openmantra.md`.
 - **The references are zh-Hant:** before evaluation, OpenCC converts `text_zh` to zh-Hans, and the gold glossary is built from the converted references. The OpenCC config is `t2s` (§8).
-- Split by book: **dev = 2 books** (for tuning prompts and tools), **test = 3 books** (run once, after the freeze).
+- Split by book: **dev = 2 books** (for tuning prompts and tools): `tojime_no_siora`, `boureisougi`; **test = 3 books** (run once, after the freeze): `balloon_dream`, `tencho_isoro`, `rasetugari` (§8).
 - Metrics are computed per segment; the paired bootstrap resamples pages.
 - The public repository holds no OpenMantra images, only eval scripts, the gold glossary and attribution.
 
@@ -292,6 +296,8 @@ Every quality metric in both comparisons gets a paired bootstrap 95% CI. Primary
 
 - 20–40 entries per dev book (M3), and one glossary for each of the three test books (M5).
 - Built from the reference translation, **before looking at any model output**.
+- **Who builds it (§8):** an AI coding assistant (Claude, not the translation model) drafts the entries from the Japanese text and the converted reference translations only, without access to stored Runs, Translations or eval outputs; the author reviews every entry. The glossary file says so.
+- **Not fully blind for `tojime_no_siora`:** its pages 2–4 were translated in M0–M2 and their output was read. It is a dev book; each test book's glossary is built before any page of that book is translated.
 
 ### 4.8 Reproducibility
 
@@ -415,6 +421,10 @@ fukidashi/
 | Provider SDK retries | M2 | **Off** (`max_retries=0`). By default the `openai` SDK silently resends a request up to twice on connection errors, timeouts, 429 and 5xx; earlier attempts that may have been billed would never reach the Meter, and cost would be a partial sum. Now a 429 or 5xx fails the page and the user reruns it. An explicit retry for 429, which is rejected and not billed, can be added if 429s are common in M4 (`IDEAS.md`) | Decided (2026-10-26) |
 | Agent loop | M2 | **LangChain v1 `create_agent`** as the loop skeleton, customised through its model, tools and middleware (the Step limit is its `ModelCallLimitMiddleware`); start here and change it if the project needs to. Its model is a small custom chat model over `LLMClient`, not `ChatOpenAI` / `ChatDeepSeek`: those bypass the Meter and retry by default, and DeepSeek rejects tool-call turns that do not send `reasoning_content` back. LangChain stays inside `agents/`, behind a plain result type, so replacing it touches nothing else. The alternative was a hand-written loop | Decided (2026-10-27) |
 | Tracing tool | M2 | **Arize Phoenix, run locally** (`phoenix serve` or Docker): one process, no account, no cost, and traces kept as long as we like, so the report's trace links (§3.5) still work in January. Hosted free tiers keep traces 14 days (LangSmith) or 30 days (Langfuse Cloud), and self-hosting Langfuse needs several services. Traces stay on this machine by default; that is a choice, not a licence requirement. **Kept replaceable:** the code uses only OpenTelemetry and OpenInference, and the backend is one exporter in `tracing/`, so moving to Langfuse or another OTLP backend later changes that exporter, not the instrumentation (`IDEAS.md`). The Phoenix server is not a project dependency | Decided (2026-10-27) |
+| Dev / test split | M3 | **Dev: `tojime_no_siora`, `boureisougi`** (82 pages, 608 segments). **Test: `balloon_dream`, `tencho_isoro`, `rasetugari`** (132 pages, 984 segments). `tojime_no_siora` cannot be a test book: M0–M2 translated its pages 2–4 and read the output. Of the other four books `boureisougi` is the smallest, so the test split keeps the most segments (narrower CIs) and the dev runs in M4 cost least | Decided (2026-10-28) |
+| Who builds the gold glossary | M3 | **An AI coding assistant drafts it from the reference translations only, and the author reviews every entry** (§4.7). Drafting by hand would take the author about 2 hours for the two dev books. The drafting assistant (Claude) is not the translation model (DeepSeek), and it has no access to stored Runs, Translations or eval outputs | Decided (2026-10-28) |
+| KB scope in evaluation | M3 | **Each eval run starts every book with an empty KB**, filled page by page in page order, so two eval runs of the same config start from the same state. **`pending_human` entries are readable**, marked as pending; rejected ones are not (§3.3). No human works the Human Review Queue during an eval, and every name goes there; if pending entries were hidden, no name would ever reach a later page and the KB ablation would measure little. The cost: a wrong pending entry can spread to later pages, which the Reviewer is there to catch | Decided (2026-10-28) |
+| Curator form | M3 | **Rules in code, plus one model call per page without tools** (§3.3). Deduplication, routing conflicts and names to the Human Review Queue, and the single write at finalize are code, so they hold whatever the model answers (least privilege, §1.3). The model only judges the remaining proposals. Rejected: a tool-calling Curator, which would leave the rules to the prompt; a Curator with no model at all, which would leave two agents and change the scope (`SCOPE.md` §1) | Decided (2026-10-28) |
 | COMET checkpoint | M4 | Which COMET and xCOMET models, by license and memory | Open |
 | Judge model (GEMBA-MQM) | M5 | A strong model different from the translation model | Open |
 
