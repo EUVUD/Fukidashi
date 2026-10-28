@@ -147,7 +147,8 @@ def test_a_full_page_is_one_succeeded_run_that_finalizes_the_curators_call_and_t
     assert {r["run_id"] for r in store.kb_proposals(imported, kb)} == {outcome.run_id}
 
     attempts = attempts_of(imported, outcome.run_id)
-    assert set(attempts) == {"config", "stages", "send_backs", "final", "finalize"} and attempts["config"] == "full"
+    assert set(attempts) == {"config", "stages", "send_backs", "final", "kb_snippets", "finalize"}
+    assert attempts["config"] == "full"
     finalize = attempts["finalize"]
     assert set(finalize) == {"kb_id", "curator", "outcomes"} and finalize["kb_id"] == kb
     assert set(finalize["curator"]) == {"status", "error", "asked", "decisions", "attempts"}
@@ -396,6 +397,88 @@ def test_a_page_whose_orchestrator_fails_gets_no_curator_call_and_writes_nothing
     assert dump(imported) == before
 
 
+# --- the snippets the page was shown (task 018) -----------------------------------------------------------------------
+
+def shown_in(body):
+    """What the snippets part of a request carried, as the Run records it: the item lines, read back from the text."""
+    text = body["messages"][1]["content"][0]["text"]
+    if text == NOTHING:
+        return []
+    shown = []
+    for line in text.removeprefix(HEADER).split("\n"):
+        kind, rest = line.split(": ", 1)
+        shown.append({"kind": kind, "key": rest.split(" → ")[0],
+                      "status": "pending" if line.endswith("[pending]") else "approved"})
+    return shown
+
+
+def seed_page_three(conn, kb_id):
+    """Page 3 reads "日本語3-0" and "日本語3-1". Two terms and a name occur in it, one of them found by an alias and one
+    pending; `kb` already holds a term that does not occur, and here is a name that does not either."""
+    seed_entry(conn, kb_id, "日本語", "日语")
+    seed_entry(conn, kb_id, "3-1", "三之一", status="pending_human")
+    seed_profile(conn, kb_id, "ユキ", "小雪", aliases=["3-0"])
+    seed_profile(conn, kb_id, "ハル", "小春")
+
+
+def test_a_full_run_records_the_items_its_page_was_shown_in_the_order_of_the_prompt(imported, root, kb):
+    seed_page_three(imported, kb)
+    provider = Provider(answer(zh_json(3)), answer(APPROVE))
+
+    outcome, _ = run_page(imported, root, provider, kb)
+
+    assert outcome.result.ok
+    recorded = attempts_of(imported, outcome.run_id)["kb_snippets"]
+    assert recorded == [{"kind": "term", "key": "日本語", "status": "approved"},
+                        {"kind": "character", "key": "ユキ", "status": "approved"},   # by its alias, under its name
+                        {"kind": "term", "key": "3-1", "status": "pending"}]
+    assert [who(b) for b in provider.bodies] == ["translate", "review"]
+    assert recorded == shown_in(provider.bodies[0]) == shown_in(provider.bodies[1])   # what both agents were sent
+    assert "宇宙船" not in sent(provider.bodies) and "ハル" not in sent(provider.bodies)   # in the KB, not on the page
+
+
+def test_the_record_stops_where_the_budget_cut_the_snippets(imported, root, kb):
+    for n in range(30):
+        seed_entry(imported, kb, "日本語", f"{n:02d}" + "译" * 58)   # one line of about 70 characters each
+    provider = Provider(answer(zh_json(3)), answer(APPROVE))
+
+    outcome, _ = run_page(imported, root, provider, kb)
+
+    recorded = attempts_of(imported, outcome.run_id)["kb_snippets"]
+    assert 10 < len(recorded) < 30 and recorded == shown_in(provider.bodies[0])
+    assert len(provider.bodies[0]["messages"][1]["content"][0]["text"]) <= 1_000 + len(HEADER)
+
+
+def test_a_page_with_nothing_from_the_kb_records_an_empty_list_not_a_missing_one(imported, root, kb):
+    provider = Provider(answer(zh_json(3)), answer(APPROVE))
+
+    outcome, _ = run_page(imported, root, provider, kb)   # the KB holds only a term that is not on page 3
+
+    assert attempts_of(imported, outcome.run_id)["kb_snippets"] == []
+    assert provider.bodies[0]["messages"][1]["content"][0]["text"] == NOTHING
+
+
+def test_a_page_whose_orchestrator_failed_still_records_what_it_was_shown(imported, root, kb):
+    seed_page_three(imported, kb)
+    provider = Provider(answer(zh_json(3)), upstream_500())
+
+    outcome, _ = run_page(imported, root, provider, kb)
+
+    assert not outcome.result.ok
+    attempts = attempts_of(imported, outcome.run_id)
+    assert attempts["finalize"] is None
+    assert [i["key"] for i in attempts["kb_snippets"]] == ["日本語", "ユキ", "3-1"]
+    assert attempts["kb_snippets"] == shown_in(provider.bodies[0])
+
+
+def test_a_run_without_a_kb_records_no_snippets(imported, root):
+    provider = Provider(answer(zh_json(1)), answer(APPROVE))
+
+    outcome = translate(imported, root, mock_llm_client(provider), 1, config="full_no_kb")
+
+    assert "kb_snippets" not in attempts_of(imported, outcome.run_id)
+
+
 def boom(*args, **kwargs):
     raise RuntimeError("disk on fire")
 
@@ -579,9 +662,10 @@ def test_the_harness_makes_one_kb_for_a_full_eval_and_passes_it_to_every_page_in
         "SELECT p.page_index FROM runs r JOIN pages p ON p.id = r.page_id ORDER BY r.id")] == [1, 2, 3]
 
     scores = json.loads((result.out_dir / "scores.json").read_text(encoding="utf-8"))
-    assert set(scores) == OLD_SCORE_KEYS | {"final_stops", "curator_statuses", "proposal_outcomes", "kb"}
+    assert set(scores) == OLD_SCORE_KEYS | {"final_stops", "curator_statuses", "proposal_outcomes", "kb", "kb_reach"}
     assert scores["config"] == CONFIG and (scores["pages_scored"], scores["segments_scored"]) == (3, 6)
-    assert all(set(p) == OLD_PAGE_KEYS | LOOP_KEYS | {"curator_status", "proposal_outcomes"} for p in scores["pages"])
+    assert all(set(p) == OLD_PAGE_KEYS | LOOP_KEYS | {"curator_status", "proposal_outcomes", "kb_reach"}
+               for p in scores["pages"])
     assert [(p["page_index"], p["curator_status"]) for p in scores["pages"]] == [(1, "ok"), (2, "ok"), (3, "unusable")]
     assert [p["proposal_outcomes"] for p in scores["pages"]] == [
         outcomes(accepted=1, pending_human=1),
@@ -715,6 +799,7 @@ def test_the_other_configs_keep_every_key_they_have_and_make_no_kb(imported, roo
 SUMMARY_LINES = (("chrF", "chrF"), ("BLEU", "BLEU"), ("cost ", "cost"), ("latency ", "latency"),
                  ("scored ", "scored"), ("fallback to baseline", "fallback"), ("review loop", "review loop"),
                  ("curator ", "curator"), ("proposals ", "proposals"), ("knowledge base", "knowledge base"),
+                 ("kb reach", "kb reach"),
                  ("REVIEW LOOP ", "REVIEW LOOP"), ("CURATOR ", "CURATOR"), ("FELL BACK", "FELL BACK"),
                  ("skipped ", "skipped"), ("FAILED", "FAILED"), ("failed runs cost", "failed runs cost"))
 
@@ -737,9 +822,9 @@ SUMMARY_ORDER = {
                     "REVIEW LOOP", "FELL BACK", "skipped", "FAILED", "failed runs cost"]),
     "full": (lambda: Provider(answer(zh_json(1)), answer(APPROVE), cut_off(), answer(zh_json(2)), answer(APPROVE),
                               upstream_500()),
-             ["id", "scored", "fallback", "review loop", "curator", "proposals", "knowledge base", "chrF", "BLEU",
-              "cost", "latency", "REVIEW LOOP", "REVIEW LOOP", "CURATOR", "CURATOR", "FELL BACK", "skipped", "FAILED",
-              "failed runs cost"]),
+             ["id", "scored", "fallback", "review loop", "curator", "proposals", "knowledge base", "kb reach", "chrF",
+              "BLEU", "cost", "latency", "REVIEW LOOP", "REVIEW LOOP", "CURATOR", "CURATOR", "FELL BACK", "skipped",
+              "FAILED", "failed runs cost"]),
 }
 
 

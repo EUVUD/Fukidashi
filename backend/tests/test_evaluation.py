@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import pathlib
 import sqlite3
 import subprocess
 import sys
@@ -810,3 +811,104 @@ def test_cli_help_says_what_leaving_pages_out_does(tmp_path):
     helped = run_cli(tmp_path, "--help")
 
     assert "[--pages PAGES]" in helped.stdout and "every page of the book" in " ".join(helped.stdout.split())
+
+
+# --- the atomic replace of scores.json and manifest.json (task 018) ---------------------------------------------
+
+@pytest.mark.parametrize("name", ["scores.json", "manifest.json"])
+def test_a_write_that_fails_halfway_leaves_the_previous_complete_file_in_place(conn, wide, tmp_path, monkeypatch, name):
+    clients = iter([FakeClient([wide_reply(p)]) for p in (1, 2, 3)])
+    real_write_text, writes, before = pathlib.Path.write_text, [], {}
+
+    def dying_disk(self, text, *args, **kwargs):
+        if self.name in (name, name + ".tmp"):  # however the file is written: in place or through a temporary file
+            writes.append(self.name)
+            if len(writes) == 3:  # the files are written once with no page done, then after each page: this is page 2's
+                before["bytes"] = self.with_name(name).read_bytes()
+                real_write_text(self, text[:len(text) // 2], *args, **kwargs)
+                raise OSError("No space left on device")
+        return real_write_text(self, text, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "write_text", dying_disk)
+
+    with pytest.raises(OSError, match="No space left") as raised:
+        evaluate_wide(conn, wide, tmp_path, lambda: next(clients), pages=[1, 2, 3])
+
+    (out_dir,) = (tmp_path / "out").iterdir()
+    assert raised.value.out_dir == out_dir
+    assert (out_dir / name).read_bytes() == before["bytes"]   # the file as page 1 left it, not half of page 2's
+    scores = json.loads((out_dir / "scores.json").read_text(encoding="utf-8"))   # and both files still parse
+    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert scores["pages_scored"] == (1 if name == "scores.json" else 2)   # the manifest is written after the scores
+    assert [p["status"] for p in manifest["pages"]] == ["scored", "pending", "pending"]
+    assert manifest["finished_at"] is None
+
+
+# --- Ctrl-C in the CLI (task 018) -------------------------------------------------------------------------------
+
+# The CLI as a child process, with its model client factory replaced and its project root moved under `tmp_path` (the
+# output goes to <root>/runs/eval, the dataset is the test's). In mode "before" the first client is interrupted while it
+# is built, before the output directory exists; in mode "after" the first page is translated and the second page's
+# client is interrupted. `.env` is not read.
+INTERRUPT_CHILD = """
+import dotenv, runpy, sys
+dotenv.load_dotenv = lambda *a, **k: False
+tests_dir, root, dataset, mode, script, *argv = sys.argv[1:]
+sys.path.insert(0, tests_dir)
+from pathlib import Path
+from conftest import FakeClient
+from fukidashi import config
+from fukidashi.api import deps
+config.ROOT, config.DATASET_ROOT = Path(root), Path(dataset)
+built = []
+def get_client_factory():
+    def make():
+        built.append(1)
+        if mode == "before" or len(built) > 1:
+            raise KeyboardInterrupt
+        return FakeClient(['{"translations": [{"id": 0, "zh": "译文1"}]}'])
+    return make
+deps.get_client_factory = get_client_factory
+sys.argv = [script, *argv]
+runpy.run_path(script, run_name="__main__")
+"""
+
+
+def run_interrupted_cli(tmp_path, mode):
+    conn = connect(tmp_path / "cli.db")
+    init_db(conn)
+    dataset = make_wide_root(tmp_path)
+    import_openmantra(conn, dataset)
+    conn.close()
+    root = tmp_path / "project"
+    done = subprocess.run(
+        [sys.executable, "-c", INTERRUPT_CHILD, str(pathlib.Path(__file__).parent), str(root), str(dataset), mode,
+         str(config.ROOT / "eval" / "run.py"), "--config", "baseline", "--book", WIDE, "--pages", "1,2"],
+        capture_output=True, text=True, env={"PATH": "/usr/bin:/bin", "FUKIDASHI_DB": str(tmp_path / "cli.db")},
+        timeout=60)
+    return done, root / "runs" / "eval"
+
+
+def test_ctrl_c_prints_where_the_finished_pages_are_and_exits_130_without_a_traceback(tmp_path):
+    done, eval_dir = run_interrupted_cli(tmp_path, "after")
+
+    (out_dir,) = eval_dir.iterdir()
+    assert done.returncode == 130
+    assert "Traceback" not in done.stderr and "KeyboardInterrupt" not in done.stderr
+    assert "Interrupted" in done.stderr and str(out_dir) in done.stderr
+    scores = json.loads((out_dir / "scores.json").read_text(encoding="utf-8"))
+    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert scores["pages_scored"] == 1 and manifest["finished_at"] is None   # what the message points to
+    assert [p["status"] for p in manifest["pages"]] == ["scored", "pending"]
+    assert "chrF" not in done.stdout   # no summary of an unfinished eval
+
+
+def test_ctrl_c_before_the_output_directory_exists_says_nothing_was_written_and_exits_130(tmp_path):
+    done, eval_dir = run_interrupted_cli(tmp_path, "before")
+
+    assert done.returncode == 130
+    assert "Traceback" not in done.stderr and "KeyboardInterrupt" not in done.stderr
+    assert "Interrupted" in done.stderr and "No output directory was made" in done.stderr
+    assert not eval_dir.exists()
+    with sqlite3.connect(tmp_path / "cli.db") as db:
+        assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0

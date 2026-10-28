@@ -15,11 +15,12 @@ from pathlib import Path
 from . import orchestrator, store, tracing
 from .agents import curator as curator_agent
 from .agents import reviewer, translator
+from .agents.kb_tools import KB_SNIPPET_CHARS
 from .agents.loop import DEFAULT_MAX_STEPS
 from .agents.translator import TranslatorResult
 from .datasets.openmantra import Page, Segment
 from .kb import curator as curator_rules
-from .kb.entities import KEY_FIELDS
+from .kb.entities import APPROVED, CHARACTER, KEY_FIELDS, TERM, GlossaryEntry
 from .kb.loader import load_snapshot
 from .kb.snapshot import KBSnapshot
 from .llm.client import LLMClient
@@ -184,6 +185,9 @@ def translate_page(
     stay undecided, and `apply` still applies names, confirmations and conflicts by rule. A failure in `apply` fails the
     Run (`RunCrashed`), with nothing stored and nothing written to the KB. A page whose Orchestrator failed has no
     proposals, no Curator call and no write. The `attempts_json` is the Orchestrator's plus
+      "kb_snippets": [{"kind": "term" | "character", "key": <source term or name>,
+                       "status": "approved" | "pending"}, ...]   # what the snippets part carried, in its order; also
+                                                                 # recorded when the Orchestrator failed
       "finalize": null (the Orchestrator failed) | {"kb_id",
         "curator": {"status", "error", "asked": [proposal ids], "decisions": [{"id", "accept", "reason"}],
                     "attempts": <the Curator Agent's record>},
@@ -276,6 +280,7 @@ def _translate_page(
                 fallback_budget=page_budget, max_tokens=max_tokens, max_steps=max_steps, kb=kb,
             )
             if kb is not None:
+                result.attempts["kb_snippets"] = _shown_snippets(page, kb)
                 result.attempts["finalize"] = None if not result.ok else _finalize(
                     conn, page, kb, run_id, result, client, curator_budget=curator_budget, max_tokens=max_tokens,
                     max_steps=max_steps,
@@ -301,6 +306,18 @@ def _translate_page(
         raise RunCrashed(run_id, error, trace_id) from e
     _describe_run(span, client, "succeeded" if result.ok else "failed", result.error, result)
     return Outcome(run_id, result, trace_id)
+
+
+def _shown_snippets(page: Page, kb: KBSnapshot) -> list[dict]:
+    """The KB items the agents' snippets part carried for `page`, in its order, as the Run records them: the same
+    snapshot, text and budget as `kb_tools.kb_snippets_part`, through the one function that decides which items match
+    (`KBSnapshot.snippet_items`), so the record is what the prompt had. `key` is the entry's source term or the
+    profile's name, which is also what a found lookup returns."""
+    shown = []
+    for item in kb.snippet_items("\n".join(s.ja for s in page.segments), KB_SNIPPET_CHARS):
+        kind, key = (TERM, item.source_term) if isinstance(item, GlossaryEntry) else (CHARACTER, item.name_src)
+        shown.append({"kind": kind, "key": key, "status": "approved" if item.status == APPROVED else "pending"})
+    return shown
 
 
 def _check_kb(conn: sqlite3.Connection, book_title: str, config: str, kb_id: int | None) -> None:

@@ -18,10 +18,11 @@ the book that is in the database, in page order (a page without text is skipped,
 Outputs go to runs/eval/<id>/: manifest.json, segments.jsonl, scores.json. They are written page by page: after
 each page the three files cover the pages done so far, with the scores of those pages. So an eval that is stopped
 (Ctrl-C, a crash, a killed process) leaves the outputs of the pages it finished: its manifest has "finished_at"
-null and the pages it did not reach "pending". It is not continued; to finish it, run the whole eval again. A
-missing LLM configuration stops the eval before the KB and the directory are made. The logic lives in
-fukidashi.evaluation; the exit code is 0 when every page was scored or skipped, 1 when a page failed, 2 when the
-harness could not start (including a book with no pages in the database).
+null and the pages it did not reach "pending". It is not continued; to finish it, run the whole eval again.
+Ctrl-C prints where the finished pages are (or that no directory was made yet) and exits with code 130. A missing
+LLM configuration stops the eval before the KB and the directory are made. The logic lives in fukidashi.evaluation;
+the exit code is 0 when every page was scored or skipped, 1 when a page failed, 2 when the harness could not start
+(including a book with no pages in the database), 130 when it was interrupted.
 
 With FUKIDASHI_TRACING=phoenix (shell or .env) and a Phoenix running on this machine, every page leaves one trace there;
 its ID is in the outputs.
@@ -90,6 +91,13 @@ def main() -> int:
     except (LLMNotConfigured, TracingEnabled) as e:
         print(f"Stopped before any model call: {e}", file=sys.stderr)
         return 2
+    except KeyboardInterrupt as e:
+        out_dir = getattr(e, "out_dir", None)  # set by run_eval once the directory exists
+        where = ("No output directory was made." if out_dir is None else
+                 f"The pages finished so far are in {out_dir} (finished_at is null in its manifest.json). "
+                 "The eval is not continued: run it again to finish it.")
+        print(f"\nInterrupted. {where}", file=sys.stderr)
+        return 130
     finally:
         conn.close()
         tracing.shutdown()  # sends the last spans; with no Phoenix listening this waits for the exporter's timeout
