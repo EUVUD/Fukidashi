@@ -117,7 +117,7 @@ def run_eval(
         except runs.RunCrashed as e:  # the Run exists: failed, or still running if the database failed too
             run_id, error, trace_id = e.run_id, e.error, e.trace_id
         except Exception as e:  # no Run row exists yet (make_client or start_run raised); keep the other pages
-            run_id, error = None, f"{type(e).__name__}: {e}"
+            run_id, error, trace_id = None, f"{type(e).__name__}: {e}", getattr(e, "trace_id", None)
         else:
             run_id, error, trace_id = outcome.run_id, outcome.result.error, outcome.trace_id
         latency = time.monotonic() - start

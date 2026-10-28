@@ -6,14 +6,18 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import sqlite3
 import time
 import types
 
 import httpx
 import pytest
+import requests
 from conftest import FakeClient, completion, mock_llm_client
 from fastapi.testclient import TestClient
-from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExporter, SpanExportResult
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from test_agent_loop import Provider, answer, ask, call
 from test_evaluation import run_cli
@@ -22,8 +26,10 @@ from test_translator import BOOK, imported, previous_context, root, translate, z
 from fukidashi import config as app_config
 from fukidashi import main, runs, store, tracing
 from fukidashi.agents import loop
+from fukidashi.api.deps import get_client_factory
 from fukidashi.evaluation import harness
-from fukidashi.tracing import redact
+from fukidashi.llm.client import LLMNotConfigured
+from fukidashi.tracing import backends, redact
 
 OPENAI_SCOPE = "openinference.instrumentation.openai"
 API_KEY = "sk-test-SECRET-0123456789"
@@ -186,6 +192,72 @@ def test_a_page_that_cannot_be_translated_still_leaves_its_trace_with_the_error(
     (top,) = traced.spans()
     assert top.attributes["fukidashi.page_index"] == 99 and top.status.status_code.name == "ERROR"
     assert "fukidashi.run_id" not in top.attributes  # no Run existed
+
+
+# --- a page that fails before its Run exists keeps its trace ID ----------------------------------------------------
+
+def not_configured():
+    raise LLMNotConfigured("Set LLM_API_KEY in .env (see .env.example)")
+
+
+def run_cannot_start(monkeypatch):
+    def start_run(*args, **kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(store, "start_run", start_run)
+
+
+@pytest.mark.parametrize("config", ["baseline", "translator"])
+@pytest.mark.parametrize("failure, error_type", [
+    ("page_missing", runs.PageNotFound),
+    ("not_configured", LLMNotConfigured),
+    ("run_cannot_start", sqlite3.OperationalError),
+])
+def test_an_early_failure_leaves_a_trace_with_the_error_and_the_exception_carries_its_id(
+        imported, root, traced, monkeypatch, config, failure, error_type):
+    if failure == "run_cannot_start":
+        run_cannot_start(monkeypatch)
+    make_client = not_configured if failure == "not_configured" else (lambda: FakeClient([]))
+
+    with pytest.raises(error_type) as raised:  # the same type as without tracing
+        runs.translate_page(imported, BOOK, 99 if failure == "page_missing" else 1, make_client=make_client,
+                            dataset_root=root, config=config)
+
+    (top,) = traced.spans()
+    assert top.status.status_code.name == "ERROR" and any(e.name == "exception" for e in top.events)
+    assert "fukidashi.run_id" not in top.attributes  # no Run existed
+    assert imported.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+    assert raised.value.trace_id == trace_id_of(top) and len(raised.value.trace_id) == 32
+
+
+@pytest.mark.parametrize("failure", ["page_missing", "not_configured", "run_cannot_start"])
+def test_an_early_failure_with_tracing_off_carries_no_id(imported, root, monkeypatch, failure):
+    if failure == "run_cannot_start":
+        run_cannot_start(monkeypatch)
+
+    with pytest.raises((runs.PageNotFound, LLMNotConfigured, sqlite3.OperationalError)) as raised:
+        runs.translate_page(imported, BOOK, 99 if failure == "page_missing" else 1, config="baseline",
+                            make_client=not_configured if failure == "not_configured" else (lambda: FakeClient([])),
+                            dataset_root=root)
+
+    assert raised.value.trace_id is None
+
+
+def test_an_exception_that_takes_no_attributes_is_raised_as_it_is(imported, root, traced):
+    class Sealed(Exception):
+        def __setattr__(self, name, value):  # the ID cannot be attached
+            if name == "trace_id":
+                raise AttributeError(name)
+            super().__setattr__(name, value)
+
+    def make_client():
+        raise Sealed("sealed")
+
+    with pytest.raises(Sealed):
+        runs.translate_page(imported, BOOK, 1, make_client=make_client, dataset_root=root, config="baseline")
+
+    (top,) = traced.spans()
+    assert top.status.status_code.name == "ERROR"
 
 
 # --- AC3: a translator page is one trace -----------------------------------------------------------------------
@@ -433,6 +505,74 @@ def test_phoenix_gets_the_project_name_as_the_resource_attribute_it_reads(monkey
     backend.exporter.shutdown()
 
 
+# --- the endpoint rule holds on the wire: no proxy, no OTLP endpoint variable -----------------------------------
+
+LOCAL_ENDPOINT = backends.PHOENIX_DEFAULT_ENDPOINT
+PROXY_VARIABLES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+
+
+@pytest.fixture
+def wire(monkeypatch):
+    """Every request that reaches `requests`' adapter, as (url, proxies the session resolved). Nothing is sent."""
+    sent = []
+
+    def send(self, request, **kwargs):
+        sent.append((request.url, kwargs.get("proxies")))
+        response = requests.Response()
+        response.status_code, response.reason, response._content = 200, "OK", b""
+        response.url, response.request = request.url, request
+        return response
+
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", send)
+    return sent
+
+
+def export_one_span(exporter):
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with provider.get_tracer("test").start_as_current_span("span"):
+        pass
+    provider.shutdown()
+
+
+def test_the_phoenix_exporter_ignores_proxy_settings_from_the_environment(monkeypatch, wire):
+    for name in ("NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    for name in PROXY_VARIABLES:
+        monkeypatch.setenv(name, "http://127.0.0.1:9")
+    # the environment would send a plain session's request to the proxy, so the assertion below is not vacuous
+    assert requests.Session().merge_environment_settings(LOCAL_ENDPOINT, {}, None, None, None)["proxies"]
+
+    export_one_span(tracing.BACKENDS["phoenix"]().exporter)
+
+    assert wire == [(LOCAL_ENDPOINT, {})]
+
+
+def test_the_direct_session_reads_nothing_from_the_environment(monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+
+    session = backends.direct_session()
+
+    assert session.trust_env is False
+    assert session.merge_environment_settings("https://example.com/", {}, None, None, None)["proxies"] == {}
+
+
+@pytest.mark.parametrize("endpoint", [None, "http://127.0.0.1:4318/v1/traces"])
+def test_the_otlp_endpoint_variables_do_not_move_the_phoenix_exporter(monkeypatch, wire, endpoint):
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector.example.com")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "https://collector.example.com/v1/traces")
+    if endpoint:
+        monkeypatch.setenv("PHOENIX_COLLECTOR_ENDPOINT", endpoint)
+    export_one_span(OTLPSpanExporter())  # an exporter nobody configured follows the variables, so the test can tell
+    assert [url for url, _ in wire] == ["https://collector.example.com/v1/traces"]
+    wire.clear()
+
+    backend = tracing.BACKENDS["phoenix"]()
+    export_one_span(backend.exporter)
+
+    assert [url for url, _ in wire] == [endpoint or LOCAL_ENDPOINT] and backend.info["endpoint"] == wire[0][0]
+
+
 def test_setup_is_idempotent_and_shutdown_removes_the_instrumentation(monkeypatch, traced):
     from openinference.instrumentation.langchain import LangChainInstrumentor
     from openinference.instrumentation.openai import OpenAIInstrumentor
@@ -506,6 +646,21 @@ def test_an_api_request_leaves_one_trace(api, traced):
     assert top.attributes["fukidashi.run_status"] == "succeeded"
 
 
+@pytest.mark.parametrize("page, status", [(99, 404), (2, 422), (1, 503)])
+def test_the_api_keeps_its_status_codes_for_early_failures_with_tracing_on(api, traced, conn, page, status):
+    client, _ = api
+    main.app.dependency_overrides[get_client_factory] = lambda: not_configured  # only page 1 gets as far as the client
+
+    response = client.post(f"/api/pages/book_a/{page}/translate")
+
+    assert response.status_code == status
+    if status == 503:
+        assert response.json()["detail"] == "Set LLM_API_KEY in .env (see .env.example)"
+    (top,) = traced.spans()
+    assert top.attributes["fukidashi.page_index"] == page and top.status.status_code.name == "ERROR"
+    assert conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+
+
 # --- AC7: the eval harness -------------------------------------------------------------------------------------
 
 def eval_with(conn, root, tmp_path, provider, pages, *, config):
@@ -544,6 +699,68 @@ def test_a_crashed_page_has_its_trace_id_in_the_eval_rows_too(imported, root, tm
     (crashed,) = result.scores["failed_pages"]
     assert crashed["error"] == "RuntimeError: crashed" and crashed["trace_id"] == roots[2]
     assert [p["trace_id"] for p in result.manifest["pages"]] == [roots[1], roots[2]]
+
+
+@pytest.mark.parametrize("failure", ["make_client", "run_cannot_start"])
+def test_a_page_that_fails_before_its_run_exists_has_its_trace_id_in_the_eval_rows_too(
+        imported, root, tmp_path, traced, monkeypatch, failure):
+    makes, starts = [], []
+    real_start_run = store.start_run
+
+    def start_run(*args, **kwargs):
+        starts.append(1)
+        if failure == "run_cannot_start" and len(starts) == 2:  # page 2
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_start_run(*args, **kwargs)
+
+    def make_client():
+        makes.append(1)
+        if failure == "make_client" and len(makes) == 2:  # page 2
+            raise RuntimeError("no client")
+        return mock_llm_client(provider)
+
+    monkeypatch.setattr(store, "start_run", start_run)
+    provider = Provider(answer(zh_json(1)))
+
+    result = harness.run_eval(imported, config="baseline", book=BOOK, page_indexes=[1, 2], make_client=make_client,
+                              dataset_root=root, out_root=tmp_path / "out", repo_root=app_config.ROOT)
+
+    roots = {s.attributes["fukidashi.page_index"]: trace_id_of(s) for s in traced.spans() if s.parent is None}
+    (early,) = result.scores["failed_pages"]
+    assert set(roots) == {1, 2} and early["page_index"] == 2 and early["run_id"] is None
+    assert early["error"].split(":")[0] in {"RuntimeError", "OperationalError"} and early["trace_id"] == roots[2]
+    assert [(p["page_index"], p["trace_id"]) for p in result.manifest["pages"]] == [(1, roots[1]), (2, roots[2])]
+    assert [p["trace_id"] for p in result.scores["pages"]] == [roots[1]]
+    assert result.exit_code == 1
+
+
+def test_a_missing_llm_setting_still_stops_the_eval_and_its_exception_names_the_trace(imported, root, tmp_path,
+                                                                                      traced):
+    with pytest.raises(LLMNotConfigured) as raised:
+        harness.run_eval(imported, config="baseline", book=BOOK, page_indexes=[1, 2], make_client=not_configured,
+                         dataset_root=root, out_root=tmp_path / "out", repo_root=app_config.ROOT)
+
+    (top,) = traced.spans()  # the first page stopped it
+    assert raised.value.trace_id == trace_id_of(top) and top.status.status_code.name == "ERROR"
+
+
+def test_an_early_failure_has_a_null_trace_id_in_the_eval_rows_when_tracing_is_off(imported, root, tmp_path,
+                                                                                    monkeypatch):
+    real_start_run = store.start_run
+    starts = []
+
+    def start_run(*args, **kwargs):
+        starts.append(1)
+        if len(starts) == 2:
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_start_run(*args, **kwargs)
+
+    monkeypatch.setattr(store, "start_run", start_run)
+
+    result = eval_with(imported, root, tmp_path, Provider(answer(zh_json(1))), [1, 2], config="baseline")
+
+    assert [(p["page_index"], p["run_id"], p["trace_id"]) for p in result.scores["failed_pages"]] == [(2, None, None)]
+    assert [(p["page_index"], p["trace_id"]) for p in result.manifest["pages"]] == [(1, None), (2, None)]
 
 
 def test_eval_rows_have_a_null_trace_id_and_the_manifest_says_off_when_tracing_is_off(imported, root, tmp_path):
