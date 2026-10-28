@@ -1,6 +1,6 @@
 # Fukidashi — Project Outline
 
-> v0.21 · 2026-10-28
+> v0.22 · 2026-10-28
 > **v0.2 (2026-10-22):** evaluation changed from a research-style controlled experiment to a standard evaluation framework plus a baseline comparison (plan B); see §4.
 > **v0.3 (2026-10-22):** M0 decisions recorded in §8: name Fukidashi, ja → zh-Hans, an OpenAI-compatible provider, a $100 budget cap.
 > **v0.4 (2026-10-24):** M1 added the term Run (§0).
@@ -21,6 +21,7 @@
 > **v0.19 (2026-10-28):** after the KB tools (#31): §3.2 and §3.4 record the agents' KB tools and where the snippets go; §3.3 marks the order of parallel proposals as settled.
 > **v0.20 (2026-10-28):** after hardening the KB seams (#33): §3.3 records the conflict across kinds and the first call's payload as built, and updates what is still open.
 > **v0.21 (2026-10-28):** M3 done (§7, `docs/m3.md`) after the Curator and `full` (#35): §3.2, §3.3, §3.5, §3.6 and §4.2 record what is built; §3.3 updates what is still open; §9 notes what the first `full` run showed about the KB.
+> **v0.22 (2026-10-28):** M4 decisions in §8: the COMET checkpoint, the term accuracy rules (§4.7) and the budget for the dev runs. §7 moves term accuracy from M5 to M4, before the dev runs, and records M4's cost estimate. §4.8 records that the eval harness writes its outputs page by page (#37).
 > Convention: code, docs, commit messages and reports use the canonical terms in §0.
 
 ---
@@ -339,9 +340,9 @@ Every quality metric in both comparisons gets a paired bootstrap 95% CI. Primary
 | Metric | Tool | Use | Notes |
 |---|---|---|---|
 | **chrF / BLEU** | sacreBLEU | Corpus-level; the report includes the **sacreBLEU signature** | With Chinese as the target, BLEU uses `tokenize=zh`; chrF needs no tokenization |
-| **COMET / xCOMET** | Unbabel COMET | The main neural metric, reference-based; **required** | If it does not run on the Mac, use the Windows machine's GPU; check license and memory of the checkpoints (for example `Unbabel/wmt22-comet-da`, `Unbabel/XCOMET-XL`) in M4 |
+| **COMET / xCOMET** | Unbabel COMET | The main neural metric, reference-based; **required** | COMET is `Unbabel/wmt22-comet-da` (Apache-2.0), run on the Mac's CPU. xCOMET is `Unbabel/XCOMET-XL` (CC BY-NC-SA 4.0, gated), run on the Windows machine's GPU if it fits; otherwise COMET only (§8) |
 | **GEMBA-MQM** | LLM-as-judge | Marks error spans with error category and severity (minor / major / critical) per segment, aggregated into an MQM score and error breakdown; **replaces the custom failure taxonomy** | The judge model differs from the translation model; run the human agreement check (§4.5) first |
-| **Term accuracy / consistency** | Ours, against the gold glossary | Measures the KB | Primary metric of the KB ablation |
+| **Term accuracy / consistency** | Ours, against the gold glossary | Measures the KB | Term accuracy is the primary metric of the KB ablation; its rules are in §4.7 |
 | **Cost per page** | Our metering | Cost of all of the system's own LLM calls; unknown usage counted separately | The evaluation's own cost (judge calls, COMET GPU time) is tracked separately, not as system cost |
 | **Latency** | Our timer | End-to-end wall-clock time per page, reported as p50 / p95 | |
 | Overflow rate | Typesetter | Product metric | Not part of the §4.3 comparisons |
@@ -374,12 +375,20 @@ Every quality metric in both comparisons gets a paired bootstrap 95% CI. Primary
     - no term is longer than 20 characters, so no sentence of the dataset enters git.
   - **Tools for the author.** `candidates` and `sheet` write candidate lists and review sheets to `runs/glossary/`; they quote the dataset and are gitignored.
   - **Entries.** `tojime_no_siora` has 20 and `boureisougi` 17 (its names and coined terms ran out). Every entry occurs on 2 or more pages. The author approved all of them as drafted.
-  - **Ordinary words.** 15 of the 37 entries are recurring ordinary words, marked as borderline in their notes. How term accuracy treats them, and how it matches terms, is decided in M5 (`IDEAS.md`).
+  - **Ordinary words.** 15 of the 37 entries are recurring ordinary words, marked as borderline in their notes. Term accuracy leaves them out of its primary score (below).
+- **Term accuracy (§8, decided 2026-10-28; built in M4, before the dev runs):**
+  - **Entries.** The primary score covers the entries that are not borderline (22 of the dev split's 37: names and coined terms). A second score covers all entries. Borderline becomes a structured field of the entry, not a note.
+  - **Occurrence.** A segment counts for an entry when its Japanese text contains the entry's source or an alias *and* its converted reference contains the target or a variant. Where the reference translator did not use the term, the reference cannot say what is right, so the segment is left out. This also leaves out most compounds that contain the source by accident.
+  - **Hit.** The system's translation of that segment contains the target or a variant.
+  - **Aggregation.** The primary score pools all occurrences (hits ÷ occurrences). The mean over entries is reported beside it.
+  - **Character forms.** A form that `t2s` keeps but a mainland reader would write differently (著 / 着) is listed as a variant in the glossary, not handled by normalisation code.
+  - **Consistency** is not part of M4 (§7).
 
 ### 4.8 Reproducibility
 
 - Every `eval/run.py` run writes a manifest: data hash, model IDs (translation model and judge model), config, seed, git commit, sacreBLEU signature, COMET checkpoint.
 - Raw output and trace ID are kept for every page.
+- **As built (#37):** the harness writes its outputs after every page. `finished_at` stays null until the last page is done, and pages not yet reached are `pending`, so an interrupted eval keeps the pages it finished. An interrupted eval is not continued; it is run again (`IDEAS.md`).
 
 ### 4.9 Known Limitations (stated in the report)
 
@@ -461,8 +470,8 @@ fukidashi/
 | **M1** Vertical slice | 2 | 10/19–10/25 | 3.5 | M1-a: FastAPI + SQLite + OpenMantra import (oracle boxes + source text); M1-b: C0 → the frontend shows the page image, boxes and a translation list. **Checkpoint 10/25: a real translation of one page in the browser.** **Done 2026-10-24**, see `docs/m1.md` |
 | **M2** Agent layer & eval harness | 3 | 10/26–11/1 | 3.5 | Tool-calling loop + guardrails; Translator Agent; metering; tracing tool (Phoenix, §8); eval harness: `eval/run.py` + manifest + sacreBLEU (chrF / BLEU, with signature); `baseline` scored on 3 pages, Translator Agent runs on the same 3 pages (smoke test, not a reported config). **Done 2026-10-28**, see `docs/m2.md`. `translator` scored chrF 10.67 on the 3 pages, inside `baseline`'s run-to-run spread (11.17–12.87), at about $0.0016 per page against $0.0009 |
 | **M3** KB & Reviewer | 4 | 11/2–11/8 | 3 | KB + Curator + Proposal Queue + unit tests for KB write permissions; Reviewer Agent in the full system (at most 2 rounds, fixed); gold glossary for the dev split; `baseline` / `full` / `full_no_kb` each run on 1 page. **Done 2026-10-28**, see `docs/m3.md`. Each config ran on `tojime_no_siora` pages 2–4: `full` scored chrF 10.86 and `full_no_kb` 9.28, at about $0.011 and $0.004 per page; on 27 segments that is no comparison (two `baseline` runs of the same pages differed by 1.7 chrF). Seven tasks; about 6 hours of active sessions against 3 planned (`IDEAS.md`) |
-| **M4** Dev evaluation | 5 | 11/9–11/15 | 3 | Estimate tokens and cost on 3 pages first (judge calls included) against the budget cap; set up COMET / xCOMET (Windows GPU if the Mac cannot run it) and check checkpoint licenses and memory; run all 3 configs on the dev split. **11/15: first dev numbers** (chrF / BLEU, COMET, term accuracy, cost, latency) |
-| **M5** Freeze | 6 | 11/16–11/22 | 3 | Term accuracy / consistency; GEMBA-MQM + human agreement check on about 30 segments; tune prompts and tools from the MQM error breakdown; gold glossary for the test split; one-page `eval/PROTOCOL.md`. **11/22 freeze, tag `exp-frozen`** |
+| **M4** Dev evaluation | 5 | 11/9–11/15 | 3 | Estimate tokens and cost on 3 pages first (judge calls included) against the budget cap; set up COMET / xCOMET (Windows GPU if the Mac cannot run it) and check checkpoint licenses and memory; run all 3 configs on the dev split. **11/15: first dev numbers** (chrF / BLEU, COMET, term accuracy, cost, latency). **Cost estimate (2026-10-28):** M3's runs on 3 pages put one pass of the 3 configs over the dev split's 79 pages with text at about $1.3 ($0.07 `baseline`, $0.35 `full_no_kb`, $0.87 `full`); the judge's cost is estimated in M5, once the judge model is chosen. Before the dev runs: whole-book evals that keep the pages they finished (#37), counts of how often the KB reaches a page, a COMET scorer and term accuracy (§4.7, moved here from M5) |
+| **M5** Freeze | 6 | 11/16–11/22 | 3 | Term consistency; GEMBA-MQM + human agreement check on about 30 segments; tune prompts and tools from the MQM error breakdown; gold glossary for the test split; one-page `eval/PROTOCOL.md`. **11/22 freeze, tag `exp-frozen`** |
 | **M6** Test run | 9 | 12/7–12/13 | 1 | From `exp-frozen`, run the test split in the background, each of the 3 configs once, then score with COMET. **Checkpoint 12/13** |
 | **M7** Productization | 10 | 12/14–12/20 | **12** | Editor features; SSE live trace + `Last-Event-ID` reconnect; review comments and uncertain flags highlighted; approve / reject proposals, renaming a term updates and re-typesets the whole book; end-to-end visual path; overflow rate; first demo recording. **Does not touch the eval code path.** v0.2: +3 h from the simpler evaluation |
 | **M8** Analysis | 12 | 12/28–1/3 | 2.5 | Paired bootstrap 95% CIs for both comparisons; GEMBA-MQM on the test split with an MQM error breakdown (by category and severity); cost / latency summary; charts |
@@ -503,7 +512,9 @@ fukidashi/
 | KB scope in evaluation | M3 | **Each eval run starts every book with an empty KB**, filled page by page in page order, so two eval runs of the same config start from the same state. **`pending_human` entries are readable**, marked as pending; rejected ones are not (§3.3). No human works the Human Review Queue during an eval, and every name goes there; if pending entries were hidden, no name would ever reach a later page and the KB ablation would measure little. The cost: a wrong pending entry can spread to later pages, which the Reviewer is there to catch | Decided (2026-10-28) |
 | Curator form | M3 | **Rules in code, plus one model call per page without tools** (§3.3). Deduplication, routing conflicts and names to the Human Review Queue, and the single write at finalize are code, so they hold whatever the model answers (least privilege, §1.3). The model only judges the remaining proposals. Rejected: a tool-calling Curator, which would leave the rules to the prompt; a Curator with no model at all, which would leave two agents and change the scope (`SCOPE.md` §1) | Decided (2026-10-28) |
 | Reviewer comment language | M3 | **Simplified Chinese.** The Translator reads the Issues when a page is sent back, and from M7 the editor shows them to a Chinese-reading user. The first smoke run returned English comments because the Reviewer's prompt is English; the Translator's flag reasons were already Chinese | Decided (2026-10-28) |
-| COMET checkpoint | M4 | Which COMET and xCOMET models, by license and memory | Open |
+| COMET checkpoint | M4 | **COMET: `Unbabel/wmt22-comet-da`** (Apache-2.0, not gated; XLM-R large, about 560M parameters), run on this Mac's CPU (Apple M2, 8 GB). **xCOMET: `Unbabel/XCOMET-XL`** (CC BY-NC-SA 4.0, gated: the author accepts its terms on Hugging Face), about 3.5B parameters, so about 14 GB of weights in fp32, more than the Mac's memory; it runs on the Windows machine's GPU if it fits, otherwise the report gives COMET only (§9). Rejected: `XCOMET-XXL` (10.7B). COMET scores an eval run's outputs after the run, outside the translation path, so it can run on another machine and re-score old runs | Decided (2026-10-28) |
+| Term accuracy rules | M4 | **Built in M4, before the dev runs, not in M5.** It is the primary metric of the KB ablation, and its rules are better fixed before whole-book output has been read; M5 keeps consistency. The rules are in §4.7: the primary score covers the non-borderline entries, counts an occurrence only where the reference uses the term, and pools the occurrences; all entries and the mean over entries are reported beside it | Decided (2026-10-28) |
+| Dev-run budget | M4 | **At most $3** for running the 3 configs once on both dev books (one pass is about $1.3, §7). Each config runs on its own, one book at a time, so latencies are not confounded. A run stops and is reported when more than about 10% of its pages fail or 429s repeat | Decided (2026-10-28) |
 | Judge model (GEMBA-MQM) | M5 | A strong model different from the translation model | Open |
 
 ---
