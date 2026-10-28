@@ -4,7 +4,7 @@ English | [简体中文](README.zh-CN.md)
 
 A multi-agent manga translation editor (Japanese → Simplified Chinese), evaluated on the [OpenMantra](https://github.com/mantra-inc/open-mantra-dataset) dataset against a single-call baseline with a standard MT evaluation framework.
 
-> **Status (2026-10-28):** M0, M1 and M2 are done. The vertical slice works end to end: import OpenMantra, translate a page with one model call, and check every line against its box in the browser. M2 added an eval harness that scores configs with chrF / BLEU, a first Translator Agent (the `translator` config) on a tool-calling loop over our metered client, and optional tracing in a local Arize Phoenix ([record](docs/m2.md)). M3 is under way: a gold glossary for the two dev books, a Reviewer Agent, an Orchestrator that runs the `full_no_kb` config, and the Knowledge Base's storage exist; the KB tools, the Curator and the `full` config come next.
+> **Status (2026-10-28):** M0, M1 and M2 are done. The vertical slice works end to end: import OpenMantra, translate a page with one model call, and check every line against its box in the browser. M2 added an eval harness that scores configs with chrF / BLEU, a first Translator Agent (the `translator` config) on a tool-calling loop over our metered client, and optional tracing in a local Arize Phoenix ([record](docs/m2.md)). M3 is under way: a gold glossary for the two dev books, a Reviewer Agent, an Orchestrator that runs the `full_no_kb` config, the Knowledge Base's storage, and the agents' KB tools exist; the Curator, the KB write and the `full` config come next.
 
 ## What it does
 
@@ -12,7 +12,7 @@ A multi-agent manga translation editor (Japanese → Simplified Chinese), evalua
 - **Check it where it belongs.** The editor draws each box on the page and lists source, translation and reference side by side.
 - **A first Translator Agent (M2).** The `translator` config gives the model the same page plus a tool that reads the earlier pages; a bad answer is repaired once, and otherwise the page falls back to `baseline`, visibly.
 - **Translate, review, revise (M3, in progress).** In the `full_no_kb` config an Orchestrator, plain code, runs the Translator, then a Reviewer Agent. The Reviewer works in an independent context: it sees the page, the translation and the regions the Translator flagged as uncertain, never the Translator's reasoning, and comments in Simplified Chinese. A page it sends back is revised, at most twice.
-- **Planned (M3):** tools for a Glossary and Character Profiles, and a Curator Agent that is the only writer of the per-book Knowledge Base (its storage and write rules exist; nothing uses them yet).
+- **Planned (M3):** the `full` config, in which the agents use a per-book Knowledge Base: the Translator looks up and proposes Glossary entries and Character Profiles, the Reviewer looks them up, and a Curator Agent is the only writer. The storage, the write rules and the agents' tools exist; no config uses them yet.
 
 ## How it is evaluated
 

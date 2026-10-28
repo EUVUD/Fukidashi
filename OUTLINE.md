@@ -1,6 +1,6 @@
 # Fukidashi — Project Outline
 
-> v0.18 · 2026-10-28
+> v0.19 · 2026-10-28
 > **v0.2 (2026-10-22):** evaluation changed from a research-style controlled experiment to a standard evaluation framework plus a baseline comparison (plan B); see §4.
 > **v0.3 (2026-10-22):** M0 decisions recorded in §8: name Fukidashi, ja → zh-Hans, an OpenAI-compatible provider, a $100 budget cap.
 > **v0.4 (2026-10-24):** M1 added the term Run (§0).
@@ -18,6 +18,7 @@
 > **v0.16 (2026-10-28):** M3 decisions in §8: the dev / test split (§4.1), who drafts the gold glossary (§4.7), a fresh KB for each eval run with readable `pending_human` entries (§3.3), and the Curator as code rules plus one model call per page (§3.3).
 > **v0.17 (2026-10-28):** after the gold glossary (#25) and the Reviewer (#26): §0 adds Flag, Verdict / Issue and Unusable review; §3.2 and §4.7 record what is built; §8 decides that the Reviewer writes its comments in Simplified Chinese; §10: each executor works in its own git worktree.
 > **v0.18 (2026-10-28):** after the Orchestrator and `full_no_kb` (#29) and the KB store (#28): §0 adds Send-back / Revision and KB snapshot; §3.2, §3.3 and §4.2 record what is built; §3.5 no longer claims review rounds are spans (only the root span carries the loop's outcome).
+> **v0.19 (2026-10-28):** after the KB tools (#31): §3.2 and §3.4 record the agents' KB tools and where the snippets go; §3.3 marks the order of parallel proposals as settled.
 > Convention: code, docs, commit messages and reports use the canonical terms in §0.
 
 ---
@@ -201,7 +202,17 @@ Fukidashi is a product, so it is evaluated with general, objective metrics rathe
   - a provider error or a spent budget in any stage fails the whole Run, with nothing more sent (§3.6).
 - **Budgets.** Each Translator run and each review has its own token budget.
 - **The Reviewer's comments** are in Simplified Chinese (§8).
-- **First real run** (`tojime_no_siora` pages 2–4, $0.013): the Reviewer approved all three pages on the first review, each with a note, so no page was sent back. The Revision has run only against scripted providers so far.
+- **First real run** (`tojime_no_siora` pages 2–4, $0.013): the Reviewer approved all three pages on the first review, each with a note, so no page was sent back. A separate check (#31) sent one Revision, with a made-up Issue, to the real provider: it was accepted and usable, and changed only the region the Issue named.
+
+**As built in M3, the KB tools (#31):**
+- **The switch.** `run_orchestrator` takes a KB snapshot. Without one it is `full_no_kb`, and its requests are unchanged. With one:
+  - the Translator has `lookup_term`, `lookup_character` and `propose_entry`;
+  - the Reviewer has the two lookups only;
+  - each agent has a system prompt of its own for the KB.
+- **One snapshot per page.** A page uses one snapshot and one proposal collector for all its stages, so its own proposals stay invisible to it until finalize (§3.6).
+- **Proposals.** Proposals are validated by the same code that stores them. The page's proposals come back in call order: Translator run, step, position in the reply. A failed Run returns none.
+- **Not wired yet.** No config passes a snapshot yet. That, the Curator's call and the KB write are the next task's.
+- **Real check** (`tojime_no_siora` page 3, empty KB, $0.009): the Translator looked a term up, proposed one term (a family name, as a term) and flagged one region; the Reviewer approved without a lookup. A non-empty snippets part, a character proposal and a Reviewer lookup have run only against scripted providers.
 
 **Review loop:** the Reviewer sends a page back at most twice. This is fixed; since v0.2 it is not tuned for cost parity.
 
@@ -217,23 +228,24 @@ Fukidashi is a product, so it is evaluated with general, objective metrics rathe
 - **Readable states:** lookups and KB snippets return `approved` and `pending_human` entries, the latter marked as pending; `proposed` and `rejected` entries are not returned. So a name proposed on one page reaches later pages before a human has confirmed it (§8).
 - **One KB per eval run:** each eval run starts every book with an empty KB, which fills page by page in page order; nothing carries over between eval runs. The editor keeps one KB per book (M7).
 - **Retrieval:** relevant terms and characters are matched against the source text and truncated to a character budget; the agent looks up the rest with tools. No vector database, and the report says why: terms and names are identifiers, where exact match beats embeddings.
-- **As built in M3, storage and rules (#28)** (`kb/`, nothing calls it yet):
+- **As built in M3, storage and rules (#28)** (`kb/`; the agents read it since #31, nothing writes it yet):
   - **Tables.** A `kbs` row is one KB (book, purpose `eval` or `editor`, label). The entries, profiles and proposals each belong to one KB.
   - **Profile status.** Character Profiles carry a `status` like entries do, because names go to the Human Review Queue. That queue is the set of rows with status `pending_human`, not a table of its own.
   - **Proposal IDs** come from the KB, the page, the kind and the normalised pair, so a retried page writes nothing twice. The same pair proposed on a later page becomes evidence.
   - **`curator.apply`** applies one page's proposals and the Curator's decisions in one transaction, by the rules above. It is the only code that writes KB entries, which a test checks.
-  - **Agents** will get only a KB snapshot and a proposal collector, neither of which holds a database connection. Least privilege therefore comes from what an agent has, not from its prompt.
-  - **Open for task design:**
+  - **Agents** get only a KB snapshot and a proposal collector, neither of which holds a database connection (built in #31). Least privilege therefore comes from what an agent has, not from its prompt.
+  - **Settled in #31:** the order of parallel `propose_entry` calls within one reply. Proposals follow the calls' position, not their arrival.
+  - **Still open for task design:**
     - a proposal left undecided (the Curator's call failed) cannot be decided by applying its page again;
-    - the order of parallel `propose_entry` calls within one reply decides which of two conflicting proposals wins;
-    - a name proposed as a term is not checked against the profiles.
+    - a name proposed as a term is not checked against the profiles; the first real KB run did propose a family name as a term;
+    - for two calls of one reply with the same proposal id but different details, which details are kept still depends on timing.
 
 ### 3.4 Agent Loop Guardrails
 
 - Step limit; per-page token budget; duplicate tool call detection; tool errors are passed back to the agent as they are. **Built in M2** (`agents/loop.py`): the Step limit is `max_steps` model calls (default 6); a duplicate is the same tool with the same validated arguments; the model's mistakes (an unknown tool, arguments that fail the tool's pydantic model, a handler that raises) go back as the tool's result. Nothing in the loop retries: a provider error ends the run (§3.6).
 - A reply that ended for any reason other than `stop` or `tool_calls` is never taken as the answer (stop reason `incomplete`): with thinking on, reasoning can use up `max_tokens` and leave an empty, truncated reply. Further checks (no progress, a cap on tool calls, near-duplicates, a wall-clock deadline) wait for traces that show a need (`IDEAS.md`).
 - Structured output: validate against a JSON schema, retry once on a parse failure, then **fall back visibly** to `baseline` (one call per page). **Built in M2** (`agents/translator.py`): the answer must pass `parse_translations`; a bad one gets one Repair call (the history plus the parse error, JSON output, no tools); `step_limit`, `incomplete` or a failed Repair fall back to `baseline` with a budget of its own. The Run keeps config `translator`, its attempts say why, and the eval harness counts the pages that fell back. `provider_error` and `budget` never fall back (§3.6).
-- The prompt keeps a stable prefix for prompt caching: `system → tool definitions → glossary → page`.
+- The prompt keeps a stable prefix for prompt caching: `system → tool definitions → glossary → page`. **Built in M3** (#31): with the KB on, the glossary is the user message's first text part (the page's snippets, at most about 1,000 characters), before the page image and the regions; the system prompt and the tool definitions do not change from page to page.
 - **Two DeepSeek rules:** with tools, the `reasoning_content` of every turn must be passed back unchanged in later requests (done by `LLMClientChatModel` since M2; `deepseek-flash` sends `""` on its final turn, which goes back as it is); JSON output occasionally comes back empty, which the retry above covers. Thinking is switched in `extra_body`; effort is `reasoning_effort` (`low` / `high` / `max`). The M2 smoke runs (2026-10-27, text only) also showed that `response_format: json_object` is accepted together with tools.
 
 ### 3.5 Metering & Tracing

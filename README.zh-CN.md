@@ -4,7 +4,7 @@
 
 多 agent 漫画翻译编辑器（日 → 简体中文）。在 [OpenMantra](https://github.com/mantra-inc/open-mantra-dataset) 数据集上，用标准的 MT evaluation framework 和单次调用的 baseline 做对比。
 
-> **现状（2026-10-28）：** M0、M1 和 M2 已完成。vertical slice 已经跑通：导入 OpenMantra，对一页做一次模型调用完成翻译，在浏览器里逐句对照图上的 box 检查译文。M2 新增了用 chrF / BLEU 给各个 config 打分的 eval harness；第一版 Translator Agent（即 `translator` config），它跑在调用工具的 agent loop 上，底下是带计量的 client；还有可选的 tracing，trace 发到本机的 Arize Phoenix（[记录](docs/m2.md)）。M3 正在进行：两部 dev 作品的 gold glossary、Reviewer Agent、运行 `full_no_kb` config 的 Orchestrator，以及 Knowledge Base 的存储已经有了；接下来是 KB tools、Curator 和 `full` config。
+> **现状（2026-10-28）：** M0、M1 和 M2 已完成。vertical slice 已经跑通：导入 OpenMantra，对一页做一次模型调用完成翻译，在浏览器里逐句对照图上的 box 检查译文。M2 新增了用 chrF / BLEU 给各个 config 打分的 eval harness；第一版 Translator Agent（即 `translator` config），它跑在调用工具的 agent loop 上，底下是带计量的 client；还有可选的 tracing，trace 发到本机的 Arize Phoenix（[记录](docs/m2.md)）。M3 正在进行：两部 dev 作品的 gold glossary、Reviewer Agent、运行 `full_no_kb` config 的 Orchestrator、Knowledge Base 的存储，以及两个 agent 的 KB tools 已经有了；接下来是 Curator、写入 KB 和 `full` config。
 
 ## 它做什么
 
@@ -12,7 +12,7 @@
 - **在原位检查。** 编辑器在页面上画出每个 box，并把原文、译文和参考译文并排列出。
 - **第一版 Translator Agent（M2）。** `translator` config 给模型同样的一页，外加一个读取前几页的工具；答案不合格时修复一次，仍不行就回退到 `baseline`，并且会明确记录下来。
 - **翻译、审校、修改（M3，进行中）。** 在 `full_no_kb` config 里，由 Orchestrator（普通代码）先运行 Translator，再运行 Reviewer Agent。Reviewer 在 independent context 里工作：它看得到页面、译文和 Translator 标为不确定的区域，看不到 Translator 的推理，审校意见用简体中文写。被退回的页面由 Translator 修改，最多两次。
-- **计划中（M3）：** 查 Glossary 和 Character Profiles 的 tools；Curator Agent 是每本书 Knowledge Base 唯一的写者（KB 的存储和写入规则已经有了，但还没有被使用）。
+- **计划中（M3）：** `full` config，让两个 agent 用上每本书的 Knowledge Base：Translator 查询并提议 Glossary 条目和 Character Profiles，Reviewer 只查询，Curator Agent 是唯一的写者。KB 的存储、写入规则和两个 agent 的 tools 都已经有了，但还没有 config 用上它们。
 
 ## 怎么评测
 
