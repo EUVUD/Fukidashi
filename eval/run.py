@@ -3,9 +3,11 @@
 Usage:
   uv run python eval/run.py --config baseline --book tojime_no_siora --pages 2,3,4
   uv run python eval/run.py --config translator --book tojime_no_siora --pages 2,3,4
+  uv run python eval/run.py --config full_no_kb --book tojime_no_siora --pages 2,3,4
 
 This makes real model calls: one per page for baseline, several for translator (the agent's steps, a repair,
-and the fallback to baseline when it comes to that). Outputs go to runs/eval/<id>/: manifest.json, segments.jsonl,
+and the fallback to baseline when it comes to that), and for full_no_kb those plus a review, and up to two
+more rounds of revision and review per page. Outputs go to runs/eval/<id>/: manifest.json, segments.jsonl,
 scores.json. The logic lives in fukidashi.evaluation; the exit code is 0 when every page was scored or
 skipped, 1 when a page failed, 2 when the harness could not start.
 
