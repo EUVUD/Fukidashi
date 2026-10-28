@@ -48,6 +48,7 @@ Check every region against the Japanese and the image:
 Look closely at the flagged regions: confirm the concern or clear it.
 
 Answer "approve" when the translation can stand as it is, even if you would have chosen other words. Answer "revise" only when at least one region needs a change; then give one issue for each region that needs it, with a comment that says what is wrong and a suggestion with the Chinese you would use. An "approve" may carry issues as notes: the comment says what you noticed, the suggestion is null, and nothing needs to change. Give at most one issue per region.
+Write every comment and every suggestion in Simplified Chinese (zh-Hans), not in English or Japanese. Quote the Japanese text only where you must point at it.
 
 Answer with only JSON in this shape:
 {"verdict": "approve" or "revise", "issues": [{"id": 0, "comment": "...", "suggestion": "..." or null}]}"""

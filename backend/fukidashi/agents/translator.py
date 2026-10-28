@@ -9,18 +9,23 @@ have been billed, and OUTLINE §3.6 leaves resending to the user.
 With the `flagging` switch on, the agent also has `flag_uncertain`, which marks regions for the Reviewer to look at
 closely (OUTLINE §3.2). The switch is off for the `translator` config, so its requests stay what they were in M2.
 
+Given a `Revision`, the run is a revision: the Reviewer sent the page back, and the user message also carries the
+current translation and the Reviewer's Issues. It has the same tools and the same Repair, but no fallback: a revision
+that gives no usable answer is `unusable`, and the translation it was meant to replace stands.
+
 This module imports no LangChain and no database: the earlier pages are read by the caller before the run starts,
 because tool handlers run in LangGraph worker threads.
 """
 
 from __future__ import annotations
 
+import json
 import threading
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
-from typing import Annotated
+from typing import Annotated, Any
 
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints, field_validator
 
 from ..datasets.openmantra import Page
 from ..llm.client import LLMClient
@@ -111,6 +116,13 @@ class FlagUncertainArgs(BaseModel):
         description=f"Why, in one short sentence (at most {MAX_REASON_CHARS} characters).",
     )
 
+    @field_validator("id", mode="before")
+    @classmethod
+    def _not_a_boolean(cls, value: Any) -> Any:
+        if isinstance(value, bool):  # pydantic would read true as 1; parse_verdict refuses it too
+            raise ValueError("Input should be a valid integer, not a boolean")
+        return value
+
 
 class FlagCollector:
     """The flags one run collects through `flag_uncertain`, for the region ids of one page.
@@ -147,12 +159,21 @@ class FlagCollector:
             return sorted(self._flags, key=lambda f: f["id"])  # stable: one region's flags keep the order they came in
 
 
+@dataclass(frozen=True)
+class Revision:
+    """What a revision run is given besides the page: the translation the Reviewer sent back, and its Issues."""
+
+    translations: Mapping[int, str]  # region id -> zh-Hans, for every region of the page
+    issues: Sequence[Mapping]  # the Reviewer's {"id", "comment", "suggestion"}
+
+
 @dataclass
 class TranslatorResult:
     translations: dict[int, str] | None  # region id -> zh-Hans; None when the run failed
     attempts: dict  # what `runs.py` stores: see run_translator
     error: str | None = None  # why translations is None
     flags: list[dict] = field(default_factory=list)  # {"id", "reason"}; see run_translator
+    unusable: bool = False  # a revision that gave no usable answer; see run_translator. Never true for a first pass
 
     @property
     def ok(self) -> bool:
@@ -174,6 +195,7 @@ def run_translator(
     max_tokens: int = baseline.DEFAULT_MAX_TOKENS,
     max_steps: int = DEFAULT_MAX_STEPS,
     flagging: bool = False,
+    revision: Revision | None = None,
 ) -> TranslatorResult:
     """Translate one page. Never raises for provider errors or bad output: they end up in `error`.
 
@@ -187,8 +209,16 @@ def run_translator(
     it flagged: {"id", "reason"}, in region order. Flags count only when the page's answer is the agent's or its repair's;
     after a fallback, or a failed run, `flags` is empty (the agent's steps still show the calls). With it off, which
     is the default, the requests are the M2 `translator`'s.
+
+    With a `revision`, the user message is `baseline`'s followed by one more text part: the current translation and
+    the Issues. The record, the tools and the Repair are the same, and so is the budget (`agent_budget`, its own), but
+    there is no fallback (`fallback_budget` is not used): when the agent stops with the Step limit or a cut-off reply,
+    or the answer and its Repair stay unparseable, the result is `unusable` (no translations, `error` says why).
+    A `revision` that does not fit the page is a `ValueError`, raised before any request.
     """
     ids = [s.index for s in page.segments]
+    if revision is not None:
+        _check_revision(revision, ids)
     budget = PageBudget(page.page_id, agent_budget)
     tools = [previous_context_tool(previous, page.page_index)]
     collector = FlagCollector(ids) if flagging else None
@@ -197,7 +227,7 @@ def run_translator(
     agent = run_agent(
         client, budget,
         system_prompt=FLAG_SYSTEM_PROMPT if flagging else SYSTEM_PROMPT,
-        user_message=baseline.build_messages(page)[1]["content"],  # the user message baseline sends, unchanged
+        user_message=_user_message(page, revision),
         tools=tools,
         max_tokens=max_tokens, json_output=True, max_steps=max_steps,
     )
@@ -239,9 +269,49 @@ def run_translator(
     else:  # step_limit or incomplete
         reason = f"{agent.stop_reason}: {agent.error}"
 
+    if revision is not None:  # no fallback: the translation the revision was meant to replace stands
+        return TranslatorResult(None, record, reason, unusable=True)
     fallback = baseline.run_baseline(page, client, PageBudget(page.page_id, fallback_budget), max_tokens=max_tokens)
     record["fallback"] = {"reason": reason, "attempts": fallback.attempts}
     return TranslatorResult(fallback.translations, record, fallback.error)
+
+
+def _user_message(page: Page, revision: Revision | None) -> list[dict]:
+    """The user message baseline sends, unchanged; for a revision, one more text part after it."""
+    content = baseline.build_messages(page)[1]["content"]
+    if revision is None:
+        return content
+    return [*content, {"type": "text", "text": revision_text(revision)}]
+
+
+def revision_text(revision: Revision) -> str:
+    """The text part of a revision's user message: the current translation, the Issues, and what to do with them.
+
+    Only the Reviewer's Issues (comment and suggestion) and the translation go in, nothing of how either was made.
+    """
+    current = "\n".join(json.dumps({"id": i, "zh": zh}, ensure_ascii=False)
+                        for i, zh in sorted(revision.translations.items()))
+    issues = "\n".join(
+        json.dumps({"id": i["id"], "comment": i["comment"], "suggestion": i.get("suggestion")}, ensure_ascii=False)
+        for i in revision.issues)
+    return (
+        "A reviewer has read your translation of this page and sent it back for revision.\n\n"
+        f"Current translation, one JSON object per line:\n{current}\n\n"
+        "The reviewer's issues, one JSON object per line (the comments and suggestions are in Simplified Chinese):\n"
+        f"{issues}\n\n"
+        "Revise the translation. Fix each region that has an issue, as its comment says. A suggestion is a proposal: "
+        "use it, or write something better. Leave the other regions as they are, unless keeping names, terms and "
+        "tone consistent needs a change there. Answer with the JSON in the same shape as before, with one entry for "
+        "every region id of this page, the changed and the unchanged ones."
+    )
+
+
+def _check_revision(revision: Revision, ids: list[int]) -> None:
+    if set(revision.translations) != set(ids):
+        raise ValueError(f"the revision's translations must have exactly the region ids {ids}, "
+                         f"got {sorted(revision.translations)}")
+    if unknown := sorted({i["id"] for i in revision.issues} - set(ids)):
+        raise ValueError(f"issues for region ids {unknown} that are not on the page {ids}")
 
 
 def repair_messages(history: list[dict], parse_error: str, ids: list[int]) -> list[dict]:

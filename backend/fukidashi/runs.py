@@ -11,17 +11,19 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import store, tracing
-from .agents import translator
+from . import orchestrator, store, tracing
+from .agents import reviewer, translator
 from .agents.loop import DEFAULT_MAX_STEPS
 from .agents.translator import TranslatorResult
 from .datasets.openmantra import Page, Segment
 from .llm.client import LLMClient
 from .llm.metering import PageBudget
+from .orchestrator import OrchestratorResult
 from .pipeline import baseline
 from .pipeline.baseline import BaselineResult
 
-CONFIGS = (baseline.CONFIG_NAME, translator.CONFIG_NAME)
+CONFIGS = (baseline.CONFIG_NAME, translator.CONFIG_NAME, orchestrator.CONFIG_NAME)
+AGENT_CONFIGS = (translator.CONFIG_NAME, orchestrator.CONFIG_NAME)  # the configs whose Translator has earlier pages
 
 
 class TranslateError(Exception):
@@ -59,7 +61,7 @@ class RunCrashed(RuntimeError):
 @dataclass(frozen=True)
 class Outcome:
     run_id: int
-    result: BaselineResult | TranslatorResult  # ok, error and attempts of the config's run
+    result: BaselineResult | TranslatorResult | OrchestratorResult  # ok, error and attempts of the config's run
     trace_id: str | None = None  # the page's trace; None when tracing is off
 
 
@@ -93,13 +95,18 @@ def run_params(
     page_budget: int,
     max_tokens: int,
     agent_budget: int = translator.DEFAULT_PAGE_BUDGET,
+    review_budget: int = reviewer.DEFAULT_REVIEW_BUDGET,
     max_steps: int = DEFAULT_MAX_STEPS,
 ) -> dict:
     """The parameters a Run records. `page_budget` is the token budget of the `baseline` call: the page's own for
-    `baseline`, the fallback's for `translator`, which also has the agent's budget and its Step limit."""
+    `baseline`, the fallback's for `translator` and `full_no_kb`, which also have the agent's budget and its Step
+    limit. `full_no_kb` has the Reviewer's budget too, and the number of times a page can be sent back."""
     if config == translator.CONFIG_NAME:
         return {"agent_budget": agent_budget, "fallback_budget": page_budget, "max_steps": max_steps,
                 "max_tokens": max_tokens}
+    if config == orchestrator.CONFIG_NAME:
+        return {"agent_budget": agent_budget, "review_budget": review_budget, "fallback_budget": page_budget,
+                "max_steps": max_steps, "max_tokens": max_tokens, "max_send_backs": orchestrator.MAX_SEND_BACKS}
     return {"page_budget": page_budget, "max_tokens": max_tokens}
 
 
@@ -135,13 +142,17 @@ def translate_page(
     page_budget: int = baseline.DEFAULT_PAGE_BUDGET,
     max_tokens: int = baseline.DEFAULT_MAX_TOKENS,
     agent_budget: int = translator.DEFAULT_PAGE_BUDGET,
+    review_budget: int = reviewer.DEFAULT_REVIEW_BUDGET,
     max_steps: int = DEFAULT_MAX_STEPS,
 ) -> Outcome:
-    """Run `config` (`baseline` or `translator`) on one page and store the Run (and its Translations when it succeeds).
+    """Run `config` (`baseline`, `translator` or `full_no_kb`) on one page and store the Run (and its Translations
+    when it succeeds).
 
-    `agent_budget` and `max_steps` are the `translator`'s; `page_budget` is `baseline`'s, which is the fallback's
-    budget for the `translator`. A `translator` Run that fell back to `baseline` is still a `translator` Run: its
-    `attempts_json` says so. An unknown `config` is a `ValueError`, raised before anything else happens.
+    `agent_budget` and `max_steps` are the Translator's; `page_budget` is `baseline`'s, which is the fallback's
+    budget for the `translator` and `full_no_kb`; `review_budget` is each review's, in `full_no_kb`. A `translator`
+    Run that fell back to `baseline` is still a `translator` Run: its `attempts_json` says so. A `full_no_kb` Run is
+    one Run for the whole page: its `attempts_json` has every stage, and a failure in any stage fails it (see
+    `orchestrator.run_orchestrator`). An unknown `config` is a `ValueError`, raised before anything else happens.
 
     `make_client` is a factory so that every Run gets its own client and Meter, and its usage is its own.
     It is called after the page is validated and before the Run row exists, so a client that cannot be
@@ -161,7 +172,8 @@ def translate_page(
         try:
             return _translate_page(
                 conn, book_title, page_index, span, make_client=make_client, dataset_root=dataset_root, config=config,
-                page_budget=page_budget, max_tokens=max_tokens, agent_budget=agent_budget, max_steps=max_steps,
+                page_budget=page_budget, max_tokens=max_tokens, agent_budget=agent_budget,
+                review_budget=review_budget, max_steps=max_steps,
             )
         except Exception as e:
             try:
@@ -183,6 +195,7 @@ def _translate_page(
     page_budget: int,
     max_tokens: int,
     agent_budget: int,
+    review_budget: int,
     max_steps: int,
 ) -> Outcome:
     trace_id = None if span is None else span.trace_id
@@ -195,12 +208,12 @@ def _translate_page(
          for s in valid.segment_rows],
     )
 
-    previous = previous_pages(conn, book_title, page_index, config) if config == translator.CONFIG_NAME else []
+    previous = previous_pages(conn, book_title, page_index, config) if config in AGENT_CONFIGS else []
     client = make_client()
     run_id = store.start_run(
         conn, page_id=page_row["id"], config=config, model=client.config.model,
         params=run_params(config, page_budget=page_budget, max_tokens=max_tokens, agent_budget=agent_budget,
-                          max_steps=max_steps),
+                          review_budget=review_budget, max_steps=max_steps),
     )
     if span is not None:
         span.set(run_id=run_id)
@@ -217,6 +230,11 @@ def _translate_page(
             result = translator.run_translator(
                 page, client, previous=previous, agent_budget=agent_budget, fallback_budget=page_budget,
                 max_tokens=max_tokens, max_steps=max_steps,
+            )
+        elif config == orchestrator.CONFIG_NAME:
+            result = orchestrator.run_orchestrator(
+                page, client, previous=previous, agent_budget=agent_budget, review_budget=review_budget,
+                fallback_budget=page_budget, max_tokens=max_tokens, max_steps=max_steps,
             )
         else:
             result = baseline.run_baseline(
@@ -243,13 +261,16 @@ def _translate_page(
 
 def _describe_run(
     span: tracing.PageSpan | None, client: LLMClient, status: str, error: str | None,
-    result: BaselineResult | TranslatorResult | None = None,
+    result: BaselineResult | TranslatorResult | OrchestratorResult | None = None,
 ) -> None:
-    """What the page's root span says about the Run: its status and calls, and for a `translator` why it stopped."""
+    """What the page's root span says about the Run: its status and calls, for a `translator` why it stopped, and for
+    `full_no_kb` how often the page was sent back and why the loop ended."""
     if span is None:
         return
     span.set(run_status=status, calls=client.meter.summary()["calls"])
     if isinstance(result, TranslatorResult):
         span.set(stop_reason=result.attempts["agent"]["stop_reason"], fallback_reason=result.fallback_reason)
+    elif isinstance(result, OrchestratorResult):
+        span.set(send_backs=result.send_backs, final_stop=result.final_stop, fallback_reason=result.fallback_reason)
     if error is not None:
         span.fail(error)

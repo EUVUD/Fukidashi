@@ -13,8 +13,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .. import runs, store, tracing
-from ..agents import translator
+from .. import orchestrator, runs, store, tracing
+from ..agents import reviewer, translator
 from ..agents.loop import DEFAULT_MAX_STEPS, refuse_tracing
 from ..llm.client import LLMClient, LLMNotConfigured
 from ..pipeline import baseline
@@ -22,7 +22,7 @@ from . import manifest as manifest_facts
 from .metrics import cost_summary, latency_summary, run_cost, score_corpus
 from .references import OPENCC_CONFIG, to_zh_hans
 
-CONFIGS = runs.CONFIGS  # `full` and `full_no_kb` arrive with the orchestrator
+CONFIGS = runs.CONFIGS  # `full` arrives with the KB
 
 
 class EvalAborted(Exception):
@@ -68,8 +68,11 @@ def run_eval(
     and every `translator` page would fail). A page without text regions is skipped. A failed or crashed Run is
     listed under `failed_pages` and left out of the scores; its cost is reported apart, under `cost.failed_runs`.
     A `translator` Run that fell back to `baseline` is scored like any other, and flagged: per page (`fell_back`,
-    `fallback_reason`) and as a count over the scored pages (`fallback_pages`). Each page row carries the
-    `trace_id` of its trace (null when tracing is off), and the manifest says where the traces went.
+    `fallback_reason`) and as a count over the scored pages (`fallback_pages`). For `full_no_kb` that is the first pass;
+    a revision never falls back. A `full_no_kb` page row also says how its review loop went (`send_backs`,
+    `final_stop`, `final_reviewed`, and the status and verdict of each review), and `scores.json` counts the scored
+    pages by `final_stop` (`final_stops`). Each page row carries the `trace_id` of its trace (null when tracing is
+    off), and the manifest says where the traces went.
     """
     if config not in CONFIGS:
         raise ValueError(f"unknown config {config!r}; expected one of {CONFIGS}")
@@ -80,6 +83,9 @@ def run_eval(
     params = {"page_budget": baseline.DEFAULT_PAGE_BUDGET, "max_tokens": baseline.DEFAULT_MAX_TOKENS}
     if config == translator.CONFIG_NAME:
         params |= {"agent_budget": translator.DEFAULT_PAGE_BUDGET, "max_steps": DEFAULT_MAX_STEPS}
+    if config == orchestrator.CONFIG_NAME:
+        params |= {"agent_budget": translator.DEFAULT_PAGE_BUDGET, "review_budget": reviewer.DEFAULT_REVIEW_BUDGET,
+                   "max_steps": DEFAULT_MAX_STEPS}
 
     to_translate: list[int] = []
     skipped: list[dict] = []
@@ -148,6 +154,7 @@ def run_eval(
         scored.append({"book": book, "page_index": page_index, "run_id": outcome.run_id, "trace_id": trace_id,
                        "segments": len(rows), "calls": run["calls"], "unknown_usage_calls": run["unknown_usage_calls"],
                        "fell_back": fallback_reason is not None, "fallback_reason": fallback_reason,
+                       **(_review_loop(run) if config == orchestrator.CONFIG_NAME else {}),
                        "cost_usd": cost, "latency_s": round(latency, 3)})
         log(f"  run {outcome.run_id}: {len(rows)} segments, {latency:.1f}s")
     for entry in skipped:
@@ -161,6 +168,8 @@ def run_eval(
         "pages_scored": len(scored),
         "segments_scored": len(segment_lines),
         "fallback_pages": sum(p["fell_back"] for p in scored),  # scored pages whose Run fell back to baseline
+        **({"final_stops": {stop: sum(p["final_stop"] == stop for p in scored) for stop in orchestrator.FINAL_STOPS}}
+           if config == orchestrator.CONFIG_NAME else {}),  # scored pages by why their review loop ended
         "chrf": {"score": corpus.chrf, "signature": corpus.chrf_signature},
         "bleu": {"score": corpus.bleu, "signature": corpus.bleu_signature},
         "cost": cost_summary([(r["cost_usd"], r["unknown_usage_calls"]) for r in scored_runs])
@@ -203,13 +212,30 @@ def run_eval(
     return EvalResult(out_dir, manifest, scores, failed)
 
 
-def _fallback_reason(run: sqlite3.Row | None) -> str | None:
-    """Why the Run fell back to `baseline`, read from what it stored; None when it did not (or has no record)."""
+def _attempts(run: sqlite3.Row | None) -> list | dict | None:
+    """The Run's stored attempts record; None when it has none."""
     if run is None or not run["attempts_json"]:
         return None
-    attempts = json.loads(run["attempts_json"])
+    return json.loads(run["attempts_json"])
+
+
+def _fallback_reason(run: sqlite3.Row | None) -> str | None:
+    """Why the Run fell back to `baseline`, read from what it stored; None when it did not (or has no record)."""
+    attempts = _attempts(run)
+    if isinstance(attempts, dict) and "stages" in attempts:  # `full_no_kb`: only its first pass can fall back
+        attempts = attempts["stages"][0]["attempts"]
     fallback = attempts.get("fallback") if isinstance(attempts, dict) else None  # baseline stores a list
     return None if fallback is None else fallback["reason"]
+
+
+def _review_loop(run: sqlite3.Row) -> dict:
+    """How a `full_no_kb` Run's review loop went, read from what it stored: the send-backs, why the loop ended,
+    whether the stored translation got a verdict, and the status and verdict of each review, in order."""
+    attempts = _attempts(run)
+    reviews = [stage for stage in attempts["stages"] if stage["kind"] == orchestrator.REVIEW]
+    return {"send_backs": attempts["send_backs"], "final_stop": attempts["final"]["stop"],
+            "final_reviewed": attempts["final"]["reviewed"],
+            "review_statuses": [r["status"] for r in reviews], "review_verdicts": [r["verdict"] for r in reviews]}
 
 
 def _free_id(out_root: Path, base: str) -> str:
@@ -246,6 +272,13 @@ def format_summary(result: EvalResult) -> str:
     ]
     if s["config"] != baseline.CONFIG_NAME:
         lines.insert(2, f"fallback to baseline  {s['fallback_pages']} of {s['pages_scored']} scored pages")
+    if s["config"] == orchestrator.CONFIG_NAME:
+        stops = ", ".join(f"{stop} {n}" for stop, n in s["final_stops"].items())
+        lines.insert(3, f"review loop  {stops}; send-backs {sum(p['send_backs'] for p in s['pages'])}")
+        for p in s["pages"]:
+            reviews = "/".join(verdict or status for verdict, status in zip(p["review_verdicts"], p["review_statuses"]))
+            lines.append(f"REVIEW LOOP  {p['book']}/{p['page_index']} (run {p['run_id']}): {p['final_stop']}, "
+                         f"{p['send_backs']} send-back(s), reviews {reviews}")
     for p in s["pages"]:
         if p["fell_back"]:
             lines.append(f"FELL BACK  {p['book']}/{p['page_index']} (run {p['run_id']}): {p['fallback_reason']}")

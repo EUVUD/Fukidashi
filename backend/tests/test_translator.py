@@ -600,7 +600,7 @@ def test_a_baseline_eval_reports_zero_fallback_pages(imported, root, tmp_path):
 
 
 def test_the_harness_knows_both_configs_and_the_cli_accepts_translator(tmp_path):
-    assert harness.CONFIGS == ("baseline", "translator")
+    assert harness.CONFIGS == ("baseline", "translator", "full_no_kb")  # `full_no_kb` joined in task 012
 
     stopped = run_cli(tmp_path, "--config", "translator", "--book", "book_t", "--pages", "1")
 
@@ -848,3 +848,55 @@ def test_the_translator_config_does_not_flag(imported, root):
     assert outcome.result.flags == []
     assert [t["function"]["name"] for t in provider.bodies[0]["tools"]] == ["get_previous_context"]
     assert provider.bodies[0]["messages"][0]["content"] == translator.SYSTEM_PROMPT
+
+
+# --- folded in from task 011's review (task 012) ------------------------------------------------------------------
+
+class AppendsUnderTheLock(list):
+    """The collector's list, made to say whether the collector's lock was held at each append.
+
+    Under CPython's GIL a bare `list.append` is atomic, so contention cannot show a missing lock; this can.
+    """
+
+    def __init__(self, collector):
+        super().__init__()
+        self.collector = collector
+        self.held = []
+
+    def append(self, item):
+        self.held.append(self.collector._lock.locked())
+        super().append(item)
+
+
+def test_the_flag_handler_appends_only_while_it_holds_the_lock():
+    collector = translator.FlagCollector([0, 1])
+    collector._flags = recorder = AppendsUnderTheLock(collector)
+    handler = collector.tool().handler
+
+    handler(id=0, reason="一つ目")
+    handler(id=1, reason="二つ目")
+
+    assert recorder.held == [True, True]  # false for an append outside `with self._lock`
+    assert [f["id"] for f in collector.flags] == [0, 1]
+
+
+@pytest.mark.parametrize("region", [True, False])
+def test_a_boolean_region_id_goes_back_to_the_model_and_is_not_recorded(page_for, region):
+    provider = Provider(ask(call("bad", f'{{"id": {str(region).lower()}, "reason": "x"}}', name="flag_uncertain")),
+                        answer(zh_json(3)))
+
+    result = run_flagging(page_for, provider)
+
+    assert result.ok and result.flags == []
+    assert "Error: the arguments of flag_uncertain are not valid" in tool_result(provider.bodies[1], "bad")
+    (bad_call,) = result.attempts["agent"]["steps"][0]["tool_calls"]
+    assert bad_call["ran"] is False
+
+
+@pytest.mark.parametrize("region", ["1", 1.0])
+def test_a_number_written_as_text_or_a_float_is_still_a_region_id(page_for, region):
+    provider = Provider(ask(call("f", {"id": region, "reason": "x"}, name="flag_uncertain")), answer(zh_json(3)))
+
+    result = run_flagging(page_for, provider)
+
+    assert result.ok and result.flags == [{"id": 1, "reason": "x"}]  # only the booleans are refused
