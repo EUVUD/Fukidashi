@@ -4,7 +4,7 @@ English | [简体中文](README.zh-CN.md)
 
 A multi-agent manga translation editor (Japanese → Simplified Chinese), evaluated on the [OpenMantra](https://github.com/mantra-inc/open-mantra-dataset) dataset against a single-call baseline with a standard MT evaluation framework.
 
-> **Status (2026-10-28):** M0, M1 and M2 are done. The vertical slice works end to end: import OpenMantra, translate a page with one model call, and check every line against its box in the browser. M2 added an eval harness that scores configs with chrF / BLEU, a first Translator Agent (the `translator` config) on a tool-calling loop over our metered client, and optional tracing in a local Arize Phoenix ([record](docs/m2.md)). M3 added the multi-agent system ([record](docs/m3.md)): a Reviewer Agent, an Orchestrator that sends pages back for revision, a per-book Knowledge Base with a Curator Agent as its only writer, the `full` and `full_no_kb` configs, and a gold glossary for the two dev books. Next is M4: scoring all three configs on the two dev books.
+> **Status (2026-10-28):** M0 to M3 are done. The vertical slice works end to end: import OpenMantra, translate a page with one model call, and check every line against its box in the browser. M2 added an eval harness that scores configs with chrF / BLEU, a first Translator Agent (the `translator` config) on a tool-calling loop over our metered client, and optional tracing in a local Arize Phoenix ([record](docs/m2.md)). M3 added the multi-agent system ([record](docs/m3.md)): a Reviewer Agent, an Orchestrator that sends pages back for revision, a per-book Knowledge Base with a Curator Agent as its only writer, the `full` and `full_no_kb` configs, and a gold glossary for the two dev books. M4 has added whole-book evals, a COMET scorer, term accuracy against the gold glossary, a count of how often the KB reaches a page, and CI on GitHub Actions. Next are the first dev runs: all three configs on the two dev books.
 
 ## What it does
 
@@ -19,7 +19,7 @@ A multi-agent manga translation editor (Japanese → Simplified Chinese), evalua
 Fukidashi is evaluated as a product, not as a research experiment (details in [OUTLINE.md §4](OUTLINE.md#4-evaluation)):
 
 - **Main comparison:** the full system vs `baseline` (one call per page). **KB ablation:** the full system with and without the Knowledge Base.
-- **Metrics:** chrF / BLEU (sacreBLEU, with signature), COMET / xCOMET, GEMBA-MQM (LLM-as-judge, checked against about 30 human-annotated segments first), term accuracy against a gold glossary, cost per page and latency.
+- **Metrics:** chrF / BLEU (sacreBLEU, with signature), COMET (`wmt22-comet-da`), GEMBA-MQM (LLM-as-judge, checked against about 30 human-annotated segments first), term accuracy against a gold glossary, cost per page and latency.
 - **Rigor:** split by book (2 dev, 3 test), an eval protocol written before the freeze, the test split run once, paired bootstrap 95% CIs by page.
 
 ## Engineering notes
@@ -58,7 +58,16 @@ uv run python eval/run.py --config full_no_kb --book tojime_no_siora --pages 2,3
 uv run python eval/run.py --config full --book tojime_no_siora --pages 2,3,4         # the same with a Knowledge Base and the Curator
 ```
 
-The eval harness translates those pages through the same code path as the editor (each page leaves a Run in SQLite), converts the zh-Hant reference translations to zh-Hans with OpenCC (`t2s`), and prints chrF and BLEU with their sacreBLEU signatures, plus cost per page and latency; for the agent configs it also counts the pages that fell back to `baseline`, and for `full_no_kb` and `full` how often the Reviewer sent a page back and why the loop stopped. A `full` eval starts from a new, empty Knowledge Base, passes it through the pages in order, and reports what the Curator decided and what the KB holds at the end. The Manifest, per-Segment outputs and scores go to `runs/eval/<id>/`, rewritten after every page, so an interrupted eval keeps the pages it finished. Leave out `--pages` to evaluate every page of a book in page order (a whole book makes many real calls). The exit code is non-zero if a page failed or the harness could not start.
+The eval harness translates those pages through the same code path as the editor (each page leaves a Run in SQLite), converts the zh-Hant reference translations to zh-Hans with OpenCC (`t2s`), and prints chrF and BLEU with their sacreBLEU signatures, plus cost per page and latency; for the agent configs it also counts the pages that fell back to `baseline`, and for `full_no_kb` and `full` how often the Reviewer sent a page back and why the loop stopped. A `full` eval starts from a new, empty Knowledge Base, passes it through the pages in order, and reports what the Curator decided, how often the KB reached a page, and what the KB holds at the end. The Manifest, per-Segment outputs and scores go to `runs/eval/<id>/`, rewritten after every page, so an interrupted eval keeps the pages it finished. Leave out `--pages` to evaluate every page of a book in page order (a whole book makes many real calls). The exit code is non-zero if a page failed or the harness could not start.
+
+Two scorers read a finished eval run and write their results next to its outputs. Neither calls a model provider:
+
+```bash
+uv run python eval/terms.py runs/eval/<id>   # term accuracy against the gold glossary
+uv run eval/comet.py runs/eval/<id>          # COMET, in an environment of its own
+```
+
+`eval/comet.py` declares its own dependencies (PyTorch and `unbabel-comet`), so they stay out of the project's environment. Its first run downloads them and the `Unbabel/wmt22-comet-da` checkpoint (about 2.3 GB) from Hugging Face. A CPU is enough.
 
 Optional tracing: one trace per translated page (every model call, agent step and tool call) in an [Arize Phoenix](https://github.com/Arize-ai/phoenix) running on your machine. Start Phoenix in another terminal, set `FUKIDASHI_TRACING=phoenix` (in the shell or `.env`), and open http://localhost:6006:
 
@@ -70,7 +79,7 @@ FUKIDASHI_TRACING=phoenix uv run python eval/run.py --config translator --book t
 Tracing is off by default and never fails a translation. Page images and the API key are removed from every span, and the endpoint must be on this machine. Spans go straight to it, even when your shell uses an HTTP proxy. The eval outputs record each page's trace ID.
 
 ```bash
-uv run pytest                                       # no network, no real LLM calls
+uv run pytest                                       # no network, no real LLM calls; CI runs it on every pull request
 uv run python scripts/m0_first_call.py --dry-run    # print the M0 request without sending it
 uv run python eval/glossary.py check                # check the gold glossaries against the dataset; no model calls
 ```
