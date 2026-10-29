@@ -1,6 +1,6 @@
 # Fukidashi — Project Outline
 
-> v0.24 · 2026-10-29
+> v0.26 · 2026-10-29
 > **v0.2 (2026-10-22):** evaluation changed from a research-style controlled experiment to a standard evaluation framework plus a baseline comparison (plan B); see §4.
 > **v0.3 (2026-10-22):** M0 decisions recorded in §8: name Fukidashi, ja → zh-Hans, an OpenAI-compatible provider, a $100 budget cap.
 > **v0.4 (2026-10-24):** M1 added the term Run (§0).
@@ -25,6 +25,7 @@
 > **v0.23 (2026-10-28):** after KB reach (#40), the COMET scorer (#41), term accuracy (#42) and CI (#39): §0 adds KB reach; §3.3, §4.4, §4.7 and §4.8 record what is built; §8 and §9 record that XCOMET-XL does not fit the Windows machine's GPU, so the report gives COMET only (§1.1, §4.3, §5, §12 and §13 follow); §8 adds CI; §6 shows the scorers and the workflow.
 > **v0.24 (2026-10-29):** M4 done (§7, `docs/m4.md`) after the dev runs and the pooled report (#44): §0 adds Pooled report and Common pages; §3.3 records the dev runs' KB reach and settles normalised matching (not needed); §4.8 records the COMET checkpoint's revision; §4.9 adds what term accuracy cannot see; §6 shows the report; §8 and §9 record the dev runs' outcomes.
 > **v0.25 (2026-10-29):** M5 decisions in §8: the judge model (GPT-4o mini, with GPT-5.1 as its fallback) and the agreement check's decision rule (§4.5), the KB ablation's primary metric (term accuracy stays; term consistency is added as a secondary metric), a second `baseline` pass for the run-to-run spread, and the rules of term consistency (§4.7). §0 adds Rendering and Run-to-run spread; §4.4, §4.5, §4.9 and §7 follow.
+> **v0.26 (2026-10-29):** §4.5 records the hash of the agreement sample's labels, which Claude annotated because the author does not read Japanese, and what these labels allow the check to show.
 > Convention: code, docs, commit messages and reports use the canonical terms in §0.
 
 ---
@@ -369,6 +370,8 @@ Every quality metric in both comparisons gets a paired bootstrap 95% CI. Primary
 
     If the author marked no major or critical error, τ_b decides alone.
   - **Then.** For a judge that passes, the MQM breakdown is the report's main error analysis. If GPT-4o mini fails, its fallback (§8) annotates the same sample once, under the same rule. If neither passes, MQM is reported for reference only.
+- **Recorded (2026-10-29):** the labels, `runs/mqm-human/20261029T172846Z-sample/sheet.csv`, sha256 `c400077e12c677f31b510bff6cb76b846fdd3d9d053487ab5e216974c51d68c2`, recorded before any judge output on the sample. **The annotator is Claude, an LLM, and not a person**: the author does not read Japanese and decided on 2026-10-29 to have a fresh Claude session annotate the sample. The session was told to read only the annotation guide, the sample's README and the sheet, and its tool calls show it opened nothing else: no `key.json`, no judge output, no reference translation, no web search. Wherever this section says "the author", read "the annotator". The rule and its thresholds are unchanged. The check therefore measures the judge's agreement with another LLM, which is weaker evidence than agreement with a person, and every report that uses it says so.
+- **What these labels allow (2026-10-29, before any judge output).** The annotator marked an error on 1 of the 30 items (one minor `accuracy/addition`) and none on the other 29, so there is no major or critical error and τ_b decides alone. Of the 435 pairs of items, only the 29 that include the marked item can be concordant or discordant. The best case is a judge that scores that item below every other and gives many items the same score: at least 113 of the 435 pairs must be tied (16 items with one score would give 120). A judge whose scores mostly differ from item to item cannot reach 0.30, whatever it does. The procedure is unchanged, and a fail is reported as weak evidence against such a judge, not as proof that its errors are wrong.
 - **A later judge** (GPT-4o mini leaves the API on 2027-01-14, §8) reuses the human labels: the new judge annotates the same sample, and the same rule decides.
 
 ### 4.6 Rigor & Statistics
