@@ -19,7 +19,7 @@ A multi-agent manga translation editor (Japanese → Simplified Chinese), evalua
 Fukidashi is evaluated as a product, not as a research experiment (details in [OUTLINE.md §4](OUTLINE.md#4-evaluation)):
 
 - **Main comparison:** the full system vs `baseline` (one call per page). **KB ablation:** the full system with and without the Knowledge Base.
-- **Metrics:** chrF / BLEU (sacreBLEU, with signature), COMET (`wmt22-comet-da`), GEMBA-MQM (LLM-as-judge, checked against about 30 human-annotated segments first), term accuracy against a gold glossary, cost per page and latency.
+- **Metrics:** chrF / BLEU (sacreBLEU, with signature), COMET (`wmt22-comet-da`), GEMBA-MQM (LLM-as-judge with GPT-4o mini, checked against about 30 human-annotated segments first), term accuracy and term consistency against a gold glossary, cost per page and latency.
 - **Rigor:** split by book (2 dev, 3 test), an eval protocol written before the freeze, the test split run once, paired bootstrap 95% CIs by page.
 
 ## Engineering notes
