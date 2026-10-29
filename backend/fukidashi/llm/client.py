@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
 
 class LLMNotConfigured(RuntimeError):
-    """The LLM_* variables are missing. The message names them, never their values."""
+    """The <PREFIX>_* variables are missing. The message names them, never their values."""
 
 
 @dataclass(frozen=True)
@@ -32,25 +32,41 @@ class LLMConfig:
     token_param: str = "max_tokens"  # or "max_completion_tokens"
     price_input_per_m: float | None = None
     price_output_per_m: float | None = None
+    temperature: float | None = None  # sent only when set, so a request without it is what it was before
+    reasoning_effort: str | None = None  # for reasoning models; sent only when set
+    env_prefix: str = "LLM"  # the variables this configuration is read from; messages that point at them use it
 
     @classmethod
-    def from_env(cls) -> LLMConfig:
-        missing = [k for k in ("LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL") if not os.environ.get(k)]
+    def from_env(cls, prefix: str = "LLM") -> LLMConfig:
+        """Read `<prefix>_BASE_URL`, `_API_KEY`, `_MODEL` (required) and the optional ones. The translation system is
+        `LLM`, the GEMBA-MQM judge `JUDGE` and its fallback `JUDGE2` (OUTLINE 8)."""
+
+        def var(name: str) -> str:
+            return f"{prefix}_{name}"
+
+        missing = [k for k in (var("BASE_URL"), var("API_KEY"), var("MODEL")) if not os.environ.get(k)]
         if missing:
             raise LLMNotConfigured(f"Set {', '.join(missing)} in .env (see .env.example)")
 
-        def price(key: str) -> float | None:
+        def optional(key: str) -> str | None:
             value = os.environ.get(key, "").strip()
-            return float(value) if value else None
+            return value or None
+
+        def number(key: str) -> float | None:
+            value = optional(key)
+            return float(value) if value is not None else None
 
         return cls(
-            base_url=os.environ["LLM_BASE_URL"],
-            api_key=os.environ["LLM_API_KEY"],
-            model=os.environ["LLM_MODEL"],
-            json_mode=os.environ.get("LLM_JSON_MODE", "json_object"),
-            token_param=os.environ.get("LLM_TOKEN_PARAM", "max_tokens"),
-            price_input_per_m=price("LLM_PRICE_INPUT_PER_M"),
-            price_output_per_m=price("LLM_PRICE_OUTPUT_PER_M"),
+            base_url=os.environ[var("BASE_URL")],
+            api_key=os.environ[var("API_KEY")],
+            model=os.environ[var("MODEL")],
+            json_mode=os.environ.get(var("JSON_MODE"), "json_object"),
+            token_param=os.environ.get(var("TOKEN_PARAM"), "max_tokens"),
+            price_input_per_m=number(var("PRICE_INPUT_PER_M")),
+            price_output_per_m=number(var("PRICE_OUTPUT_PER_M")),
+            temperature=number(var("TEMPERATURE")),
+            reasoning_effort=optional(var("REASONING_EFFORT")),
+            env_prefix=prefix,
         )
 
 
@@ -99,6 +115,11 @@ class LLMClient:
             kwargs["response_format"] = {"type": "json_object"}
         if tools:  # OpenAI function format; an empty list sends nothing, because providers reject `"tools": []`
             kwargs["tools"] = tools
+        # Each only when set: the translation requests set neither and stay what they were (test_kb_seams.py).
+        if self.config.temperature is not None:
+            kwargs["temperature"] = self.config.temperature
+        if self.config.reasoning_effort is not None:
+            kwargs["reasoning_effort"] = self.config.reasoning_effort
 
         start = time.monotonic()
         try:
@@ -107,7 +128,7 @@ class LLMClient:
             # The request may have reached the provider and been billed (a timeout, a 5xx): unknown, not zero.
             # A 200 that claims to be JSON and is not makes the SDK raise JSONDecodeError: also the provider's doing.
             if isinstance(e, (openai.OpenAIError, json.JSONDecodeError)):
-                raise self._fail(budget, start, describe_api_error(e, self.config.base_url),
+                raise self._fail(budget, start, describe_api_error(e, self.config.base_url, self.config.env_prefix),
                                  getattr(e, "status_code", None)) from e
             self._record(budget, start, error=self._redact(f"{type(e).__name__}: {e}"))
             raise
@@ -117,7 +138,7 @@ class LLMClient:
             raise self._fail(
                 budget, start,
                 f"The response from {self.config.base_url} is not a chat completion (got {type(resp).__name__}, "
-                "not JSON). Check LLM_BASE_URL in .env.",
+                f"not JSON). Check {self.config.env_prefix}_BASE_URL in .env.",
             )
 
         # From here on the response is read in this one place. The SDK builds it without validating it, so any
