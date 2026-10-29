@@ -4,7 +4,7 @@
 
 多 agent 漫画翻译编辑器（日 → 简体中文）。在 [OpenMantra](https://github.com/mantra-inc/open-mantra-dataset) 数据集上，用标准的 MT evaluation framework 和单次调用的 baseline 做对比。
 
-> **现状（2026-10-28）：** M0 到 M3 已完成。vertical slice 已经跑通：导入 OpenMantra，对一页做一次模型调用完成翻译，在浏览器里逐句对照图上的 box 检查译文。M2 新增了用 chrF / BLEU 给各个 config 打分的 eval harness；第一版 Translator Agent（即 `translator` config），它跑在调用工具的 agent loop 上，底下是带计量的 client；还有可选的 tracing，trace 发到本机的 Arize Phoenix（[记录](docs/m2.md)）。M3 加上了多 agent 系统（[记录](docs/m3.md)）：Reviewer Agent、把页面退回修改的 Orchestrator、每本书一个的 Knowledge Base（Curator Agent 是它唯一的写者）、`full` 和 `full_no_kb` 两个 config，以及两部 dev 作品的 gold glossary。M4 已经加上了按整本书跑的 eval、COMET 打分脚本、对照 gold glossary 的 term accuracy、KB 触达各页次数的统计，以及 GitHub Actions 上的 CI。下一步是第一次 dev 运行：在两部 dev 作品上跑三个 config。
+> **现状（2026-10-29）：** M0 到 M4 已完成。vertical slice 已经跑通：导入 OpenMantra，对一页做一次模型调用完成翻译，在浏览器里逐句对照图上的 box 检查译文。M2 新增了用 chrF / BLEU 给各个 config 打分的 eval harness；第一版 Translator Agent（即 `translator` config），它跑在调用工具的 agent loop 上，底下是带计量的 client；还有可选的 tracing，trace 发到本机的 Arize Phoenix（[记录](docs/m2.md)）。M3 加上了多 agent 系统（[记录](docs/m3.md)）：Reviewer Agent、把页面退回修改的 Orchestrator、每本书一个的 Knowledge Base（Curator Agent 是它唯一的写者）、`full` 和 `full_no_kb` 两个 config，以及两部 dev 作品的 gold glossary。M4 加上了按整本书跑的 eval、COMET 打分脚本、对照 gold glossary 的 term accuracy、KB 触达各页次数的统计、汇总多次 eval 的报告，以及 GitHub Actions 上的 CI，然后在两部 dev 作品上把每个 config 各跑了一遍（[记录](docs/m4.md)）。在 dev split 上，full system 的分数并不比每页一次调用高（COMET 0.8235 对 0.8257），成本却是它的约 9.5 倍；这是每个 config 只跑一次的结果，还没有置信区间。下一步是 M5：eval protocol、GEMBA-MQM 和 term consistency，然后冻结。
 
 ## 它做什么
 
@@ -60,14 +60,15 @@ uv run python eval/run.py --config full --book tojime_no_siora --pages 2,3,4    
 
 Eval harness（评测执行器）走和编辑器相同的代码路径翻译这几页（每页在 SQLite 里留下一个 Run），用 OpenCC（`t2s`）把 zh-Hant 参考译文转成 zh-Hans，然后打印 chrF 和 BLEU 及其 sacreBLEU 签名，以及每页成本和延迟；跑 agent config 时还会统计回退到 `baseline` 的页数，跑 `full_no_kb` 和 `full` 时还会统计 Reviewer 退回了几次、循环为什么停下。`full` 每次 eval 都从一个新的空 Knowledge Base 开始，按页序依次传给各页，最后报告 Curator 的决定、KB 触达了多少页，以及 KB 里留下了什么。运行清单（Manifest）、逐 Segment 的输出和分数写入 `runs/eval/<id>/`，每跑完一页就更新一次，所以中途被打断的 eval 会保留已经跑完的页。不写 `--pages` 就按页序跑整本书（整本书会产生很多次真实调用）。有页面失败或 harness 无法启动时，退出码非零。
 
-下面两个打分脚本读取一次已经跑完的 eval，把结果写在它的输出旁边。两者都不调用模型 provider：
+下面两个打分脚本读取一次已经跑完的 eval，把结果写在它的输出旁边；汇总报告把打完分的多次 eval（每个 config 和每部作品各一次）合在一起。三者都不调用模型 provider：
 
 ```bash
 uv run python eval/terms.py runs/eval/<id>   # 对照 gold glossary 的 term accuracy
 uv run eval/comet.py runs/eval/<id>          # COMET，在单独的环境里运行
+uv run python eval/report.py runs/eval/<id> runs/eval/<id> ...   # 每个 config 一份结果，合并全部作品，也分作品列出
 ```
 
-`eval/comet.py` 自己声明依赖（PyTorch 和 `unbabel-comet`），不进项目的环境。第一次运行时会从 Hugging Face 下载这些依赖和 `Unbabel/wmt22-comet-da` checkpoint（约 2.3 GB）。用 CPU 就够了。
+`eval/comet.py` 自己声明依赖（PyTorch 和 `unbabel-comet`），不进项目的环境。第一次运行时会从 Hugging Face 下载这些依赖和 `Unbabel/wmt22-comet-da` checkpoint（约 2.3 GB）。用 CPU 就够了。汇总报告只在每个 config 都打了分的页上比较各 config，chrF 和 BLEU 用合并后的全部 segment 重新计算，文件之间对不上时拒绝生成；结果写进 `runs/report/<time>-report/report.json`，并打印一份摘要。
 
 可选的 tracing：每翻译一页就生成一条 trace（包含每次模型调用、每个 agent 步骤和每次工具调用），发到你本机运行的 [Arize Phoenix](https://github.com/Arize-ai/phoenix)。在另一个终端启动 Phoenix，设置 `FUKIDASHI_TRACING=phoenix`（在 shell 或 `.env` 里都可以），然后打开 http://localhost:6006：
 
@@ -92,7 +93,8 @@ uv run python eval/glossary.py check                # 对照数据集检查 gold
 | M1 Vertical slice：页面 → `baseline` → 浏览器 | 10/25 | 完成（[记录](docs/m1.md)） |
 | M2 Agent layer 与 eval harness | 11/1 | 完成（[记录](docs/m2.md)） |
 | M3 Knowledge Base 与 Reviewer | 11/8 | 完成（[记录](docs/m3.md)） |
-| M4–M5 Dev 评测、冻结 eval protocol | 11/22 | 计划中 |
+| M4 Dev 评测 | 11/15 | 完成（[记录](docs/m4.md)） |
+| M5 Eval protocol 与冻结 | 11/22 | 计划中 |
 | M6–M8 Test 运行、编辑器产品化、分析 | 1/3 | 计划中 |
 | M9 报告与发布 | 1/17 | 计划中 |
 

@@ -278,6 +278,9 @@ classDiagram
     class CometScript:::eval {
         eval/comet.py
     }
+    class PooledReport:::eval {
+        build_report()
+    }
     class Runs:::service {
         validate_page()
         translate_page()
@@ -390,6 +393,7 @@ classDiagram
     EvalHarness ..> EvalOutputs : writes
     TermAccuracy ..> EvalOutputs : reads segments.jsonl, writes terms.json
     CometScript ..> EvalOutputs : reads segments.jsonl, writes comet-*.json
+    PooledReport ..> EvalOutputs : reads several, writes runs/report/
     Runs ..> Tracing : page_span
     Tracing ..> Backend : exporter
     Tracing ..> RedactingExporter : wraps the exporter
@@ -449,6 +453,7 @@ classDiagram
 - `Runs.translate_page` does not depend on HTTP, so the eval harness calls it directly (OUTLINE §1.3, Same code path). An invalid page raises `PageNotFound` or another `TranslateError` before any Run exists, which the router maps to 404 / 422. A failed model call or unparseable output is not an exception but a `failed` Run (502). An unexpected exception after the Run row exists marks that Run failed and is raised as `RunCrashed` with its `run_id` (500).
 - `EvalHarness` (`evaluation/harness.py`; CLI `eval/run.py`) calls `validate_page` for every page before the first model call, then `translate_page` page by page, and scores the stored Translations against references converted with OpenCC `t2s`. It writes `EvalOutputs` to `runs/eval/<id>/` after every page, so an interrupted eval keeps the pages it finished (its manifest's `finished_at` stays null); `scores.json` reports scored and failed Runs' cost separately, and any unknown cost makes a total `null`. For `full` it also reports KB reach, read from each stored Run: the snippets the page was shown (`kb_snippets`, which `Runs` records from `KBSnapshot.snippet_items`), the lookups that found something or not, and the items that reached the page.
 - Two scorers read a finished eval run's `EvalOutputs` and write a file of their own next to them, outside `EvalHarness` and the translation path, so they can score old runs again. `TermAccuracy` (`evaluation/terms.py`; CLI `eval/terms.py`) writes `terms.json` and reads neither the database nor the zh-Hant reference. `CometScript` (`eval/comet.py`) is a standalone script with its own environment that imports nothing from `fukidashi`, so PyTorch stays out of the project's lock and CI, and the script can run on another machine.
+- `PooledReport` (`evaluation/report.py`; CLI `eval/report.py`) reads the `EvalOutputs` of several scored eval runs, one per config and book, and writes one report to `runs/report/<time>-report/`. It reads files only, compares the configs on the pages every config scored, recomputes chrF and BLEU over the pooled segments, and refuses files that do not belong together.
 - `Tracing` (`tracing/`) is off unless `FUKIDASHI_TRACING` names a backend. `setup()`, called once by an entry point, installs the OpenInference instrumentors for the `openai` SDK and LangChain and a batch span processor whose exporter comes from `Backend` (Phoenix, which must be on this machine and is reached without any proxy), wrapped in `RedactingExporter` so no page image or API key reaches a span. `Runs` opens `page_span` around each page and returns its trace ID in `Outcome`, or on the exception when the page fails; `EvalHarness` writes it per page, failed pages included. Only `tracing/` imports OpenTelemetry or OpenInference, and tracing never fails a Run.
 - `PagesRouter` gets the SQLite connection, the dataset path and the `LLMClient` factory through FastAPI's `Depends` (`get_db`, `get_dataset_root`, `get_client_factory`). Tests swap them for a temporary DB and a fake `LLMClient`, so tests never make real requests.
 - `Runs` receives an `LLMClient` factory, not a client: every Run builds its own `LLMClient` and `Meter`, so each Run's usage is its own.
@@ -513,6 +518,6 @@ classDiagram
 
 - **M2 (done):** `Translator` built on `AgentLoop` runs beside `Baseline`, and `Tracing` wraps every `translate_page`. `LLMClient`, `Meter` and `PageBudget` stayed as they were, and every agent call goes through them. `Runs.translate_page` picks the pipeline by `config`, and `EvalHarness` accepts each config in `runs.CONFIGS`. An Orchestrator (`orchestrator/` in OUTLINE §6) comes with the Reviewer in M3.
 - **M3 (done):** `Orchestrator`, `Reviewer` and `Curator` sit between `Runs` and `AgentLoop`, and the KB modules sit beside `Store`. `Runs.translate_page` gained the configs `full_no_kb` and `full`; for `full` it also loads the snapshot and runs finalize. Nothing in `LLMClient`, `AgentLoop` or the API changed shape: the editor still runs `baseline`.
-- **M4 (in progress):** term accuracy went into `evaluation/` (#42); COMET became a standalone script in `eval/` (#41) instead, so its dependencies stay out of the project. Both read a finished eval run's outputs (`segments.jsonl`). `EvalHarness` reports how often the KB reaches a page (#40). Nothing in the translation path changed shape. A report that pools the eval runs of both dev books comes with the dev runs.
+- **M4 (done):** term accuracy went into `evaluation/` (#42); COMET became a standalone script in `eval/` (#41) instead, so its dependencies stay out of the project. Both read a finished eval run's outputs (`segments.jsonl`). `EvalHarness` reports how often the KB reaches a page (#40), and `PooledReport` pools the scored eval runs of both dev books (#44). Nothing in the translation path changed shape.
 - **M5:** GEMBA-MQM goes into `evaluation/`; prompt tuning changes the agents' prompts and re-baselines the pinned request digests.
 - **M7:** the frontend adds a canvas and editing to `PageView`, plus SSE, which adds an event subscription to the `api` module.
