@@ -1399,3 +1399,431 @@ def test_the_report_pools_one_run_as_the_scorer_does(tmp_path, monkeypatch):
     assert pooled["reference"] == scored["pooled"]["reference"]
     assert pooled["statuses"] == scored["statuses"]
     assert pooled["extractor"] == {k: v for k, v in scored["extractor"].items() if k != "threshold"}
+
+
+# --- GEMBA-MQM (eval/mqm.py): all or none, from one judge model ---------------------------------------------------------
+
+MQM_MODEL = "gpt-4o-mini-2024-07-18"
+
+
+def write_mqm(run_dir, judged=None, *, model=MQM_MODEL, response_model=None, template="template", weights=None):
+    """An MQM file as eval/mqm.py writes it, as far as the report reads it. `judged` maps (page_index, idx) to the
+    segment's errors, [(severity, category)], or to "failed" / "skipped"; a segment not in it is scored with no error."""
+    from fukidashi.evaluation import mqm
+
+    manifest = read_json(run_dir / "manifest.json")
+    lines = [json.loads(l) for l in (run_dir / "segments.jsonl").read_text(encoding="utf-8").split("\n") if l.strip()]
+    segments = []
+    for line in lines:
+        j = (judged or {}).get((line["page_index"], line["idx"]), [])
+        place = {"book": line["book"], "page_index": line["page_index"], "idx": line["idx"], "run_id": line["run_id"]}
+        if j in ("failed", "skipped"):
+            segments.append({**place, "status": j, "errors": [], "score": None, "answer": None, "attempts": 0,
+                             "problems": []})
+        else:
+            segments.append({**place, "status": "scored", "score": mqm.mqm_score(s for s, _ in j), "answer": "(answer)",
+                             "attempts": 1, "problems": [],
+                             "errors": [{"severity": s, "category": c, "span": None, "text": c} for s, c in j]})
+    path = run_dir / f"mqm-{model.rsplit('/', 1)[-1]}.json"
+    write_json(path, {
+        "eval_id": manifest["eval_id"], "book": manifest["book"], "segments_sha256": sha256_of(run_dir / "segments.jsonl"),
+        "judge": {"prefix": "JUDGE", "model": model, "response_model": response_model or model, "temperature": 0.0,
+                  "reasoning_effort": None, "max_tokens": 500},
+        "gemba": {"repository": "https://github.com/MicrosoftTranslator/GEMBA", "commit": "a7a7eff",
+                  "template_sha256": template},
+        "weights": weights or {"critical": 25, "major": 5, "minor": 1}, "score_rule": "the rule",
+        "segments": segments, "usage": {"calls": len(segments), "cost_usd": 0.001}, "scored_at": FINISHED,
+        "elapsed_s": 1.0})
+    return path
+
+
+# On two_by_two's runs. Page 3 of book A is off the common pages: baseline scored it, full_no_kb failed it.
+MQM_JUDGED = {
+    ("baseline", A): {(1, 0): [("major", "accuracy-mistranslation")],
+                      (1, 1): [("minor", "style"), ("minor", "fluency-punctuation")],
+                      (2, 0): "skipped", (2, 1): [],
+                      (3, 0): [("critical", "accuracy-mistranslation")], (3, 1): "failed"},
+    ("baseline", B): {(1, 0): [("critical", "non-translation")], (2, 0): "failed"},
+    ("full_no_kb", A): {(1, 0): [("minor", "style")], (1, 1): [], (2, 0): "skipped", (2, 1): [("major", "fluency-grammar")]},
+    ("full_no_kb", B): {(1, 0): [], (2, 0): [("minor", "style")]},
+}
+
+
+def with_mqm(tmp_path, **options):
+    dirs, glossary_dir = two_by_two(tmp_path)
+    for key, run_dir in dirs.items():
+        write_mqm(run_dir, MQM_JUDGED[key], **options)
+    return dirs, glossary_dir
+
+
+def mqm_key(book, page_index, idx):
+    return {"book": book, "page_index": page_index, "idx": idx}
+
+
+def test_mqm_is_pooled_per_config_over_the_common_pages_of_both_books(tmp_path):
+    result = build(*with_mqm(tmp_path))
+
+    baseline = result["pooled"]["baseline"]["mqm"]
+    # common pages: A1 -5 and -2, A2 skipped and 0, B1 -25, B2 failed; page 3's critical error and failure are off
+    assert (baseline["segments"], baseline["scored"], baseline["score"]) == (6, 4, -8.0)
+    assert baseline["failed"] == {"count": 1, "segments": [mqm_key(B, 2, 0)]}
+    assert baseline["skipped"] == {"count": 1, "segments": [mqm_key(A, 2, 0)]}
+    assert baseline["breakdown"] == {
+        "errors": 4, "segments_with_errors": 3, "by_severity": {"critical": 1, "major": 1, "minor": 2},
+        "by_category": {"accuracy-mistranslation": 1, "fluency-punctuation": 1, "non-translation": 1, "style": 1},
+        "by_category_and_severity": {"accuracy-mistranslation": {"critical": 0, "major": 1, "minor": 0},
+                                     "fluency-punctuation": {"critical": 0, "major": 0, "minor": 1},
+                                     "non-translation": {"critical": 1, "major": 0, "minor": 0},
+                                     "style": {"critical": 0, "major": 0, "minor": 1}}}
+    assert baseline["examples"] == {"accuracy-mistranslation": [mqm_key(A, 1, 0)], "fluency-punctuation": [mqm_key(A, 1, 1)],
+                                    "non-translation": [mqm_key(B, 1, 0)], "style": [mqm_key(A, 1, 1)]}
+    full_no_kb = result["pooled"]["full_no_kb"]["mqm"]
+    assert (full_no_kb["scored"], full_no_kb["score"]) == (5, pytest.approx(-1.4))  # -1 0 -5 0 -1
+    assert full_no_kb["breakdown"]["by_category"] == {"style": 2, "fluency-grammar": 1}
+    assert full_no_kb["examples"] == {"style": [mqm_key(A, 1, 0), mqm_key(B, 2, 0)], "fluency-grammar": [mqm_key(A, 2, 1)]}
+
+
+def test_mqm_per_book_counts_that_books_segments_only(tmp_path):
+    by_book = build(*with_mqm(tmp_path))["by_book"]
+
+    assert by_book[A]["baseline"]["mqm"]["score"] == pytest.approx(-7 / 3)
+    assert by_book[B]["baseline"]["mqm"]["score"] == -25.0
+    assert by_book[B]["baseline"]["mqm"]["failed"]["count"] == 1 and by_book[A]["baseline"]["mqm"]["failed"]["count"] == 0
+
+
+def test_a_config_whose_segments_all_failed_has_no_score_not_zero(tmp_path):
+    glossary_dir = make_glossary_dir(tmp_path, books=(A,))
+    run_dir = make_eval(tmp_path, "baseline", A, [page(1, segments=[("甲", "甲"), ("乙", "乙")])], glossary_dir=glossary_dir)
+    write_mqm(run_dir, {(1, 0): "failed", (1, 1): "skipped"})
+
+    mqm_section = report.build_report([run_dir], glossary_dir)["pooled"]["baseline"]["mqm"]
+
+    assert mqm_section["score"] is None and mqm_section["scored"] == 0
+    assert mqm_section["breakdown"]["errors"] == 0 and mqm_section["examples"] == {}
+
+
+def test_at_most_five_segment_keys_are_kept_for_a_category(tmp_path):
+    glossary_dir = make_glossary_dir(tmp_path, books=(A,))
+    run_dir = make_eval(tmp_path, "baseline", A, [page(1, segments=[("甲", "甲")] * 7)], glossary_dir=glossary_dir)
+    write_mqm(run_dir, {(1, i): [("minor", "style"), ("minor", "style")] for i in range(7)})
+
+    mqm_section = report.build_report([run_dir], glossary_dir)["pooled"]["baseline"]["mqm"]
+
+    assert mqm_section["breakdown"]["by_category"] == {"style": 14}
+    assert mqm_section["examples"] == {"style": [mqm_key(A, 1, i) for i in range(5)]}
+
+
+def strip_mqm(result):
+    """The report with everything MQM added taken out again."""
+    result = json.loads(json.dumps(result))
+    result.pop("mqm")
+    for metrics in [*result["pooled"].values(), *(m for by_config in result["by_book"].values() for m in by_config.values())]:
+        metrics.pop("mqm")
+    for run in result["runs"]:
+        run.pop("mqm")
+    return result
+
+
+def test_mqm_files_add_their_sections_and_change_nothing_else(tmp_path, monkeypatch):
+    monkeypatch.setattr(report, "datetime", FixedClock)
+    dirs, glossary_dir = two_by_two(tmp_path)
+    before = json.loads(json.dumps(build(dirs, glossary_dir)))
+    text_before = report.render(before)
+    for key, run_dir in dirs.items():
+        write_mqm(run_dir, MQM_JUDGED[key])
+
+    after = build(dirs, glossary_dir)
+
+    assert strip_mqm(after) == before
+    assert list(after) == [*before, "mqm"]
+    assert after["mqm"] == {
+        "judge_model": MQM_MODEL, "file": f"mqm-{MQM_MODEL}.json",
+        "gemba": {"repository": "https://github.com/MicrosoftTranslator/GEMBA", "commit": "a7a7eff",
+                  "template_sha256": "template"},
+        "weights": {"critical": 25, "major": 5, "minor": 1}, "score_rule": "the rule", "agreement": None,
+        "use": "for reference only", "why": "no agreement check (eval/mqm_agreement.py) was given for this judge"}
+    assert after["runs"][0]["mqm"] == {
+        "file": f"mqm-{MQM_MODEL}.json", "segments_sha256": sha256_of(dirs["baseline", A] / "segments.jsonl"),
+        "scored_at": FINISHED, "prefix": "JUDGE", "model": MQM_MODEL, "response_model": MQM_MODEL, "temperature": 0.0,
+        "reasoning_effort": None, "usage": {"calls": 6, "cost_usd": 0.001}}
+    lines = report.render(after).splitlines()
+    heading = next(i for i, l in enumerate(lines) if l.startswith("GEMBA-MQM by"))
+    block = lines[heading - 1:heading + 1 + len(after["configs"])]  # a blank line, the heading, one line per config
+    assert block[0] == "" and all(l.startswith("  ") for l in block[2:])
+    assert lines[:heading - 1] + lines[heading + 1 + len(after["configs"]):] == text_before.splitlines()
+
+
+def test_mqm_and_consistency_together_each_add_their_own_sections(tmp_path):
+    dirs, glossary_dir = with_mqm(tmp_path)
+    for key, run_dir in dirs.items():
+        write_consistency(run_dir, glossary_dir, CONSISTENCY[key])
+
+    result = build(dirs, glossary_dir)
+
+    assert {"consistency", "kb_ablation", "mqm"} <= set(result)
+    assert {"consistency", "mqm"} <= set(result["pooled"]["baseline"])
+    text = report.render(result)
+    assert text.index("term consistency") < text.index("GEMBA-MQM by") < text.index(f"{A}  (2 common pages)")
+
+
+def test_without_any_mqm_file_the_report_has_no_mqm_at_all(tmp_path):
+    result = build(*two_by_two(tmp_path))
+
+    def keys(value):
+        if isinstance(value, dict):
+            return set(value) | set().union(*map(keys, value.values()))
+        return set().union(*map(keys, value)) if isinstance(value, list) else set()
+
+    assert "mqm" not in keys(result)
+    assert "MQM" not in report.render(result).replace(str(tmp_path), "")
+
+
+def test_the_summary_has_one_mqm_line_per_config(tmp_path):
+    text = report.render(build(*with_mqm(tmp_path)))
+
+    lines = text.splitlines()
+    heading = next(i for i, l in enumerate(lines) if l.startswith("GEMBA-MQM by"))
+    assert MQM_MODEL in lines[heading] and "for reference only" in lines[heading]
+    assert lines[heading + 1] == (
+        f"  baseline: -8.000 [{A} -2.333, {B} -25.000] over 4 scored segments (failed 1, skipped 1); errors 4 "
+        "(critical 1, major 1, minor 2) in 3 segments; most frequent: accuracy-mistranslation 1, fluency-punctuation 1, "
+        "non-translation 1, style 1")
+    assert lines[heading + 2].startswith(f"  full_no_kb: -1.400 [{A} -2.000, {B} -0.500] over 5 scored segments")
+
+
+def test_a_judge_model_is_chosen_when_a_run_has_files_of_two_judges(tmp_path):
+    dirs, glossary_dir = with_mqm(tmp_path)
+    for key, run_dir in dirs.items():
+        write_mqm(run_dir, {}, model="gpt-5.1-2025-11-13")  # no errors anywhere
+
+    with pytest.raises(report.Refused, match="more than one MQM file"):
+        build(dirs, glossary_dir)
+    first = report.build_report(list(dirs.values()), glossary_dir, mqm_judge=MQM_MODEL)
+    second = report.build_report(list(dirs.values()), glossary_dir, mqm_judge="openai/gpt-5.1-2025-11-13")
+
+    assert first["pooled"]["baseline"]["mqm"]["score"] == -8.0 and first["mqm"]["judge_model"] == MQM_MODEL
+    assert second["pooled"]["baseline"]["mqm"]["score"] == 0.0 and second["mqm"]["judge_model"] == "gpt-5.1-2025-11-13"
+
+
+def write_agreement(path, *, model=MQM_MODEL, passed=False):
+    """An agreement file as eval/mqm_agreement.py writes it, as far as the report reads it."""
+    write_json(path, {
+        "sheet": {"path": "sheet.csv", "sha256": "c4" * 32, "expected_sha256": "c4" * 32},
+        "annotator": {"kind": "llm", "note": "The labels are an LLM annotator's, not a person's."},
+        "judge": {"model": model, "prefix": "JUDGE", "response_model": model},
+        "thresholds": {"tau_b": 0.3, "recall": 0.6}, "n_items": 30,
+        "tau_b": {"value": 0.45 if passed else 0.1}, "recall": {"items_with_major_or_critical": 0, "hits": 0, "value": None},
+        "decision": {"pass": passed, "tau_b_ok": passed, "recall_ok": None,
+                     "decided_by": "tau_b alone: the annotator marked no major or critical error"},
+        "computed_at": "2026-10-29T21:00:00+00:00"})
+    return path
+
+
+@pytest.mark.parametrize("passed, use", [(True, "main error analysis"), (False, "for reference only")])
+def test_the_agreement_file_says_whether_the_breakdown_is_the_main_error_analysis(tmp_path, passed, use):
+    dirs, glossary_dir = with_mqm(tmp_path)
+    agreement_path = write_agreement(tmp_path / f"agreement-{MQM_MODEL}.json", passed=passed)
+
+    result = report.build_report(list(dirs.values()), glossary_dir, mqm_agreement=agreement_path)
+
+    assert result["mqm"]["use"] == use
+    assert result["mqm"]["agreement"] == {
+        "file": str(agreement_path), "sha256": sha256_of(agreement_path), "judge_model": MQM_MODEL, "pass": passed,
+        "decided_by": "tau_b alone: the annotator marked no major or critical error", "tau_b": 0.45 if passed else 0.1,
+        "recall": None, "items_with_major_or_critical": 0, "thresholds": {"tau_b": 0.3, "recall": 0.6}, "n_items": 30,
+        "annotator": {"kind": "llm", "note": "The labels are an LLM annotator's, not a person's."},
+        "sheet_sha256": "c4" * 32, "computed_at": "2026-10-29T21:00:00+00:00"}
+    lines = report.render(result).splitlines()
+    heading = next(i for i, l in enumerate(lines) if l.startswith("GEMBA-MQM by"))
+    assert use in lines[heading]
+    assert lines[heading + 1].startswith(f"  agreement check: {'PASS' if passed else 'FAIL'} (tau_b alone")
+    assert "not a person" in lines[heading + 1]
+
+
+def test_the_cli_takes_the_judge_and_the_agreement(cli, tmp_path, capsys):
+    dirs, glossary_dir = with_mqm(tmp_path)
+    agreement_path = write_agreement(tmp_path / "agreement.json", passed=True)
+
+    code = cli.main([*map(str, dirs.values()), "--glossary-dir", str(glossary_dir), "--out-root", str(tmp_path / "r"),
+                     "--mqm-judge", MQM_MODEL, "--mqm-agreement", str(agreement_path)])
+
+    assert code == 0
+    (out_dir,) = list((tmp_path / "r").iterdir())
+    assert read_json(out_dir / "report.json")["mqm"]["use"] == "main error analysis"
+    assert "GEMBA-MQM by" in capsys.readouterr().out
+
+
+def test_different_mqm_response_models_are_a_warning(tmp_path):
+    dirs, glossary_dir = two_by_two(tmp_path)
+    for key, run_dir in dirs.items():
+        write_mqm(run_dir, MQM_JUDGED[key], response_model=MQM_MODEL if key[1] == A else "gpt-4o-mini-2025-01-01")
+
+    warnings = build(dirs, glossary_dir)["warnings"]
+
+    assert len(warnings) == 1 and "MQM files' judge responses came from different models" in warnings[0]
+
+
+def mqm_refusals(tmp_path):
+    """[(what is wrong, run directories, glossary dir, extra CLI arguments, text the message must hold, what it must
+    name)]."""
+    cases = []
+
+    def fresh(name, *, with_file=True):
+        sub = tmp_path / name
+        sub.mkdir()
+        glossary_dir = make_glossary_dir(sub)
+        dirs = [make_eval(sub, "baseline", A, [page(1, segments=[("甲", "甲"), ("乙", "乙")])], glossary_dir=glossary_dir),
+                make_eval(sub, "full_no_kb", A, [page(1, segments=[("甲", "甲"), ("乙", "乙")])], glossary_dir=glossary_dir)]
+        files = [write_mqm(d, {(1, 0): [("minor", "style")]}) for d in (dirs if with_file else dirs[:1])]
+        return sub, dirs, glossary_dir, files
+
+    sub, dirs, g, files = fresh("some-but-not-all", with_file=False)
+    cases.append(("an MQM file in some runs but not all", dirs, g, [], "for every run or for none", dirs[1]))
+
+    sub, dirs, g, files = fresh("mixed-models")
+    files[1].unlink()
+    write_mqm(dirs[1], {}, model="openai/gpt-5.1-2025-11-13")
+    cases.append(("files of two judge models", dirs, g, [], "another judge model ('openai/gpt-5.1-2025-11-13')", dirs[1]))
+
+    sub, dirs, g, files = fresh("two-files")
+    write_mqm(dirs[0], {}, model="gpt-5.1-2025-11-13")
+    cases.append(("two judges' files in one run, no judge named", dirs, g, [], "more than one MQM file", dirs[0]))
+
+    sub, dirs, g, files = fresh("judge-not-there")
+    cases.append(("a judge named that a run has no file of", dirs, g, ["--mqm-judge", "gpt-5.1-2025-11-13"],
+                  "it has no mqm-gpt-5.1-2025-11-13.json", dirs[0]))
+
+    sub, dirs, g, files = fresh("other-segments")
+    edit_json(files[1], lambda d: d.update(segments_sha256="0" * 64))
+    cases.append(("a file over another segments.jsonl", dirs, g, [], f"{files[1].name} scored another segments.jsonl",
+                  dirs[1]))
+
+    sub, dirs, g, files = fresh("other-eval-id")
+    edit_json(files[0], lambda d: d.update(eval_id="20260101T000000Z-baseline"))
+    cases.append(("a file of another eval run", dirs, g, [], f"{files[0].name} is of eval run", dirs[0]))
+
+    sub, dirs, g, files = fresh("other-book")
+    edit_json(files[0], lambda d: d.update(book=B))
+    cases.append(("a file of another book", dirs, g, [], f"{files[0].name} is of book '{B}'", dirs[0]))
+
+    sub, dirs, g, files = fresh("misnamed")
+    edit_json(files[0], lambda d: d["judge"].update(model="another-judge"))
+    cases.append(("a file named for another model than its own", dirs, g, [], "whose file has another name", dirs[0]))
+
+    sub, dirs, g, files = fresh("other-template")
+    edit_json(files[1], lambda d: d["gemba"].update(template_sha256="other"))
+    cases.append(("a file of another prompt", dirs, g, [], "has another GEMBA prompt or commit", dirs[1]))
+
+    sub, dirs, g, files = fresh("other-weights")
+    edit_json(files[1], lambda d: d.update(weights={"critical": 10, "major": 5, "minor": 1}))
+    cases.append(("a file with other weights", dirs, g, [], "has another weights", dirs[1]))
+
+    sub, dirs, g, files = fresh("unknown-status")
+    edit_json(files[0], lambda d: d["segments"][0].update(status="maybe"))
+    cases.append(("an unknown status", dirs, g, [], "unknown status 'maybe'", dirs[0]))
+
+    sub, dirs, g, files = fresh("scored-without-score")
+    edit_json(files[0], lambda d: d["segments"][0].update(score=None))
+    cases.append(("a scored segment without a score", dirs, g, [], "a scored segment whose score is not a number", dirs[0]))
+
+    sub, dirs, g, files = fresh("failed-with-errors")
+    edit_json(files[0], lambda d: d["segments"][1].update(status="failed"))  # its score is 0 and stays
+    cases.append(("a failed segment with a score", dirs, g, [], "a failed segment with a score or errors", dirs[0]))
+
+    sub, dirs, g, files = fresh("unknown-severity")
+    edit_json(files[0], lambda d: d["segments"][0]["errors"][0].update(severity="serious"))
+    cases.append(("an unknown severity", dirs, g, [], "errors that are not a list of severities", dirs[0]))
+
+    sub, dirs, g, files = fresh("segment-missing")
+    edit_json(files[0], lambda d: d["segments"].pop())
+    cases.append(("a segment without a judgement", dirs, g, [], f"has no judgement for segment {A}/1 idx 1", dirs[0]))
+
+    sub, dirs, g, files = fresh("segment-twice")
+    edit_json(files[0], lambda d: d["segments"].append(d["segments"][0]))
+    cases.append(("a segment judged twice", dirs, g, [], "judged twice", dirs[0]))
+
+    sub, dirs, g, files = fresh("not-json")
+    files[0].write_text("{not json", encoding="utf-8")
+    cases.append(("an MQM file that is not JSON", dirs, g, [], f"{files[0].name} cannot be read as JSON", dirs[0]))
+
+    sub, dirs, g, files = fresh("agreement-of-another-judge")
+    other = write_agreement(sub / "agreement.json", model="gpt-5.1-2025-11-13")
+    cases.append(("an agreement file of another judge", dirs, g, ["--mqm-agreement", str(other)],
+                  "the agreement check is of judge 'gpt-5.1-2025-11-13'", other))
+
+    sub, dirs, g, files = fresh("agreement-without-mqm", with_file=False)
+    files[0].unlink()
+    lonely = write_agreement(sub / "agreement.json")
+    cases.append(("an agreement file and no MQM file", dirs, g, ["--mqm-agreement", str(lonely)],
+                  "no run has an MQM file", lonely))
+
+    sub, dirs, g, files = fresh("agreement-broken")
+    broken = sub / "agreement.json"
+    write_json(broken, {"judge": {"model": MQM_MODEL}})
+    cases.append(("an agreement file of another shape", dirs, g, ["--mqm-agreement", str(broken)],
+                  "not an agreement file as eval/mqm_agreement.py writes it", broken))
+
+    sub, dirs, g, files = fresh("agreement-missing")
+    cases.append(("a missing agreement file", dirs, g, ["--mqm-agreement", str(sub / "nowhere.json")],
+                  "the agreement file is missing", sub / "nowhere.json"))
+    return cases
+
+
+def test_every_mqm_refusal_exits_2_names_the_directory_and_writes_nothing(cli, tmp_path, capsys):
+    cases = mqm_refusals(tmp_path)
+    assert len(cases) >= 21
+
+    for what, dirs, glossary_dir, extra, expected, names in cases:
+        out_root = tmp_path / f"report-{abs(hash(what))}"
+        before = snapshot(*dirs, glossary_dir)
+
+        code = cli.main([*map(str, dirs), "--glossary-dir", str(glossary_dir), "--out-root", str(out_root), *extra])
+
+        err = capsys.readouterr().err
+        assert code == 2, what
+        assert err.startswith("Nothing was written: ") and expected in err, (what, err)
+        assert str(names) in err, (what, err)
+        assert not out_root.exists() and snapshot(*dirs, glossary_dir) == before, what
+
+
+def test_the_mqm_names_the_report_repeats_are_the_scorers():
+    import fnmatch
+
+    from fukidashi.evaluation import agreement, mqm, mqm_scorer
+
+    assert report.MQM_SEVERITIES == mqm.SEVERITIES
+    assert report.MQM_WORST == -mqm.SCORE_CAP
+    assert report.MQM_STATUSES == agreement.STATUSES
+    assert report._bare_model("openai/gpt-4o-mini") == mqm_scorer.bare_model("openai/gpt-4o-mini")
+    assert fnmatch.fnmatch(mqm_scorer.output_name("openai/gpt-4o-mini-2024-07-18"), report.MQM_GLOB)
+    assert not fnmatch.fnmatch(mqm_scorer.output_name("openai/gpt-4o-mini-2024-07-18") + ".tmp", report.MQM_GLOB)
+    assert not fnmatch.fnmatch(agreement.output_name("gpt-4o-mini-2024-07-18"), report.MQM_GLOB)
+
+
+def test_the_report_pools_one_run_as_the_scorer_does(tmp_path):
+    """An MQM file built by the scorer's own `build_document` over a run of the report's fixtures: the report over that
+    one run gives the file's own system score and breakdown."""
+    from types import SimpleNamespace
+
+    from fukidashi.evaluation import mqm, mqm_scorer
+
+    glossary_dir = make_glossary_dir(tmp_path, books=(A,))
+    pages = [page(1, segments=[("甲", "甲"), ("乙", "乙"), ("丙", "丙")]), page(2, segments=[("丁", "丁"), ("戊", "戊")])]
+    run_dir = make_eval(tmp_path, "full", A, pages, glossary_dir=glossary_dir)
+    run = mqm_scorer.read_run(run_dir)
+    errors = [(("critical", "accuracy-mistranslation"), ("minor", "style")), (), (("major", "fluency-register"),) * 6,
+              "failed", (("minor", "style"), ("major", "accuracy-omission"))]
+    results = [mqm_scorer.SegmentResult(line, "failed", attempts=2) if e == "failed" else
+               mqm_scorer.SegmentResult(line, "scored", tuple(mqm.MQMError(s, c, None, c) for s, c in e), "(answer)", 1)
+               for line, e in zip(run.lines, errors)]
+    meter = SimpleNamespace(records=[], summary=lambda: {"calls": 6, "unknown_usage_calls": 0, "input_tokens": 1,
+                                                         "output_tokens": 1, "cost_usd": 0.0})
+    client = SimpleNamespace(meter=meter, config=SimpleNamespace(model=MQM_MODEL, temperature=0.0, reasoning_effort=None))
+    document = mqm_scorer.build_document(run, client, "JUDGE", results, elapsed_s=0.1)
+    mqm_scorer.write_json(run_dir / mqm_scorer.output_name(MQM_MODEL), document)
+
+    pooled = report.build_report([run_dir], glossary_dir)["pooled"]["full"]["mqm"]
+
+    assert pooled["score"] == document["system_score"]
+    assert pooled["scored"] == document["scored"] and pooled["failed"]["count"] == document["failed"]["count"] == 1
+    assert pooled["breakdown"] == {k: v for k, v in document["breakdown"].items() if k != "segments"}

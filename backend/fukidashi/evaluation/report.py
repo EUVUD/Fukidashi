@@ -22,12 +22,22 @@ tests can import it.
   accuracy and whether consistency is reportable, and the occurrences by status. report.json then also says that term
   accuracy is the KB ablation's primary metric and consistency its secondary one (OUTLINE 4.3, 8). When no run has
   such a file the report is what it was before; when only some have one, the report refuses.
+- **GEMBA-MQM is optional too, and all or none, from one judge model** (OUTLINE 4.4, 4.5). When every run has an
+  `mqm-<judge model>.json` (eval/mqm.py) from the same judge model, prompt and weights (with `mqm_judge`, the one of
+  that model; without it, a run must have only one), each config gets an `mqm` section over the common pages: the mean
+  MQM score of the scored segments, the failed and skipped segments, the error breakdown by severity, by category and by
+  both (every error the judge marked, as the scorer counts them), and up to five segment keys for each category. The
+  report's `mqm` section names the judge and says whether the breakdown is the main error analysis: only when an
+  agreement file (eval/mqm_agreement.py, `mqm_agreement`) of the same judge model says the judge passed; otherwise it is
+  for reference only. When no run has an MQM file the report is what it was before; when only some have one, or the
+  files differ in judge model, prompt or weights, the report refuses.
 - **Warnings, not refusals,** for provenance: a dirty tree, runs from different commits, different models.
   Everything that would make the numbers wrong is a refusal (`Refused`).
 """
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import math
@@ -68,6 +78,14 @@ CONSISTENCY_MIN_RENDERED = 2  # an entry counts in the pooled consistency with t
 CONSISTENCY_REPORTABLE_PERCENT = 90  # the extractor's accuracy at which consistency is a result
 KB_ABLATION = {"comparison": "full vs full_no_kb", "primary_metric": "term accuracy (terms.primary)",
                "secondary_metric": "term consistency (consistency.translation)"}  # OUTLINE 4.3, 8
+# GEMBA-MQM (eval/mqm.py) and its agreement check (eval/mqm_agreement.py). These repeat evaluation/mqm.py's and
+# evaluation/mqm_scorer.py's names, which this module does not import; a test pins each to its source.
+MQM_GLOB = "mqm-*.json"
+MQM_SEVERITIES = ("critical", "major", "minor")
+MQM_STATUSES = ("scored", "skipped", "failed")
+MQM_WORST = -25  # a segment's MQM score is between this and 0
+MQM_EXAMPLES = 5  # segment keys kept for each error category
+MQM_MAIN, MQM_REFERENCE = "main error analysis", "for reference only"  # OUTLINE 4.5
 
 
 class Refused(Exception):
@@ -99,6 +117,19 @@ class Consistency:
 
 
 @dataclass(frozen=True)
+class MQM:
+    """A run's mqm-<model>.json: its name, the file without its segments, and each segment's judgement."""
+
+    name: str
+    document: dict
+    segments: dict[tuple[str, int, int], dict]  # (book, page_index, idx) -> {"status", "score", "errors"}
+
+    @property
+    def judge_model(self) -> str:
+        return self.document["judge"]["model"]
+
+
+@dataclass(frozen=True)
 class Run:
     """One finished eval run, as read from its directory."""
 
@@ -116,6 +147,9 @@ class Run:
     comet_scores: dict[tuple[str, int, int], float]  # (book, page_index, idx) -> score
     terms: dict  # terms.json without its entries
     consistency: Consistency | None = None  # the run's consistency file, if it has one
+    segments_sha256: str = ""  # of segments.jsonl
+    mqm_names: tuple[str, ...] = ()  # the run's MQM files, by name
+    mqm: MQM | None = None  # the MQM file the report pools, once build_report has chosen it
 
 
 # --- reading one run --------------------------------------------------------------------------------------------------
@@ -184,7 +218,8 @@ def load_run(directory: Path, glossary_dir: Path) -> Run:
                           f"idx {s['idx']}")
     return Run(directory, manifest, eval_id, config, book, statuses, rows, failed, segments,
                _term_entries(directory, terms), {k: v for k, v in comet.items() if k != "segments"}, comet_scores,
-               {k: v for k, v in terms.items() if k != "entries"}, consistency)
+               {k: v for k, v in terms.items() if k != "entries"}, consistency, segments_sha256,
+               tuple(sorted(p.name for p in directory.glob(MQM_GLOB) if p.is_file())))
 
 
 def _statuses(directory: Path, manifest: dict) -> dict[int, str]:
@@ -340,6 +375,66 @@ def _consistency_entries(directory: Path, name: str, document: dict) -> list[tup
         raise Refused(f"{directory}: {name} is not shaped as eval/consistency.py writes it ({type(e).__name__}: {e})")
 
 
+def _bare_model(model: str) -> str:
+    """The model without an organisation prefix, as eval/mqm.py names its file ("openai/gpt-4o-mini" -> "gpt-4o-mini")."""
+    return model.strip().rsplit("/", 1)[-1]
+
+
+def _mqm_file(run: Run, name: str) -> MQM:
+    """The run's MQM file `name`, checked against the run."""
+    directory = run.directory
+    document = _json_file(directory, name)
+    if document.get("eval_id") != run.eval_id:
+        raise Refused(f"{directory}: {name} is of eval run {document.get('eval_id')!r}, the manifest's is {run.eval_id!r}")
+    if document.get("book") != run.book:
+        raise Refused(f"{directory}: {name} is of book {document.get('book')!r}, the run is of {run.book!r}")
+    if document.get("segments_sha256") != run.segments_sha256:
+        raise Refused(f"{directory}: {name} scored another segments.jsonl than the one there now (its segments_sha256 "
+                      "differs): score the run again with eval/mqm.py")
+    judge = document.get("judge")
+    if not isinstance(judge, dict) or not isinstance(judge.get("model"), str) or not judge["model"].strip():
+        raise Refused(f"{directory}: {name} has no judge `model`")
+    if f"mqm-{_bare_model(judge['model'])}.json" != name:
+        raise Refused(f"{directory}: {name} holds the judgements of {judge['model']!r}, whose file has another name")
+
+    def judgement(segment: Any) -> tuple[tuple[str, int, int], dict]:
+        if not isinstance(segment, dict) or not isinstance(segment.get("book"), str) \
+                or not _is_int(segment.get("page_index")) or not _is_int(segment.get("idx")):
+            raise ValueError("a segment without book, page_index and idx")
+        status, score, errors = segment["status"], segment["score"], segment["errors"]
+        if status not in MQM_STATUSES:
+            raise ValueError(f"unknown status {status!r}")
+        if not isinstance(errors, list) or not all(
+                isinstance(e, dict) and e.get("severity") in MQM_SEVERITIES and isinstance(e.get("category"), str)
+                for e in errors):
+            raise ValueError("errors that are not a list of severities and categories")
+        if status == "scored" and not (_is_finite(score) and MQM_WORST <= score <= 0):
+            raise ValueError(f"a scored segment whose score is not a number between {MQM_WORST} and 0")
+        if status != "scored" and (score is not None or errors):
+            raise ValueError(f"a {status} segment with a score or errors")
+        return ((segment["book"], segment["page_index"], segment["idx"]),
+                {"status": status, "score": score, "errors": [(e["severity"], e["category"]) for e in errors]})
+
+    segments: dict[tuple[str, int, int], dict] = {}
+    try:
+        if not isinstance(document["segments"], list):
+            raise ValueError("`segments` is not a list")
+        for segment in document["segments"]:
+            key, value = judgement(segment)
+            if key in segments:
+                raise ValueError(f"segment {key[0]}/{key[1]} idx {key[2]} judged twice")
+            segments[key] = value
+    except (KeyError, TypeError, ValueError) as e:
+        raise Refused(f"{directory}: {name} is not shaped as eval/mqm.py writes it ({type(e).__name__}: {e})")
+    wanted = {(s["book"], s["page_index"], s["idx"]) for s in run.segments}
+    for key in sorted(wanted - set(segments)):
+        raise Refused(f"{directory}: {name} has no judgement for segment {key[0]}/{key[1]} idx {key[2]}")
+    for key in sorted(set(segments) - wanted):
+        raise Refused(f"{directory}: {name} judges segment {key[0]}/{key[1]} idx {key[2]}, which segments.jsonl does "
+                      "not have")
+    return MQM(name, {k: v for k, v in document.items() if k != "segments"}, segments)
+
+
 def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -389,6 +484,92 @@ def _check_consistency(runs: Sequence[Run]) -> dict | None:
                               "one set of rules")
     return {"judge_model": first.consistency.judge_model, "rules": first.consistency.document["rules"],
             "min_rendered": CONSISTENCY_MIN_RENDERED, "threshold": CONSISTENCY_REPORTABLE_PERCENT / 100}
+
+
+def _select_mqm(runs: Sequence[Run], judge: str | None) -> list[Run]:
+    """All or none, from one judge model: the runs with the MQM file the report pools set (`Run.mqm`), or the runs as
+    they are when none has an MQM file and no `judge` is asked for."""
+    if judge is not None:
+        name = f"mqm-{_bare_model(judge)}.json"
+        for run in runs:
+            if name not in run.mqm_names:
+                raise Refused(f"{run.directory}: it has no {name} (it has {', '.join(run.mqm_names) or 'no MQM file'}): "
+                              "the report pools GEMBA-MQM from one judge for every run (score this one with "
+                              "eval/mqm.py)")
+        chosen = [dataclasses.replace(run, mqm=_mqm_file(run, name)) for run in runs]
+    else:
+        having = [r for r in runs if r.mqm_names]
+        if not having:
+            return list(runs)
+        first = having[0]
+        for run in runs:
+            if not run.mqm_names:
+                raise Refused(f"{run.directory}: it has no {MQM_GLOB}, but {first.directory} has {first.mqm_names[0]}: "
+                              "the report pools GEMBA-MQM for every run or for none (score this one with eval/mqm.py)")
+            if len(run.mqm_names) > 1:
+                raise Refused(f"{run.directory}: it has more than one MQM file ({', '.join(run.mqm_names)}): name the "
+                              "judge whose files the report pools (--mqm-judge)")
+        chosen = [dataclasses.replace(run, mqm=_mqm_file(run, run.mqm_names[0])) for run in runs]
+    first = chosen[0]
+    for run in chosen[1:]:
+        if _bare_model(run.mqm.judge_model) != _bare_model(first.mqm.judge_model):
+            raise Refused(f"{run.directory}: {run.mqm.name} is by another judge model ({run.mqm.judge_model!r}) than "
+                          f"{first.directory} ({first.mqm.judge_model!r}): the report pools one judge's MQM scores "
+                          "(name it with --mqm-judge)")
+        for key, label in (("gemba", "GEMBA prompt or commit"), ("weights", "weights"), ("score_rule", "score rule")):
+            mine, theirs = run.mqm.document.get(key), first.mqm.document.get(key)
+            if key == "gemba":
+                mine, theirs = ({k: (d or {}).get(k) for k in ("commit", "template_sha256")} for d in (mine, theirs))
+            if mine != theirs:
+                raise Refused(f"{run.directory}: {run.mqm.name} has another {label} than {first.directory}: the report "
+                              "pools MQM scores of one prompt and one set of weights")
+    return chosen
+
+
+def _mqm_header(runs: Sequence[Run], agreement_path: Path | None) -> dict | None:
+    """The report's `mqm` section: the judge, the prompt, and whether its breakdown is the main error analysis."""
+    if not runs or runs[0].mqm is None:
+        if agreement_path is not None:
+            raise Refused(f"{agreement_path}: an agreement file is given, but no run has an MQM file")
+        return None
+    document = runs[0].mqm.document
+    model = runs[0].mqm.judge_model
+    agreement = None if agreement_path is None else _agreement(agreement_path, model)
+    if agreement is None:
+        use, why = MQM_REFERENCE, "no agreement check (eval/mqm_agreement.py) was given for this judge"
+    elif agreement["pass"]:
+        use, why = MQM_MAIN, "the judge passed the agreement check (OUTLINE 4.5)"
+    else:
+        use, why = MQM_REFERENCE, "the judge failed the agreement check (OUTLINE 4.5)"
+    return {"judge_model": model, "file": runs[0].mqm.name,
+            "gemba": {k: (document.get("gemba") or {}).get(k) for k in ("repository", "commit", "template_sha256")},
+            "weights": document.get("weights"), "score_rule": document.get("score_rule"),
+            "agreement": agreement, "use": use, "why": why}
+
+
+def _agreement(path: Path, model: str) -> dict:
+    """An agreement file (eval/mqm_agreement.py), as far as the report quotes it; it must be the pooled judge's."""
+    if not path.is_file():
+        raise Refused(f"{path}: the agreement file is missing")
+    try:
+        raw = path.read_bytes()
+        document = json.loads(raw.decode("utf-8"))
+        judge, decision = document["judge"]["model"], document["decision"]
+        summary = {
+            "file": str(path), "sha256": hashlib.sha256(raw).hexdigest(), "judge_model": judge,
+            "pass": decision["pass"], "decided_by": decision["decided_by"],
+            "tau_b": document["tau_b"]["value"], "recall": document["recall"]["value"],
+            "items_with_major_or_critical": document["recall"]["items_with_major_or_critical"],
+            "thresholds": document["thresholds"], "n_items": document["n_items"],
+            "annotator": {"kind": document["annotator"]["kind"], "note": document["annotator"]["note"]},
+            "sheet_sha256": document["sheet"]["sha256"], "computed_at": document["computed_at"]}
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise Refused(f"{path}: it is not an agreement file as eval/mqm_agreement.py writes it ({type(e).__name__}: {e})")
+    if not isinstance(summary["pass"], bool) or not isinstance(judge, str):
+        raise Refused(f"{path}: it is not an agreement file as eval/mqm_agreement.py writes it (no decision)")
+    if _bare_model(judge) != _bare_model(model):
+        raise Refused(f"{path}: the agreement check is of judge {judge!r}, the MQM files are by {model!r}")
+    return summary
 
 
 def _config_order(config: str) -> tuple[int, str]:
@@ -455,6 +636,8 @@ def _metrics(config: str, runs: Sequence[Run], common: dict[str, list[int]]) -> 
         metrics["kb_reach"] = _kb_reach(runs, wanted)
     if all(r.consistency is not None for r in runs):  # all or none, which build_report has checked
         metrics["consistency"] = _consistency(runs, wanted)
+    if all(r.mqm is not None for r in runs):  # all or none, too
+        metrics["mqm"] = _mqm(runs, wanted)
     return metrics
 
 
@@ -513,6 +696,47 @@ def _consistency(runs: Sequence[Run], wanted: dict[str, set[int]]) -> dict:
         "statuses": statuses,
         "extractor": {"checked": checked, "correct": correct, "accuracy": correct / checked if checked else None,
                       "reportable": checked > 0 and correct * 100 >= checked * CONSISTENCY_REPORTABLE_PERCENT},
+    }
+
+
+def _mqm(runs: Sequence[Run], wanted: dict[str, set[int]]) -> dict:
+    """GEMBA-MQM over the segments of the common pages: the mean score of the scored ones, the failed and skipped ones,
+    and the errors of the scored ones counted as the scorer counts them (evaluation/mqm.py `breakdown`), with up to
+    MQM_EXAMPLES segment keys for each category, in the order of the books and of segments.jsonl."""
+    judged = [({"book": s["book"], "page_index": s["page_index"], "idx": s["idx"]},
+               r.mqm.segments[(s["book"], s["page_index"], s["idx"])])
+              for r in runs for s in r.segments if s["page_index"] in wanted[r.book]]
+    scored = [(key, j) for key, j in judged if j["status"] == "scored"]
+    by_severity = dict.fromkeys(MQM_SEVERITIES, 0)
+    by_category: Counter[str] = Counter()
+    both: dict[str, dict[str, int]] = {}
+    examples: dict[str, list[dict]] = {}
+    for key, j in scored:
+        for severity, category in j["errors"]:
+            by_severity[severity] += 1
+            by_category[category] += 1
+            both.setdefault(category, dict.fromkeys(MQM_SEVERITIES, 0))[severity] += 1
+            kept = examples.setdefault(category, [])
+            if key not in kept and len(kept) < MQM_EXAMPLES:
+                kept.append(key)
+    order = sorted(by_category, key=lambda c: (-by_category[c], c))
+    scores = [j["score"] for _, j in scored]
+    return {
+        "segments": len(judged),
+        "scored": len(scored),
+        "failed": {"count": sum(j["status"] == "failed" for _, j in judged),
+                   "segments": [key for key, j in judged if j["status"] == "failed"]},
+        "skipped": {"count": sum(j["status"] == "skipped" for _, j in judged),
+                    "segments": [key for key, j in judged if j["status"] == "skipped"]},
+        "score": math.fsum(scores) / len(scores) if scores else None,
+        "breakdown": {
+            "errors": sum(by_severity.values()),
+            "segments_with_errors": sum(1 for _, j in scored if j["errors"]),
+            "by_severity": by_severity,
+            "by_category": {c: by_category[c] for c in order},
+            "by_category_and_severity": {c: both[c] for c in order},
+        },
+        "examples": {c: examples[c] for c in order},
     }
 
 
@@ -595,6 +819,12 @@ def _provenance(run: Run) -> dict:
         **{key: run.consistency.document.get(key) for key in ("rules", "glossary_sha256", "segments_sha256")},
         **{key: run.consistency.document["judge"].get(key) for key in ("prefix", "model", "response_model")},
         "usage": run.consistency.document.get("usage")}}
+    judged = {} if run.mqm is None else {"mqm": {
+        "file": run.mqm.name,
+        **{key: run.mqm.document.get(key) for key in ("segments_sha256", "scored_at")},
+        **{key: run.mqm.document["judge"].get(key) for key in ("prefix", "model", "response_model", "temperature",
+                                                                "reasoning_effort")},
+        "usage": run.mqm.document.get("usage")}}
     return {
         "directory": str(run.directory),
         "eval_id": run.eval_id,
@@ -613,6 +843,7 @@ def _provenance(run: Run) -> dict:
         "comet": {key: run.comet.get(key) for key in ("model", "model_revision", "versions", "device")},
         "terms": {key: run.terms.get(key) for key in ("rules", "glossary_sha256")},
         **consistency,
+        **judged,
     }
 
 
@@ -643,16 +874,26 @@ def _warnings(runs: Sequence[Run]) -> list[str]:
     if len({response for _, response in responses}) > 1:
         warnings.append("the consistency files' judge responses came from different models (or some do not say): "
                         + ", ".join(f"{run.eval_id} {response}" for run, response in responses))
+    judged = [(run, json.dumps(run.mqm.document["judge"].get("response_model")))
+              for run in runs if run.mqm is not None]
+    if len({response for _, response in judged}) > 1:
+        warnings.append("the MQM files' judge responses came from different models (or some do not say): "
+                        + ", ".join(f"{run.eval_id} {response}" for run, response in judged))
     return warnings
 
 
 # --- the report --------------------------------------------------------------------------------------------------------
 
-def build_report(directories: Sequence[Path], glossary_dir: Path) -> dict:
-    """The report of the eval runs in `directories` (what report.json holds). Raises `Refused`, having written nothing."""
+def build_report(directories: Sequence[Path], glossary_dir: Path, *, mqm_judge: str | None = None,
+                 mqm_agreement: Path | None = None) -> dict:
+    """The report of the eval runs in `directories` (what report.json holds). `mqm_judge` names the judge model whose
+    MQM files are pooled (needed only when a run has files of more than one); `mqm_agreement` is that judge's agreement
+    file (eval/mqm_agreement.py). Raises `Refused`, having written nothing."""
     runs = [load_run(Path(d), glossary_dir) for d in directories]
     _check_set(runs)
     consistency = _check_consistency(runs)
+    runs = _select_mqm(runs, mqm_judge)
+    mqm = _mqm_header(runs, None if mqm_agreement is None else Path(mqm_agreement))
     runs.sort(key=lambda r: (_config_order(r.config), _book_order(r.book)))
     configs = list(dict.fromkeys(r.config for r in runs))
     common = _common_pages(runs)
@@ -673,6 +914,8 @@ def build_report(directories: Sequence[Path], glossary_dir: Path) -> dict:
     if consistency is not None:  # without consistency files the report is what it was before
         report["consistency"] = consistency
         report["kb_ablation"] = dict(KB_ABLATION)
+    if mqm is not None:  # and without MQM files, too
+        report["mqm"] = mqm
     return report
 
 
@@ -768,6 +1011,30 @@ def _consistency_line(config: str, pooled: dict, by_book: dict[str, dict]) -> st
             f" {statuses}")
 
 
+def _mqm_heading(report: dict) -> list[str]:
+    m = report["mqm"]
+    lines = [f"GEMBA-MQM by {m['judge_model']}, the mean MQM score of the scored segments (0 is no error, "
+             f"{MQM_WORST} the worst): {m['use']}, because {m['why']}"]
+    a = m["agreement"]
+    if a is not None:
+        tau = "undefined" if a["tau_b"] is None else f"{a['tau_b']:.4f}"
+        recall = "n/a" if a["recall"] is None else f"{a['recall']:.1%}"
+        lines.append(f"  agreement check: {'PASS' if a['pass'] else 'FAIL'} ({a['decided_by']}); tau_b {tau}, recall "
+                     f"{recall} over {a['n_items']} items; {a['annotator']['note']}")
+    return lines
+
+
+def _mqm_line(config: str, pooled: dict, by_book: dict[str, dict]) -> str:
+    """One config's MQM on one line: pooled and per book, the segments, the errors and the most frequent categories."""
+    books = ", ".join(f"{book} {_num(m['score'], '.3f')}" for book, m in by_book.items())
+    b = pooled["breakdown"]
+    severities = ", ".join(f"{s} {n}" for s, n in b["by_severity"].items())
+    top = ", ".join(f"{c} {n}" for c, n in list(b["by_category"].items())[:5]) or "none"
+    return (f"  {config}: {_num(pooled['score'], '.3f')} [{books}] over {pooled['scored']} scored segments (failed "
+            f"{pooled['failed']['count']}, skipped {pooled['skipped']['count']}); errors {b['errors']} ({severities}) "
+            f"in {b['segments_with_errors']} segments; most frequent: {top}")
+
+
 def render(report: dict) -> str:
     configs, pooled = report["configs"], report["pooled"]
     common = report["common_pages"]
@@ -819,6 +1086,11 @@ def render(report: dict) -> str:
         lines += ["", _consistency_heading(report)]
         lines += [_consistency_line(config, pooled[config]["consistency"],
                                     {book: report["by_book"][book][config]["consistency"] for book in report["books"]})
+                  for config in configs]
+    if "mqm" in report:
+        lines += ["", *_mqm_heading(report)]
+        lines += [_mqm_line(config, pooled[config]["mqm"],
+                            {book: report["by_book"][book][config]["mqm"] for book in report["books"]})
                   for config in configs]
 
     for book, by_config in report["by_book"].items():

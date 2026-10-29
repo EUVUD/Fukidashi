@@ -2,6 +2,8 @@
 
 Usage:
   uv run python eval/report.py runs/eval/<id> [runs/eval/<id> ...]
+  uv run python eval/report.py runs/eval/<id> ... [--mqm-judge <judge model>] \
+      [--mqm-agreement runs/mqm-human/<time>-sample/agreement-<judge model>.json]
 
 Takes one finished eval run for each config and book (the same books for every config), each with its `terms.json`
 (eval/terms.py) and `comet-wmt22-comet-da.json` (eval/comet.py). Per config, pooled over the books and per book, it
@@ -17,12 +19,23 @@ its primary one), the reference's consistency, the extractor's accuracy and whet
 occurrences by status, pooled and per book; the summary gains one consistency line per config. When no run has one, the
 report is what it was before; when only some have one, or the files differ in judge model or rules, it refuses.
 
+GEMBA-MQM (eval/mqm.py) is optional in the same way: when every run has an mqm-<judge model>.json from one judge model,
+prompt and weights, each config also gets, over the common pages, the mean MQM score of the scored segments, the failed
+and skipped segments, the error breakdown by severity and category, and up to five segment keys per category, pooled
+and per book; the summary gains one MQM line per config. --mqm-judge names the judge whose files are pooled, which is
+needed when a run has files of more than one judge. --mqm-agreement gives that judge's agreement file
+(eval/mqm_agreement.py): the report quotes it, and calls the breakdown the main error analysis only when it says the
+judge passed (OUTLINE 4.5); without it, or when the judge failed, the breakdown is for reference only. When no run has
+an MQM file the report is what it was before; when only some have one, or the files differ in judge model, prompt or
+weights, or the agreement file is of another judge, it refuses.
+
 Writes runs/report/<UTC time>-report/report.json (a new directory each time, the file replaced through a temporary
 file) and prints a plain-text summary. It reads only files: nothing here calls a model, opens a network connection or
 reads the database.
 Exit code: 0 when report.json is written; 2 (with a message naming the directory and the cause, and nothing written) when
 a directory is missing or unfinished, a file is missing or does not match the others, the runs are not one for each
-config and book over the same books, or only some runs have a consistency file; 1 when the report cannot be written.
+config and book over the same books, only some runs have a consistency or an MQM file, or the MQM files or the
+agreement file do not belong together; 1 when the report cannot be written.
 """
 
 from __future__ import annotations
@@ -43,9 +56,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("run_dirs", nargs="+", type=Path, help="eval runs' directories, e.g. runs/eval/<id>")
     ap.add_argument("--glossary-dir", type=Path, default=GLOSSARY_DIR, help="where the glossary files are")
     ap.add_argument("--out-root", type=Path, default=REPORT_DIR, help="where the report's own directory is made")
+    ap.add_argument("--mqm-judge", help="the judge model whose MQM files are pooled, when a run has more than one")
+    ap.add_argument("--mqm-agreement", type=Path, help="that judge's agreement file (eval/mqm_agreement.py)")
     args = ap.parse_args(argv)
     try:
-        document = report.build_report(args.run_dirs, args.glossary_dir)
+        document = report.build_report(args.run_dirs, args.glossary_dir, mqm_judge=args.mqm_judge,
+                                       mqm_agreement=args.mqm_agreement)
     except report.Refused as e:
         print(f"Nothing was written: {e}", file=sys.stderr)
         return 2
