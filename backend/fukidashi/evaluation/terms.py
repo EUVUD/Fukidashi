@@ -120,6 +120,7 @@ def normalise(text: str) -> str:
 
 def _lines(raw: Iterable[Mapping[str, Any]]) -> list[_Line]:
     lines = []
+    first_seen: dict[tuple[int, int], int] = {}  # (page_index, idx) -> the number of the line that had it first
     for position, item in enumerate(raw):
         if not isinstance(item, Mapping):
             raise TermsError(f"segment line {position + 1} is not a JSON object")
@@ -127,6 +128,11 @@ def _lines(raw: Iterable[Mapping[str, Any]]) -> list[_Line]:
             value = item.get(key)
             if not isinstance(value, kind) or isinstance(value, bool):
                 raise TermsError(f"segment line {position + 1} has no {kind.__name__} `{key}`")
+        place = (item["page_index"], item["idx"])
+        if place in first_seen:  # a segment counted twice would count its occurrences twice
+            raise TermsError(f"segment line {position + 1} repeats page_index {place[0]} idx {place[1]}, "
+                             f"which line {first_seen[place]} has")
+        first_seen[place] = position + 1
         lines.append(_Line(item["page_index"], item["idx"], normalise(item["ja"]), normalise(item["hyp"]),
                            normalise(item["ref_zh_hans"])))
     return sorted(lines, key=lambda line: (line.page_index, line.idx))

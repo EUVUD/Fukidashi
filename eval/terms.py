@@ -102,7 +102,8 @@ def read_lines(path: Path) -> list[dict]:
     except (OSError, UnicodeDecodeError) as e:
         raise Refused(f"cannot read {path.name}: {e}")
     lines = []
-    for number, line in enumerate(text.splitlines(), start=1):
+    # "\n" only: `splitlines()` also cuts at U+2028, U+2029 and U+0085, which the harness writes unescaped
+    for number, line in enumerate(text.split("\n"), start=1):
         if not line.strip():
             continue
         try:

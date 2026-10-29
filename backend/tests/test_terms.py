@@ -229,6 +229,16 @@ def test_a_line_with_a_field_of_the_wrong_type_is_an_error(change):
         terms.score_terms(glossary_of(entry("ryu", "リュウ", "龙")), ["text"])
 
 
+def test_a_repeated_page_index_and_idx_is_an_error_not_a_second_set_of_occurrences():
+    """A segment counted twice would double its occurrences: the `full` run's 27 lines twice gave 20/6, not 10/3."""
+    doubled = LINES + LINES
+
+    with pytest.raises(terms.TermsError, match=r"line 10 repeats page_index 1 idx 0, which line 1 has"):
+        terms.score_terms(glossary_of(*ENTRIES), doubled)
+    # the same place on another page, or another idx on the same page, is a different segment
+    assert terms.score_terms(glossary_of(*ENTRIES), LINES).primary.occurrences == 5
+
+
 def imported_names(path):
     names = set()
     for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
@@ -381,6 +391,30 @@ def test_the_cli_refuses_with_exit_code_2_and_writes_nothing(cli, tmp_path, caps
         assert capsys.readouterr().err.count(message) >= 1, what
         assert (sorted(p.name for p in run_dir.iterdir()) if run_dir.exists() else None) == before, what
         assert not (run_dir / "terms.json").exists(), what
+
+
+def test_the_cli_refuses_a_repeated_segment_with_exit_code_2_and_writes_nothing(cli, tmp_path, capsys):
+    run_dir, gloss_dir = make_run(tmp_path, LINES + [LINES[0]])
+    before = sorted(p.name for p in run_dir.iterdir())
+
+    assert run(cli, run_dir, gloss_dir) == 2
+
+    err = capsys.readouterr().err
+    assert "repeats page_index 1 idx 0" in err and "segments.jsonl" in err
+    assert sorted(p.name for p in run_dir.iterdir()) == before and not (run_dir / "terms.json").exists()
+
+
+@pytest.mark.parametrize("separator", [" ", " ", "\u0085"], ids=["U+2028", "U+2029", "U+0085"])
+def test_the_cli_scores_a_translation_that_contains_a_unicode_line_separator(cli, tmp_path, separator):
+    """The harness leaves these characters unescaped in `segments.jsonl`; `splitlines()` would cut the line in two."""
+    lines = [line(1, 0, "アルファ", "甲", f"甲{separator}甲"), line(1, 1, "アルファ", "甲", "错")]
+    run_dir, gloss_dir = make_run(tmp_path, lines)
+    assert separator in (run_dir / "segments.jsonl").read_text(encoding="utf-8")
+
+    assert run(cli, run_dir, gloss_dir) == 0
+
+    written = json.loads((run_dir / "terms.json").read_text(encoding="utf-8"))
+    assert (written["scores"]["primary"]["occurrences"], written["scores"]["primary"]["hits"]) == (2, 1)
 
 
 def test_a_glossary_of_another_book_is_refused(cli, tmp_path, capsys):
