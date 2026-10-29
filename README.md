@@ -4,7 +4,7 @@ English | [简体中文](README.zh-CN.md)
 
 A multi-agent manga translation editor (Japanese → Simplified Chinese), evaluated on the [OpenMantra](https://github.com/mantra-inc/open-mantra-dataset) dataset against a single-call baseline with a standard MT evaluation framework.
 
-> **Status (2026-10-28):** M0 to M3 are done. The vertical slice works end to end: import OpenMantra, translate a page with one model call, and check every line against its box in the browser. M2 added an eval harness that scores configs with chrF / BLEU, a first Translator Agent (the `translator` config) on a tool-calling loop over our metered client, and optional tracing in a local Arize Phoenix ([record](docs/m2.md)). M3 added the multi-agent system ([record](docs/m3.md)): a Reviewer Agent, an Orchestrator that sends pages back for revision, a per-book Knowledge Base with a Curator Agent as its only writer, the `full` and `full_no_kb` configs, and a gold glossary for the two dev books. M4 has added whole-book evals, a COMET scorer, term accuracy against the gold glossary, a count of how often the KB reaches a page, and CI on GitHub Actions. Next are the first dev runs: all three configs on the two dev books.
+> **Status (2026-10-29):** M0 to M4 are done. The vertical slice works end to end: import OpenMantra, translate a page with one model call, and check every line against its box in the browser. M2 added an eval harness that scores configs with chrF / BLEU, a first Translator Agent (the `translator` config) on a tool-calling loop over our metered client, and optional tracing in a local Arize Phoenix ([record](docs/m2.md)). M3 added the multi-agent system ([record](docs/m3.md)): a Reviewer Agent, an Orchestrator that sends pages back for revision, a per-book Knowledge Base with a Curator Agent as its only writer, the `full` and `full_no_kb` configs, and a gold glossary for the two dev books. M4 added whole-book evals, a COMET scorer, term accuracy against the gold glossary, a count of how often the KB reaches a page, a report that pools eval runs, and CI on GitHub Actions, then ran each config once on the two dev books ([record](docs/m4.md)). On the dev split the full system scored no higher than one call per page (COMET 0.8235 against 0.8257) at about 9.5 times the cost; that is one run of each config, without confidence intervals yet. Next is M5: the eval protocol, GEMBA-MQM and term consistency, then the freeze.
 
 ## What it does
 
@@ -60,14 +60,15 @@ uv run python eval/run.py --config full --book tojime_no_siora --pages 2,3,4    
 
 The eval harness translates those pages through the same code path as the editor (each page leaves a Run in SQLite), converts the zh-Hant reference translations to zh-Hans with OpenCC (`t2s`), and prints chrF and BLEU with their sacreBLEU signatures, plus cost per page and latency; for the agent configs it also counts the pages that fell back to `baseline`, and for `full_no_kb` and `full` how often the Reviewer sent a page back and why the loop stopped. A `full` eval starts from a new, empty Knowledge Base, passes it through the pages in order, and reports what the Curator decided, how often the KB reached a page, and what the KB holds at the end. The Manifest, per-Segment outputs and scores go to `runs/eval/<id>/`, rewritten after every page, so an interrupted eval keeps the pages it finished. Leave out `--pages` to evaluate every page of a book in page order (a whole book makes many real calls). The exit code is non-zero if a page failed or the harness could not start.
 
-Two scorers read a finished eval run and write their results next to its outputs. Neither calls a model provider:
+Two scorers read a finished eval run and write their results next to its outputs, and a report pools scored eval runs, one per config and book. None of them calls a model provider:
 
 ```bash
 uv run python eval/terms.py runs/eval/<id>   # term accuracy against the gold glossary
 uv run eval/comet.py runs/eval/<id>          # COMET, in an environment of its own
+uv run python eval/report.py runs/eval/<id> runs/eval/<id> ...   # one report per config, over the books and per book
 ```
 
-`eval/comet.py` declares its own dependencies (PyTorch and `unbabel-comet`), so they stay out of the project's environment. Its first run downloads them and the `Unbabel/wmt22-comet-da` checkpoint (about 2.3 GB) from Hugging Face. A CPU is enough.
+`eval/comet.py` declares its own dependencies (PyTorch and `unbabel-comet`), so they stay out of the project's environment. Its first run downloads them and the `Unbabel/wmt22-comet-da` checkpoint (about 2.3 GB) from Hugging Face. A CPU is enough. The report compares the configs on the pages that every config scored, recomputes chrF and BLEU over the pooled segments, and refuses files that do not belong together; it writes `runs/report/<time>-report/report.json` and prints a summary.
 
 Optional tracing: one trace per translated page (every model call, agent step and tool call) in an [Arize Phoenix](https://github.com/Arize-ai/phoenix) running on your machine. Start Phoenix in another terminal, set `FUKIDASHI_TRACING=phoenix` (in the shell or `.env`), and open http://localhost:6006:
 
@@ -92,7 +93,8 @@ uv run python eval/glossary.py check                # check the gold glossaries 
 | M1 Vertical slice: page → `baseline` → browser | 10/25 | Done ([record](docs/m1.md)) |
 | M2 Agent layer & eval harness | 11/1 | Done ([record](docs/m2.md)) |
 | M3 Knowledge Base & Reviewer | 11/8 | Done ([record](docs/m3.md)) |
-| M4–M5 Dev evaluation, protocol freeze | 11/22 | Planned |
+| M4 Dev evaluation | 11/15 | Done ([record](docs/m4.md)) |
+| M5 Eval protocol & freeze | 11/22 | Planned |
 | M6–M8 Test run, editor productization, analysis | 1/3 | Planned |
 | M9 Report & release | 1/17 | Planned |
 

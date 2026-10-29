@@ -8,9 +8,9 @@ Fukidashi is a web editor that translates Japanese manga into Simplified Chinese
 
 - `OUTLINE.md`: design, milestones (§7), decisions (§8), pivot rules (§9). Its §0 Terminology table is canonical.
 - `SCOPE.md`: what is in and out of scope, and the cut order. `IDEAS.md`: where ideas outside a checkpoint go.
-- `docs/design.md`: domain model, system sequence diagram, object interaction diagram, object model. `docs/m0.md` to `docs/m3.md`: milestone records.
+- `docs/design.md`: domain model, system sequence diagram, object interaction diagram, object model. `docs/m0.md` to `docs/m4.md`: milestone records.
 
-M0 to M3 are done. The vertical slice (page → `baseline` → browser) works. M2 added the eval harness v0 (`eval/run.py`: `baseline` and `translator`, chrF / BLEU, manifest), the tool-calling loop (`agents/loop.py`: `run_agent` on LangChain's `create_agent`), the Translator Agent (`agents/translator.py`: config `translator`, M2's smoke config, with one tool, `get_previous_context`) and tracing (`tracing/`: one trace per page in a local Arize Phoenix, off by default). M3 added:
+M0 to M4 are done. The vertical slice (page → `baseline` → browser) works. M2 added the eval harness v0 (`eval/run.py`: `baseline` and `translator`, chrF / BLEU, manifest), the tool-calling loop (`agents/loop.py`: `run_agent` on LangChain's `create_agent`), the Translator Agent (`agents/translator.py`: config `translator`, M2's smoke config, with one tool, `get_previous_context`) and tracing (`tracing/`: one trace per page in a local Arize Phoenix, off by default). M3 added:
 - the gold glossary for the dev split (`eval/gold_glossary/`, checked by `eval/glossary.py`);
 - the Translator's `flag_uncertain`;
 - the Reviewer Agent (`agents/reviewer.py`);
@@ -18,13 +18,14 @@ M0 to M3 are done. The vertical slice (page → `baseline` → browser) works. M
 - the Knowledge Base (`kb/`, the KB tables): its storage, the Curator's rules, and the KB tools and snippets for both agents;
 - the Curator Agent (`agents/curator.py`) and the `full` config: `full_no_kb` with a KB, which is written once per page, at finalize.
 
-M4 is in progress. It has added:
+M4 added (record: `docs/m4.md`):
 - whole-book evals whose outputs are written after every page (#37);
 - KB reach: how often the KB reached each page of a `full` eval (#40);
 - the COMET scorer (`eval/comet.py`, #41) and term accuracy (`evaluation/terms.py`, `eval/terms.py`, #42), which score a finished eval run;
-- CI on GitHub Actions (#39).
+- CI on GitHub Actions (#39);
+- the pooled report (`evaluation/report.py`, `eval/report.py`, #44) and the first dev runs: each config once on both dev books.
 
-The dev runs and a report that pools eval runs come next. These do not exist yet, so do not describe them as implemented: GEMBA-MQM, term consistency, paired bootstrap CIs, a pooled report, and any agent config in the editor (the API runs `baseline` only). xCOMET is not reported: it does not fit the available GPU (OUTLINE §8).
+These do not exist yet (M5 onward), so do not describe them as implemented: GEMBA-MQM, term consistency, paired bootstrap CIs, the eval protocol, and any agent config in the editor (the API runs `baseline` only). xCOMET is not reported: it does not fit the available GPU (OUTLINE §8).
 
 Docs are written in English. The README also exists in Simplified Chinese (`README.zh-CN.md`): change both together. Use the §0 terms verbatim and add any new term to that table. The repository is public: write docs for outside readers.
 
@@ -65,6 +66,8 @@ uv run python eval/run.py --config baseline --book tojime_no_siora              
 uv run python eval/terms.py runs/eval/<id>     # term accuracy of a finished eval run (one book): terms.json; no model calls
 uv run eval/comet.py runs/eval/<id>            # COMET in its own PEP 723 environment (not `uv run python`): the first run
                                                # downloads PyTorch and the 2.3 GB checkpoint; no LLM calls, CPU is fine
+uv run python eval/report.py runs/eval/<id> runs/eval/<id> ...   # pool finished, scored eval runs (one per config and
+                                               # book) into runs/report/<time>-report/report.json; reads files only
 ```
 
 There is no Python linter and there are no frontend tests. CI (`.github/workflows/ci.yml`) runs `uv sync --locked` and `pytest`, then `npm ci`, the lint and the build, on pull requests and on pushes to `main`; it has read-only permissions and no secrets, and a stale `uv.lock` fails it. `.env` (template: `.env.example`) holds the LLM provider, prices and the optional tracing switch: never read or print it. The API's `lifespan` and `eval/run.py` load it at start. `FUKIDASHI_DB` overrides the DB path (default `runs/fukidashi.db`).
@@ -94,8 +97,9 @@ kb/                 the Knowledge Base: entities, a read-only KBSnapshot, the Pr
 datasets/           OpenMantra loader and the importer
 evaluation/         eval library: harness, OpenCC references, sacreBLEU metrics, manifest. Its CLI, eval/run.py,
                     calls runs.translate_page like the API does and writes runs/eval/<id>/. Also splits.py (dev and
-                    test books), glossary.py (the gold glossary's validator; CLI eval/glossary.py) and terms.py
-                    (term accuracy of a finished eval run; CLI eval/terms.py)
+                    test books), glossary.py (the gold glossary's validator; CLI eval/glossary.py), terms.py
+                    (term accuracy of a finished eval run; CLI eval/terms.py) and report.py (the pooled report;
+                    CLI eval/report.py)
 eval/comet.py       COMET, the one entry point whose logic is not in evaluation/: a PEP 723 script with its own
                     environment (unbabel-comet 2.2.7, Python below 3.14) that imports nothing from fukidashi
 tracing/            setup(): OpenTelemetry + OpenInference instrumentors; page_span(): each page's root span;
@@ -157,7 +161,9 @@ Invariants that span several files:
 - The gold glossary (`eval/gold_glossary/<book>.json`, OUTLINE §4.7) is evaluation data only: it never seeds the KB or reaches a prompt, and nothing outside `evaluation/` and `eval/` refers to it. `evaluation/glossary.py` checks it against `annotation.json`, never the database; `evaluation/splits.py` is the one place that names the dev and test books. Files in git hold terms only (at most 20 characters each); candidate lists and review sheets quote the dataset and stay in `runs/glossary/`. Every entry has a required boolean `borderline` (15 of the 37 dev entries). `check` looks for every target and variant in the converted references, except a variant that is the target in mainland forms (OpenCC `tw2s`), which `t2s` never produces.
 - The scorers read a finished eval run (`finished_at` set) and write their own file next to its outputs, through a temporary file; they refuse an unfinished one with exit 2 and write nothing.
   - **Term accuracy** (`evaluation/terms.py`, OUTLINE §4.7) reads only `page_index`, `idx`, `ja`, `hyp` and `ref_zh_hans` of `segments.jsonl`, never the database or `ref_zh_hant`, and writes `terms.json`.
-  - **COMET** (`eval/comet.py`) imports only the standard library at the top and `comet` and `torch` inside `load_scorer`. `pyproject.toml` and `uv.lock` never gain COMET or torch. It writes `comet-<model>.json`, and its tests (`test_comet_script.py`) use a fake scorer, so the suite needs no torch.
+  - **COMET** (`eval/comet.py`) imports only the standard library at the top and `comet` and `torch` inside `load_scorer`. `pyproject.toml` and `uv.lock` never gain COMET or torch. It writes `comet-<model>.json`, and its tests (`test_comet_script.py`) use a fake scorer, so the suite needs no torch. It records the checkpoint's Hugging Face revision (`model_revision`, from the snapshot path, or null).
+  - Both read `segments.jsonl` split on `"\n"` only, never `splitlines()` (the harness writes U+2028 and U+0085 unescaped), and term accuracy refuses a repeated `(page_index, idx)`.
+- The pooled report (`evaluation/report.py`, CLI `eval/report.py`) reads only files: each eval run's `manifest.json`, `scores.json`, `segments.jsonl`, `terms.json` and COMET file, and the glossary (for its hash); no database, model or network. It takes one finished eval run per config and book, over the same books for every config. Quality numbers cover only the common pages (scored by every config, per book), and the pages left out are listed; spend covers all Runs. chrF / BLEU are recomputed over the pooled segments, COMET is joined by `(book, page_index, idx)`, term accuracy pools hits and occurrences, and unknown stays `None`. Inputs that do not belong together (another eval id, a COMET file over another `segments.jsonl` or another model, another glossary, two runs of one config and book) are refused with exit 2 and nothing written; provenance (a dirty tree, different commits or models) is a warning. It writes `runs/report/<UTC time>-report/report.json` through a temporary file and prints a summary. No confidence intervals (M8).
 - `fukidashi.config.ROOT` comes from `__file__`, so the package must stay an editable install (`uv sync`).
 - The frontend positions boxes in percent of the image's natural size. `frontend/src/api.ts` mirrors the pydantic models in `api/pages.py` by hand; change both together.
 
