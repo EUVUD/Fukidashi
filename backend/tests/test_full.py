@@ -164,8 +164,8 @@ def test_a_full_page_is_one_succeeded_run_that_finalizes_the_curators_call_and_t
         {"proposal_id": name_proposal(kb, 3, *NAME).proposal_id,
          "kind": "character", "source": "ユキ", "target": "小雪", "result": "pending_human"}]
     assert runs.outcome_counts(finalize["outcomes"]) == {
-        "duplicate": 0, "confirmed": 1, "conflict": 0, "conflict_across_kinds": 0, "pending_human": 1, "accepted": 1,
-        "rejected": 0, "undecided": 0}
+        "duplicate": 0, "confirmed": 1, "merged": 0, "conflict": 0, "conflict_across_kinds": 0, "pending_human": 1,
+        "accepted": 1, "rejected": 0, "undecided": 0}
 
     curator_body = provider.bodies[3]
     listed = [json.loads(line) for line in curator_body["messages"][1]["content"][2]["text"].splitlines()[1:]]
@@ -590,8 +590,8 @@ def test_the_pages_root_span_says_the_curators_status_and_how_often_each_result_
     assert top.attributes["fukidashi.config"] == "full" and top.attributes["fukidashi.curator_status"] == "ok"
     assert {k.removeprefix("fukidashi.proposals_"): v for k, v in top.attributes.items()
             if k.startswith("fukidashi.proposals_")} == {
-        "duplicate": 0, "confirmed": 1, "conflict": 0, "conflict_across_kinds": 0, "pending_human": 1, "accepted": 1,
-        "rejected": 0, "undecided": 0}
+        "duplicate": 0, "confirmed": 1, "merged": 0, "conflict": 0, "conflict_across_kinds": 0, "pending_human": 1,
+        "accepted": 1, "rejected": 0, "undecided": 0}
     assert top.attributes["fukidashi.send_backs"] == 0 and top.attributes["fukidashi.final_stop"] == "approved"
     assert outcome.trace_id is not None
 
@@ -630,8 +630,8 @@ OLD_SCORE_KEYS = {"config", "book", "pages_scored", "segments_scored", "fallback
 OLD_PAGE_KEYS = {"book", "page_index", "run_id", "trace_id", "segments", "calls", "unknown_usage_calls", "fell_back",
                  "fallback_reason", "cost_usd", "latency_s"}
 LOOP_KEYS = {"send_backs", "final_stop", "final_reviewed", "review_statuses", "review_verdicts"}
-RESULTS = ("duplicate", "confirmed", "conflict", "conflict_across_kinds", "pending_human", "accepted", "rejected",
-           "undecided")
+RESULTS = ("duplicate", "confirmed", "merged", "conflict", "conflict_across_kinds", "pending_human", "accepted",
+           "rejected", "undecided")
 
 
 def outcomes(**counted):
@@ -860,3 +860,51 @@ def test_the_command_line_accepts_full_and_its_usage_names_it(tmp_path):
     assert "invalid choice" not in stopped.stderr
     assert stopped.returncode == 2 and "Stopped before any model call" in stopped.stderr
     assert "--config full --book" in app_config.ROOT.joinpath("eval", "run.py").read_text(encoding="utf-8")
+
+
+# --- task 026: a name that joins an existing profile is counted as `merged` ------------------------------------------
+
+def given_name_reply(call_id="n"):
+    """The Translator proposes the given name of a character the KB holds under the full name."""
+    return ask(propose(call_id, "character", name_src="ユキ", name_tgt="小雪", aliases=["ユキちゃん"]))
+
+
+def test_merged_is_counted_by_outcome_counts():
+    counted = runs.outcome_counts([{"result": "merged"}, {"result": "merged"}, {"result": "pending_human"}])
+
+    assert counted == outcomes(merged=2, pending_human=1) and tuple(counted) == curator_rules.RESULTS
+
+
+def test_a_full_page_whose_name_joins_a_profile_records_merged_and_its_root_span_counts_it(imported, root, kb, traced):
+    seed_profile(imported, kb, "白瀬ユキ", "白濑小雪", status="pending_human")
+    provider = Provider(given_name_reply(), answer(zh_json(3)), answer(APPROVE))
+
+    outcome, _ = run_page(imported, root, provider, kb)
+
+    assert outcome.result.ok and [who(b) for b in provider.bodies] == ["translate", "translate", "review"]
+    finalize = attempts_of(imported, outcome.run_id)["finalize"]
+    assert [(o["source"], o["target"], o["result"]) for o in finalize["outcomes"]] == [("ユキ", "小雪", "merged")]
+    assert runs.outcome_counts(finalize["outcomes"]) == outcomes(merged=1)
+    assert profiles(imported, kb) == [("白瀬ユキ", "白濑小雪", "pending_human", [1, 3])]   # no second profile
+    assert json.loads(store.kb_profiles(imported, kb, ALL_STATUSES)[0]["aliases"]) == ["ユキ", "ユキちゃん"]
+    top = one_trace(traced.spans())
+    assert top.attributes["fukidashi.proposals_merged"] == 1
+    assert {k.removeprefix("fukidashi.proposals_"): v for k, v in top.attributes.items()
+            if k.startswith("fukidashi.proposals_")} == outcomes(merged=1)
+
+
+def test_the_harness_counts_merged_per_page_and_in_total(imported, root, tmp_path):
+    provider = Provider(
+        ask(propose("a", "character", name_src="白瀬ユキ", name_tgt="白濑小雪")), answer(zh_json(1)), answer(APPROVE),
+        given_name_reply("b"), answer(zh_json(2)), answer(APPROVE))
+
+    result = evaluate(imported, root, tmp_path, provider, [1, 2], config=CONFIG)
+
+    assert result.exit_code == 0 and len(provider.bodies) == 6   # names only: no Curator call
+    scores = result.scores
+    assert [p["proposal_outcomes"] for p in scores["pages"]] == [outcomes(pending_human=1), outcomes(merged=1)]
+    assert scores["proposal_outcomes"] == outcomes(pending_human=1, merged=1)
+    assert scores["kb"]["profiles"] == {"proposed": 0, "approved": 0, "rejected": 0, "pending_human": 1}
+    summary = harness.format_summary(result)
+    assert "proposals  merged 1, pending_human 1" in summary
+    assert "CURATOR  book_t/2 (run" in summary and "skipped, proposals merged 1" in summary

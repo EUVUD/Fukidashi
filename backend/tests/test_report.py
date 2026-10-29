@@ -590,6 +590,21 @@ def test_a_stop_or_result_the_report_does_not_know_is_counted_so_that_the_counts
     assert full["curator"]["proposal_outcomes"]["a_new_result"] == 2
 
 
+def test_merged_is_pooled_and_a_run_stored_before_it_existed_counts_it_as_0(tmp_path):
+    glossary_dir = make_glossary_dir(tmp_path)
+    before_merged = {r: n for r, n in outcomes(pending_human=2).items() if r != "merged"}   # a row written before #026
+    run_dir = make_eval(tmp_path, "full", A, [
+        page(1, proposal_outcomes=outcomes(merged=2, conflict=1)), page(2, proposal_outcomes=before_merged)],
+        glossary_dir=glossary_dir)
+
+    result = report.build_report([run_dir], glossary_dir)
+
+    assert "merged" in report.PROPOSAL_RESULTS
+    assert result["pooled"]["full"]["curator"]["proposal_outcomes"] == outcomes(merged=2, conflict=1, pending_human=2)
+    assert [l.split() for l in report.render(result).splitlines() if l.startswith("proposals merged")] == [
+        ["proposals", "merged", "2"]]
+
+
 # --- provenance -------------------------------------------------------------------------------------------------------------
 
 def test_each_run_is_listed_with_its_provenance(tmp_path):
