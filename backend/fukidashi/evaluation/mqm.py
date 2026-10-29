@@ -1,3 +1,10 @@
+# SPDX-License-Identifier: CC-BY-SA-4.0
+# This file is licensed under CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/), not under the
+# repository's MIT License. It holds material copied and adapted from GEMBA
+# (https://github.com/MicrosoftTranslator/GEMBA, Microsoft Translator: Tom Kocmi, Christian Federmann) at commit
+# a7a7eff8e46998447c6cbf09d06affc8f1b99ab4, which is licensed under CC BY-SA 4.0: the GEMBA-MQM prompt template, its
+# three examples, its answer parser and its weights. The changes are listed below. See LICENSE.
+
 """GEMBA-MQM (Kocmi & Federmann 2023): the judge's prompt, the answer parser, the MQM score and the error breakdown.
 
 Adapted from GEMBA, https://github.com/MicrosoftTranslator/GEMBA (Microsoft Translator: Tom Kocmi, Christian
@@ -7,8 +14,8 @@ WMT 2023, https://aclanthology.org/2023.wmt-1.64.
 
 **Licence.** GEMBA's code and data are released under CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/).
 This module copies GEMBA's system prompt, user template and three few-shot examples verbatim and adapts its answer
-parser (`parse_mqm_answer`), its error classes (`parse_error_class`) and its weights, so this module, unlike the rest of
-the repository (MIT), is licensed under CC BY-SA 4.0. It comes with no warranty.
+parser (`parse_mqm_answer`), its error classes (`parse_error_class`) and its weights, so this module, unlike most of the
+repository (MIT; LICENSE lists the files that are not), is licensed under CC BY-SA 4.0. It comes with no warranty.
 
 **Changes from GEMBA:**
 

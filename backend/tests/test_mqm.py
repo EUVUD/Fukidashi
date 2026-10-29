@@ -1,3 +1,10 @@
+# SPDX-License-Identifier: CC-BY-SA-4.0
+# This file is licensed under CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/), not under the
+# repository's MIT License. It holds material copied and adapted from GEMBA
+# (https://github.com/MicrosoftTranslator/GEMBA, Microsoft Translator: Tom Kocmi, Christian Federmann) at commit
+# a7a7eff8e46998447c6cbf09d06affc8f1b99ab4, which is licensed under CC BY-SA 4.0: answers in GEMBA-MQM's format, the
+# errors and scores of GEMBA's three example answers, and the hash of its prompt template. See LICENSE.
+
 """GEMBA-MQM (OUTLINE 4.4): the prompt, parser and score in `evaluation/mqm.py`, and the scorer (`evaluation/mqm_scorer.py`,
 eval/mqm.py) on made-up eval runs. The judge is the real LLMClient and openai SDK on an httpx.MockTransport; no network,
 and both ledgers live in tmp_path.

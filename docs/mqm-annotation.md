@@ -1,5 +1,7 @@
 # MQM annotation guide (the GEMBA-MQM agreement sample)
 
+> **License.** This page is licensed under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/), not under the repository's MIT License. It quotes and adapts the severity definitions and error categories of the GEMBA-MQM prompt from [GEMBA](https://github.com/MicrosoftTranslator/GEMBA) (Microsoft Translator: Tom Kocmi, Christian Federmann) at commit `a7a7eff8e46998447c6cbf09d06affc8f1b99ab4`, which is licensed under CC BY-SA 4.0. The one-line definitions of the categories and the rules for counting errors are written for this project. See [LICENSE](../LICENSE).
+
 This guide is for the author, who annotates the human sample for the GEMBA-MQM agreement check (OUTLINE §4.5) by hand. The judge (GPT-4o mini) annotates the same items later in the same scheme: GEMBA-MQM's error categories and severities. The sample is drawn with `eval/mqm_sample.py draw`. Its directory under `runs/mqm-human/` holds `sheet.csv`, `key.json` and `README.txt`.
 
 ## Before you start
