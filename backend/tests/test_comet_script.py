@@ -48,8 +48,8 @@ def make_run(tmp_path, segments=None, *, finished_at="2026-10-28T15:49:03+00:00"
 class FakeScorer:
     """Stands in for the COMET model: records what it is asked, answers one score per triple."""
 
-    def __init__(self, scores=None, *, device="cpu"):
-        self.scores, self.device = scores, device
+    def __init__(self, scores=None, *, device="cpu", system_score=None, revision=None):
+        self.scores, self.device, self.system_score, self.revision = scores, device, system_score, revision
         self.loaded, self.triples, self.batch_sizes = [], [], []
 
     def load(self, model, gpus):
@@ -59,9 +59,9 @@ class FakeScorer:
             self.triples.append(triples)
             self.batch_sizes.append(batch_size)
             scores = [0.5 + 0.1 * i for i in range(len(triples))] if self.scores is None else self.scores
-            return scores, sum(scores) / len(scores)
+            return scores, sum(scores) / len(scores) if self.system_score is None else self.system_score
 
-        return comet_script.Scorer(predict, self.device, {"unbabel-comet": "2.2.7", "torch": "9.9.9"})
+        return comet_script.Scorer(predict, self.device, {"unbabel-comet": "2.2.7", "torch": "9.9.9"}, self.revision)
 
 
 def run(run_dir, *args, scorer=None):
@@ -123,8 +123,8 @@ def test_the_output_file_holds_every_field_and_the_scores_in_file_order(tmp_path
 
     assert code == 0 and listing(run_dir) == [OUTPUT, "manifest.json", "segments.jsonl"]
     out = json.loads((run_dir / OUTPUT).read_text(encoding="utf-8"))
-    assert set(out) == {"eval_id", "model", "segments_sha256", "n_segments", "system_score", "segments", "versions",
-                        "device", "gpus", "batch_size", "elapsed_s", "scored_at"}
+    assert set(out) == {"eval_id", "model", "model_revision", "segments_sha256", "n_segments", "system_score", "segments",
+                        "versions", "device", "gpus", "batch_size", "elapsed_s", "scored_at"}
     assert (out["eval_id"], out["model"], out["n_segments"]) == ("20261028T000000Z-full", MODEL, 2)
     assert out["segments_sha256"] == hashlib.sha256((run_dir / "segments.jsonl").read_bytes()).hexdigest()
     assert out["system_score"] == 0.5
@@ -187,6 +187,32 @@ def test_a_predictor_that_returns_the_wrong_number_of_scores_writes_nothing(tmp_
     assert listing(run_dir) == ["manifest.json", "segments.jsonl"]
 
 
+@pytest.mark.parametrize("scores, system_score", [
+    ([0.5, float("nan")], None),  # the system score is then NaN too
+    ([0.5, float("inf")], None),
+    ([0.5, 0.25], float("nan")),  # the scores are fine, the system score is not
+])
+def test_a_score_that_is_not_a_finite_number_writes_nothing_and_exits_1(tmp_path, capsys, scores, system_score):
+    run_dir = make_run(tmp_path)
+    before = listing(run_dir)
+
+    code, _ = run(run_dir, scorer=FakeScorer(scores, system_score=system_score))
+
+    assert code == 1 and "not a finite number" in capsys.readouterr().err
+    assert listing(run_dir) == before == ["manifest.json", "segments.jsonl"]
+
+
+def test_write_json_refuses_nan_and_keeps_the_earlier_file(tmp_path):
+    """`allow_nan=False` is the last line of defence: a NaN must never become the invalid JSON token `NaN`."""
+    path = tmp_path / OUTPUT
+    path.write_text('{"earlier": true}\n', encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        comet_script.write_json(path, {"system_score": float("nan")})
+
+    assert path.read_text(encoding="utf-8") == '{"earlier": true}\n' and listing(tmp_path) == [OUTPUT]
+
+
 def refused(tmp_path, capsys, run_dir, *args):
     """Run on a directory that must be refused: exit 2, the cause on stderr, no model loaded, nothing written."""
     before = listing(run_dir.parent) if run_dir.exists() else None
@@ -244,6 +270,31 @@ def test_every_field_the_scores_need_is_required(tmp_path, capsys, field):
     del broken[field]
 
     assert f"'{field}'" in refused(tmp_path, capsys, make_run(tmp_path, [broken]))
+
+
+@pytest.mark.parametrize("separator", [" ", " ", "\u0085"], ids=["U+2028", "U+2029", "U+0085"])
+def test_a_hypothesis_with_a_unicode_line_separator_is_scored_not_cut_in_two(tmp_path, separator):
+    """The harness writes `json.dumps(..., ensure_ascii=False)`, which leaves these characters unescaped; `splitlines()`
+    would cut the line in the middle of the string."""
+    hyp = f"译{separator}文"
+    run_dir = make_run(tmp_path, [segment(0), segment(1, hyp=hyp)])
+    assert separator in (run_dir / "segments.jsonl").read_text(encoding="utf-8")  # written raw, as the harness does
+
+    code, scorer = run(run_dir)
+
+    assert code == 0
+    assert [t["mt"] for t in scorer.triples[0]] == ["译文0", hyp]
+    assert json.loads((run_dir / OUTPUT).read_text(encoding="utf-8"))["n_segments"] == 2
+
+
+def test_lines_end_at_a_newline_only_so_a_carriage_return_is_still_tolerated(tmp_path):
+    run_dir = make_run(tmp_path)
+    text = (run_dir / "segments.jsonl").read_bytes().replace(b"\n", b"\r\n")
+    (run_dir / "segments.jsonl").write_bytes(text)
+
+    code, scorer = run(run_dir)
+
+    assert code == 0 and len(scorer.triples[0]) == 2
 
 
 def test_a_reference_in_traditional_characters_is_not_needed(tmp_path):
@@ -306,16 +357,18 @@ def test_the_script_runs_as_a_program_without_the_comet_environment(tmp_path):
     assert unfinished.returncode == 2 and "not finished" in unfinished.stderr
 
 
-def fake_comet_site(tmp_path):
+def fake_comet_site(tmp_path, checkpoint=None):
     """A directory that stands in for the script's environment: a `comet` and a `torch` that do no work, and the
     distribution metadata `importlib.metadata` reads the version from. The fake model writes what it was asked to the
-    file named by FAKE_COMET_LOG."""
+    file named by FAKE_COMET_LOG. `download_model` returns `checkpoint` when it is given."""
     site = tmp_path / "fake-site"
     (site / "comet").mkdir(parents=True)
+    path_of = "'checkpoint-of-' + name" if checkpoint is None else repr(str(checkpoint))
+    expected = "'checkpoint-of-Unbabel/wmt22-comet-da'" if checkpoint is None else repr(str(checkpoint))
     (site / "comet" / "__init__.py").write_text(
         "import json, os, types\n"
         "def download_model(name):\n"
-        "    return 'checkpoint-of-' + name\n"
+        f"    return {path_of}\n"
         "class Model:\n"
         "    def predict(self, data, batch_size, gpus, **kwargs):\n"
         "        with open(os.environ['FAKE_COMET_LOG'], 'w') as f:\n"
@@ -323,7 +376,7 @@ def fake_comet_site(tmp_path):
         "        scores = [0.25 * (i + 1) for i in range(len(data))]\n"
         "        return types.SimpleNamespace(scores=scores, system_score=sum(scores) / len(scores))\n"
         "def load_from_checkpoint(path):\n"
-        "    assert path == 'checkpoint-of-Unbabel/wmt22-comet-da', path\n"
+        f"    assert path == {expected}, path\n"
         "    return Model()\n", encoding="utf-8")
     (site / "torch").mkdir()
     (site / "torch" / "__init__.py").write_text(
@@ -362,6 +415,55 @@ def test_the_real_loader_finds_the_comet_package_and_not_the_script_that_is_call
     assert [s["score"] for s in out["segments"]] == [0.25, 0.5] and out["system_score"] == 0.375
     assert out["versions"] == {"unbabel-comet": "2.2.7", "torch": "9.9.9", "python": sys.version.split()[0]}
     assert (out["device"], out["gpus"], out["batch_size"]) == (device, asked["gpus"], asked["batch_size"])
+
+
+SNAPSHOT = "2760a223ac957f30acfb18c8aa649b01cf1d75f2"
+HUB_PATH = f"/Users/me/.cache/huggingface/hub/models--Unbabel--wmt22-comet-da/snapshots/{SNAPSHOT}/checkpoints/model.ckpt"
+
+
+@pytest.mark.parametrize("checkpoint, revision", [
+    (HUB_PATH, SNAPSHOT),
+    (HUB_PATH.replace("/", "\\"), SNAPSHOT),  # a Windows path
+    ("/models/snapshots/a1/checkpoints/model.ckpt", "a1"),  # the directory after `snapshots`, whatever it is called
+    ("/snapshots/old/models--x--y/snapshots/new/checkpoints/model.ckpt", "new"),  # the last one: nearest the file
+    ("/snapshots/a/snapshots/b/model.ckpt", "b"),  # one directly under the other
+    ("/Users/me/checkpoints/wmt22-comet-da/checkpoints/model.ckpt", None),  # not from the Hub cache
+    ("/Users/me/snapshots", None),  # `snapshots` is the last part: no revision under it
+    ("/Users/me/not-snapshots/a1/model.ckpt", None),  # only the whole directory name `snapshots` counts
+    ("", None),
+])
+def test_the_revision_is_the_snapshot_directory_in_the_checkpoint_path_or_none(checkpoint, revision):
+    assert comet_script.checkpoint_revision(checkpoint) == revision
+
+
+@pytest.mark.parametrize("revision", [SNAPSHOT, None])
+def test_the_output_file_records_the_checkpoints_revision_or_null(tmp_path, revision):
+    run_dir = make_run(tmp_path)
+
+    code, _ = run(run_dir, scorer=FakeScorer(revision=revision))
+
+    assert code == 0
+    out = json.loads((run_dir / OUTPUT).read_text(encoding="utf-8"))
+    assert "model_revision" in out and out["model_revision"] == revision
+    assert list(out)[:3] == ["eval_id", "model", "model_revision"]
+
+
+@pytest.mark.parametrize("checkpoint_in_site, expected", [
+    (lambda tmp: tmp / "hub" / "models--Unbabel--wmt22-comet-da" / "snapshots" / SNAPSHOT / "checkpoints" / "model.ckpt",
+     SNAPSHOT),
+    (None, None),  # the stand-in's default path, `checkpoint-of-<name>`, names no snapshot
+])
+def test_the_real_loader_takes_the_revision_from_the_path_download_model_returns(tmp_path, checkpoint_in_site, expected):
+    run_dir = make_run(tmp_path, [segment(0)])
+    checkpoint = None if checkpoint_in_site is None else checkpoint_in_site(tmp_path)
+    env = {"PATH": "/usr/bin:/bin", "PYTHONPATH": str(fake_comet_site(tmp_path, checkpoint)),
+           "FAKE_COMET_LOG": str(tmp_path / "asked.json"), "FAKE_MPS": "0"}
+
+    done = subprocess.run([sys.executable, str(SCRIPT), str(run_dir)], capture_output=True, text=True, env=env,
+                          timeout=60)
+
+    assert done.returncode == 0, done.stderr
+    assert json.loads((run_dir / OUTPUT).read_text(encoding="utf-8"))["model_revision"] == expected
 
 
 def test_the_script_directory_is_taken_off_the_path_and_the_rest_stays(monkeypatch):

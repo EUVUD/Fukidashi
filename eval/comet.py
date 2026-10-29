@@ -23,10 +23,11 @@ the eval run's own files. It writes `comet-<model name without the organisation>
 in one step (a temporary file, then a rename). An eval run whose manifest has `finished_at: null` is refused, because
 its pages are not all there.
 
-The file holds `eval_id`, `model`, `segments_sha256` (of `segments.jsonl` as read), `n_segments`, `system_score` (COMET's
-system score, the mean of the segment scores), `segments` (`book`, `page_index`, `idx`, `run_id` and `score`, in the
-file's order), `versions`, `device`, `gpus`, `batch_size`, `elapsed_s` (the scoring itself, not the model's download or
-loading) and `scored_at`.
+The file holds `eval_id`, `model`, `model_revision` (the checkpoint's Hugging Face snapshot, read from the path
+`download_model` returns; null when that path names none), `segments_sha256` (of `segments.jsonl` as read),
+`n_segments`, `system_score` (COMET's system score, the mean of the segment scores), `segments` (`book`, `page_index`,
+`idx`, `run_id` and `score`, in the file's order), `versions`, `device`, `gpus`, `batch_size`, `elapsed_s` (the scoring
+itself, not the model's download or loading) and `scored_at`.
 
 The first run with a model downloads its checkpoint from Hugging Face into the Hugging Face cache (`Unbabel/wmt22-comet-da`:
 Apache-2.0, about 2.3 GB). `Unbabel/XCOMET-XL` is gated: its terms are accepted on Hugging Face, by the person running it.
@@ -67,6 +68,7 @@ class Scorer(NamedTuple):
     predict: Callable[[list[dict], int], tuple[list[float], float]]  # (triples, batch size) -> (scores, system score)
     device: str  # "cpu", or the GPU's name
     versions: dict[str, str]  # {"unbabel-comet": ..., "torch": ...}
+    model_revision: str | None = None  # the checkpoint's Hugging Face snapshot; None when the path says none
 
 
 def keep_script_directory_off_the_path() -> None:
@@ -74,6 +76,14 @@ def keep_script_directory_off_the_path() -> None:
     script itself instead of the package."""
     here = Path(__file__).resolve().parent
     sys.path[:] = [entry for entry in sys.path if Path(entry or ".").resolve() != here]
+
+
+def checkpoint_revision(checkpoint: str) -> str | None:
+    """The Hugging Face revision a checkpoint path belongs to: the directory under `snapshots/` in
+    `.../models--<org>--<name>/snapshots/<revision>/checkpoints/model.ckpt`. None for a path that has none (a checkpoint
+    that was not downloaded from the Hub, or a layout this does not know)."""
+    found = re.findall(r"(?<![^\\/])snapshots[\\/]([^\\/]+)(?=[\\/])", checkpoint)
+    return found[-1] if found else None
 
 
 def load_scorer(model_name: str, gpus: int) -> Scorer:
@@ -84,7 +94,8 @@ def load_scorer(model_name: str, gpus: int) -> Scorer:
     import torch
     from comet import download_model, load_from_checkpoint
 
-    model = load_from_checkpoint(download_model(model_name))
+    checkpoint = download_model(model_name)
+    model = load_from_checkpoint(checkpoint)
 
     # With MPS present (any Apple Silicon Mac), COMET asks the DataLoader for the "fork" start method, and its default of
     # no worker processes on the CPU (`2 * gpus`) makes torch refuse that: one worker is enough to get past it.
@@ -98,7 +109,8 @@ def load_scorer(model_name: str, gpus: int) -> Scorer:
         device = "cpu"
     else:
         device = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "gpu (name unknown)"
-    return Scorer(predict, device, {"unbabel-comet": version("unbabel-comet"), "torch": torch.__version__})
+    return Scorer(predict, device, {"unbabel-comet": version("unbabel-comet"), "torch": torch.__version__},
+                  checkpoint_revision(str(checkpoint)))
 
 
 def load_run(run_dir: Path) -> tuple[dict, list[dict], str]:
@@ -122,7 +134,9 @@ def load_run(run_dir: Path) -> tuple[dict, list[dict], str]:
 
     raw = segments_path.read_bytes()
     try:
-        lines = raw.decode("utf-8").splitlines()
+        # "\n" only: `splitlines()` also cuts at U+2028, U+2029 and U+0085, which the harness writes unescaped, so one in
+        # a translation would split a valid JSON line in two
+        lines = raw.decode("utf-8").split("\n")
     except UnicodeDecodeError as e:
         raise RunRejected(f"{segments_path} is not valid UTF-8: {e}")
     segments = []
@@ -213,6 +227,7 @@ def main(argv: list[str] | None = None, *, load: Callable[[str, int], Scorer] = 
     result = {
         "eval_id": manifest["eval_id"],
         "model": args.model,
+        "model_revision": scorer.model_revision,
         "segments_sha256": segments_sha256,
         "n_segments": len(segments),
         "system_score": system_score,

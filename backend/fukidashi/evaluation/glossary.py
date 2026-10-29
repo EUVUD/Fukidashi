@@ -50,7 +50,8 @@ class Entry:
     source: str  # the Japanese form as it appears in `text_ja`
     target: str  # the zh-Hans rendering the converted reference uses most often
     source_aliases: tuple[str, ...] = ()  # other Japanese forms of the same thing; none contains `source`
-    target_variants: tuple[str, ...] = ()  # the other renderings the reference uses; also correct
+    target_variants: tuple[str, ...] = ()  # the other renderings the reference uses, and the target in mainland forms
+    # (which `t2s` never produces, so `check` does not look for it in the reference); all of them are also correct
     note: str | None = None
     borderline: bool = False  # an ordinary word: term accuracy leaves it out of its primary score (OUTLINE 4.7)
 
