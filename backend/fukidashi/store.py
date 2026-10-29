@@ -113,7 +113,7 @@ def finish_run(
 
 KB_WRITES = (
     "insert_proposal", "set_proposal_status", "insert_entry", "insert_profile",
-    "add_entry_evidence", "add_profile_evidence",
+    "add_entry_evidence", "add_profile_evidence", "add_profile_aliases",
 )
 
 # The states a lookup or a KB snippet may return (OUTLINE 3.3): 'proposed' and 'rejected' are not shown.
@@ -270,3 +270,23 @@ def add_entry_evidence(conn: sqlite3.Connection, entry_id: int, page_index: int,
 
 def add_profile_evidence(conn: sqlite3.Connection, profile_id: int, page_index: int, event: dict) -> bool:
     return _add_evidence(conn, "character_profiles", profile_id, page_index, event)
+
+
+def add_profile_aliases(
+    conn: sqlite3.Connection, profile_id: int, aliases: Sequence[str], page_index: int, event: dict,
+) -> list[str]:
+    """Add `aliases` to the profile's aliases, after the ones it has, leaving out any it has already and its own name;
+    add `page_index` to its evidence unless it is there; and add `event` to its history, always (the profile took in
+    another name, even on a page it had seen). Returns the aliases added, in the order given."""
+    row = conn.execute(
+        "SELECT name_src, aliases, evidence_pages, history FROM character_profiles WHERE id = ?", (profile_id,)
+    ).fetchone()
+    have = json.loads(row["aliases"])
+    added = [a for a in dict.fromkeys(aliases) if a != row["name_src"] and a not in have]
+    now = _now()
+    conn.execute(
+        "UPDATE character_profiles SET aliases = ?, evidence_pages = ?, history = ?, updated_at = ? WHERE id = ?",
+        (_dumps([*have, *added]), _dumps(sorted({*json.loads(row["evidence_pages"]), page_index})),
+         _dumps([*json.loads(row["history"]), {"at": now, **event}]), now, profile_id),
+    )
+    return added

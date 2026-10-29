@@ -20,14 +20,31 @@ model call and imports no LangChain.
    decides which kind it is, whatever the decision says. This catches only a collision with what
    the KB already holds, and on one page the earlier proposal counts; whether a term that collides with nothing is really
    a name is the Curator Agent's judgment.
-4. A new name (kind `character`) becomes a profile with status `pending_human`, whatever the decision says.
+4. A new name (kind `character`) becomes a profile with status `pending_human`, whatever the decision says, unless
+   rule 6 finds that it is the name of a character the KB already holds.
 5. A new term becomes an `approved` entry (provenance `agent`) when accepted; a rejected one writes no entry and its
    proposal keeps the reason; one without a decision stays `proposed`, to be decided later.
+6. One character, one profile. Before rule 4 makes a profile, the name is matched against the readable profiles. A
+   proposal matches a profile when one's name contains the other's (a given name inside a full name, a title inside
+   the same title with an honorific), or when a name or alias of one equals a name or alias of the other. Aliases are
+   compared for equality only, never for containment, so a family name used as an alias does not tie two sisters
+   together.
+   - Exactly one profile matches and one rendering contains the other (燕 in 樱野燕): the proposal is that profile's
+     character. Its name and aliases join the profile's aliases (no duplicates, never the profile's own name), the
+     page joins the evidence, the history gets a `merged` line, and the proposal is approved (`MERGED`). The profile
+     keeps its status: a person still confirms names (rule 4).
+   - A rendering that agrees with neither (铃 against 樱野雀), or more than one matching profile: a conflict. The
+     proposal goes to `pending_human`, nothing is written for it, the profiles stay as they are, and its reason names
+     the profiles and the names that matched. So a second rendering of one name never becomes a readable profile that
+     spreads.
+   Two characters who share an alias exactly (both called by their family name) are taken for one, and the proposal
+   waits for a person: the safe side. Aliases are not checked against term sources here.
 
 An existing entry or profile is one in a readable state (`approved` or `pending_human`): a `proposed` or `rejected` row is
 not there for these rules. A term is compared with the entries and a name with the profiles (rules 2 and 3), and a
 same-kind match comes first. Only the cross-kind conflict of rule 3 looks at the other kind, and only when the proposal
-would otherwise create a new entry or profile.
+would otherwise create a new entry or profile. Rule 6 comes after rules 2 and 3, so the same name is still a
+confirmation or a conflict, and a name that is a term's source is still a conflict across kinds.
 """
 
 from __future__ import annotations
@@ -43,6 +60,7 @@ from .entities import APPROVED, PENDING_HUMAN, TERM, KBNotFound, Proposal, propo
 # What happened to a proposal.
 DUPLICATE = "duplicate"
 CONFIRMED = "confirmed"
+MERGED = "merged"  # a new name of a character the KB already holds: it joins that profile (rule 6)
 CONFLICT = "conflict"
 CONFLICT_ACROSS_KINDS = "conflict_across_kinds"  # a name under the wrong kind; what is written is the same as for CONFLICT
 PENDING = PENDING_HUMAN  # a new name, now a pending profile
@@ -50,7 +68,7 @@ ACCEPTED = "accepted"
 REJECTED = "rejected"
 UNDECIDED = "undecided"
 
-RESULTS = (DUPLICATE, CONFIRMED, CONFLICT, CONFLICT_ACROSS_KINDS, PENDING, ACCEPTED, REJECTED, UNDECIDED)
+RESULTS = (DUPLICATE, CONFIRMED, MERGED, CONFLICT, CONFLICT_ACROSS_KINDS, PENDING, ACCEPTED, REJECTED, UNDECIDED)
 
 
 @dataclass(frozen=True)
@@ -145,6 +163,8 @@ def _name(conn: sqlite3.Connection, p: Proposal, run_id: int, decision: Decision
     if (entry := store.find_entry(conn, p.kb_id, name)) is not None:
         return _wrong_kind(conn, p, f"{name} is proposed as a character, but it is the source of entry {entry['id']} "
                                     f"({entry['target_term']}), a term")
+    if matched := _matching_profiles(conn, p):
+        return _known_character(conn, p, run_id, matched)
     reason = "a new name waits for a human"
     if decision is not None:  # kept for the human, but it does not change the rule
         reason += f"; the Curator Agent would {'accept' if decision.accept else 'reject'} it: {decision.reason}"
@@ -157,11 +177,62 @@ def _name(conn: sqlite3.Connection, p: Proposal, run_id: int, decision: Decision
     return PENDING
 
 
+def _matches(payload: Mapping, profile: sqlite3.Row) -> list[str]:
+    """How a character proposal matches a profile (rule 6), in words, or an empty list when it does not: one's name
+    contains the other's, or a name or alias of one equals a name or alias of the other. Aliases are compared for
+    equality only."""
+    name, other = payload["name_src"], profile["name_src"]
+    how = []
+    if name in other:
+        how.append(f"{name} is part of {other}")
+    elif other and other in name:  # a profile a person wrote could have an empty name, which every name contains
+        how.append(f"{other} is part of {name}")
+    theirs = {other, *json.loads(profile["aliases"])}
+    how += [f"both are called {called}" for called in dict.fromkeys((name, *payload["aliases"])) if called in theirs]
+    return how
+
+
+def _matching_profiles(conn: sqlite3.Connection, p: Proposal) -> list[tuple[sqlite3.Row, list[str]]]:
+    """The readable profiles that `p` matches (rule 6), each with how it matches, in id order."""
+    matched = [(row, _matches(p.payload, row)) for row in store.kb_profiles(conn, p.kb_id, store.READABLE_STATUSES)]
+    return [(row, how) for row, how in matched if how]
+
+
+def _profile_label(profile: sqlite3.Row) -> str:
+    return f"profile {profile['id']} ({profile['name_src']} → {profile['name_tgt']})"
+
+
+def _known_character(
+    conn: sqlite3.Connection, p: Proposal, run_id: int, matched: list[tuple[sqlite3.Row, list[str]]],
+) -> str:
+    """Rule 6: `p` matches the profiles in `matched`. One profile whose rendering agrees takes in `p`'s names; anything
+    else waits for a person and writes nothing."""
+    rendering = p.payload["name_tgt"]
+    if len(matched) > 1:
+        found = "; ".join(f"{_profile_label(row)}: {', '.join(how)}" for row, how in matched)
+        return _conflict_reason(conn, p, f"conflicts with more than one profile, so a person decides which character "
+                                         f"it is: {found}")
+    ((profile, how),) = matched
+    if rendering not in profile["name_tgt"] and profile["name_tgt"] not in rendering:
+        return _conflict_reason(conn, p, f"conflicts with {_profile_label(profile)}: {', '.join(how)}, but {rendering} "
+                                         f"does not agree with {profile['name_tgt']}")
+    known = {profile["name_src"], *json.loads(profile["aliases"])}
+    new_aliases = [a for a in dict.fromkeys((p.payload["name_src"], *p.payload["aliases"])) if a not in known]
+    reason = (f"the same character as {_profile_label(profile)}: {', '.join(how)}, and {rendering} agrees with "
+              f"{profile['name_tgt']}; " + (f"new aliases {', '.join(new_aliases)}" if new_aliases else "no new alias"))
+    store.add_profile_aliases(conn, profile["id"], new_aliases, p.page_index,
+                              _event("merged", p, run_id, aliases=new_aliases, reason=reason))
+    store.set_proposal_status(conn, p.proposal_id, status=APPROVED, reason=reason)
+    return MERGED
+
+
 def _conflict(conn: sqlite3.Connection, p: Proposal, existing: str, rendering: str) -> str:
     """The existing entry is not touched; the proposal waits for a human."""
-    store.set_proposal_status(
-        conn, p.proposal_id, status=PENDING_HUMAN, reason=f"conflicts with {existing}, which is {rendering}",
-    )
+    return _conflict_reason(conn, p, f"conflicts with {existing}, which is {rendering}")
+
+
+def _conflict_reason(conn: sqlite3.Connection, p: Proposal, reason: str) -> str:
+    store.set_proposal_status(conn, p.proposal_id, status=PENDING_HUMAN, reason=reason)
     return CONFLICT
 
 

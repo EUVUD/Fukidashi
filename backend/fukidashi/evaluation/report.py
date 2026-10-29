@@ -44,8 +44,8 @@ COMET_FILE = "comet-wmt22-comet-da.json"
 # this module does not import (it reads files only); a test pins each to its source.
 FINAL_STOPS = ("approved", "review_unusable", "revision_unusable", "send_back_limit")
 CURATOR_STATUSES = ("ok", "unusable", "failed", "skipped")
-PROPOSAL_RESULTS = ("duplicate", "confirmed", "conflict", "conflict_across_kinds", "pending_human", "accepted",
-                    "rejected", "undecided")
+PROPOSAL_RESULTS = ("duplicate", "confirmed", "merged", "conflict", "conflict_across_kinds", "pending_human",
+                    "accepted", "rejected", "undecided")
 LOOKUP_AGENTS = ("translator", "reviewer")
 LOOKUP_TOOLS = ("lookup_term", "lookup_character")
 LOOKUP_COUNTS = ("calls", "found", "not_found")

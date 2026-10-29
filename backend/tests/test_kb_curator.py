@@ -65,9 +65,9 @@ def history(row):
     return json.loads(row["history"])
 
 
-def test_the_results_are_the_eight_the_rules_can_give():
-    assert set(RESULTS) == {"duplicate", "confirmed", "conflict", "conflict_across_kinds", "pending_human", "accepted",
-                            "rejected", "undecided"}
+def test_the_results_are_the_nine_the_rules_can_give():
+    assert set(RESULTS) == {"duplicate", "confirmed", "merged", "conflict", "conflict_across_kinds", "pending_human",
+                            "accepted", "rejected", "undecided"}
 
 
 # --- rule 1: a duplicate id is ignored ---
@@ -596,7 +596,7 @@ def test_a_conflict_across_kinds_is_counted_apart_from_a_conflict_of_one_kind_an
                      accept_all([same_kind, term_as_name]))
 
     assert results(outcomes) == [CONFLICT, CONFLICT_ACROSS_KINDS, CONFLICT_ACROSS_KINDS]
-    assert len(RESULTS) == 8 and set(results(outcomes)) <= set(RESULTS)
+    assert len(RESULTS) == 9 and set(results(outcomes)) <= set(RESULTS)
     kinds_untouched(imported, kb, before)   # in neither case is an entry or a profile written or changed
     for proposal in (same_kind, term_as_name, name_as_term):
         row = proposal_row(imported, proposal)
@@ -604,3 +604,304 @@ def test_a_conflict_across_kinds_is_counted_apart_from_a_conflict_of_one_kind_an
     assert proposal_row(imported, same_kind)["reason"].startswith("conflicts with entry")
     assert proposal_row(imported, term_as_name)["reason"].startswith("conflicts across kinds")
     assert proposal_row(imported, name_as_term)["reason"].startswith("conflicts across kinds")
+
+
+# --- rule 6: one character, one profile (task 026) ---
+
+
+def profile_named(conn, kb_id, name_src):
+    (row,) = [r for r in profiles(conn, kb_id) if r["name_src"] == name_src]
+    return row
+
+
+def aliases(row):
+    return json.loads(row["aliases"])
+
+
+def profiles_untouched(conn, before):
+    """No entry or profile was written or changed (only the proposal queue may have grown)."""
+    kinds_untouched(conn, None, before)
+
+
+@pytest.mark.parametrize("status", ["approved", "pending_human"])
+def test_a_given_name_inside_a_profiles_full_name_with_an_agreeing_rendering_joins_that_profile(
+        imported, kb, run_id, status):
+    insert_profile(imported, kb, "桜野すずめ", "樱野雀", aliases=["桜野"], status=status)
+    given = name(kb, 6, "すずめ", "雀", aliases=["すずめさん"])
+
+    outcomes = apply(imported, kb, 6, run_id, [given], accept_all([given]))   # a decision changes nothing (rule 2)
+
+    assert results(outcomes) == ["merged"]
+    (profile,) = profiles(imported, kb)
+    assert (profile["name_src"], profile["name_tgt"], profile["status"]) == ("桜野すずめ", "樱野雀", status)   # kept
+    assert aliases(profile) == ["桜野", "すずめ", "すずめさん"]   # after the ones it had
+    assert pages(profile) == [1, 6]
+    merged = history(profile)[-1]
+    assert (merged["event"], merged["page"], merged["run_id"], merged["proposal_id"], merged["aliases"]) == (
+        "merged", 6, run_id, given.proposal_id, ["すずめ", "すずめさん"])
+    row = proposal_row(imported, given)
+    assert (row["status"], row["decided_at"] is not None) == ("approved", True)
+    assert f"profile {profile['id']}" in row["reason"] and "桜野すずめ" in row["reason"]
+    assert "すずめ is part of 桜野すずめ" in row["reason"] and "new aliases すずめ, すずめさん" in row["reason"]
+
+
+def test_a_full_name_around_a_profiles_given_name_with_an_agreeing_rendering_joins_that_profile(imported, kb, run_id):
+    insert_profile(imported, kb, "ツバメ", "燕", aliases=["ツバメさん"], status="pending_human")
+    full = name(kb, 7, "桜野ツバメ", "樱野燕", aliases=["お姉さん", "ツバメさん"])
+
+    outcomes = apply(imported, kb, 7, run_id, [full])
+
+    assert results(outcomes) == ["merged"]
+    (profile,) = profiles(imported, kb)
+    assert (profile["name_src"], profile["name_tgt"]) == ("ツバメ", "燕")   # the profile keeps its name and rendering
+    assert aliases(profile) == ["ツバメさん", "桜野ツバメ", "お姉さん"]   # no duplicate
+    assert "ツバメ is part of 桜野ツバメ" in proposal_row(imported, full)["reason"]
+
+
+@pytest.mark.parametrize("profile_aliases, proposed, rendering, proposed_aliases, shared", [
+    (["雪ちゃん"], "雪ちゃん", "小雪", [], "雪ちゃん"),          # the proposal's name is the profile's alias
+    ([], "白瀬", "小雪", ["ユキ"], "ユキ"),                      # the proposal's alias is the profile's name
+    (["お嬢"], "ユッキー", "小雪", ["お嬢"], "お嬢"),             # an alias of each is the same
+], ids=["name-is-their-alias", "alias-is-their-name", "alias-is-their-alias"])
+def test_a_name_or_alias_equal_to_a_profiles_name_or_alias_joins_that_profile(
+        imported, kb, run_id, profile_aliases, proposed, rendering, proposed_aliases, shared):
+    insert_profile(imported, kb, "ユキ", "小雪", aliases=profile_aliases)
+    proposal = name(kb, 2, proposed, rendering, aliases=proposed_aliases)
+
+    outcomes = apply(imported, kb, 2, run_id, [proposal])
+
+    assert results(outcomes) == ["merged"] and len(profiles(imported, kb)) == 1
+    profile = profiles(imported, kb)[0]
+    assert proposed in aliases(profile) or proposed == profile["name_src"]
+    assert "ユキ" not in aliases(profile)   # never the profile's own name
+    assert len(aliases(profile)) == len(set(aliases(profile)))
+    assert f"both are called {shared}" in proposal_row(imported, proposal)["reason"]
+
+
+@pytest.mark.parametrize("profile_rendering, rendering", [
+    ("葬仪屋先生", "葬仪屋"),   # the proposal's rendering inside the profile's
+    ("燕", "樱野燕"),           # the profile's inside the proposal's
+    ("小雪", "小雪"),           # the same
+])
+def test_a_rendering_agrees_when_one_contains_the_other(imported, kb, run_id, profile_rendering, rendering):
+    insert_profile(imported, kb, "葬儀屋さん", profile_rendering)
+    proposal = name(kb, 2, "葬儀屋", rendering)
+
+    assert results(apply(imported, kb, 2, run_id, [proposal])) == ["merged"]
+
+
+def test_a_rendering_that_agrees_with_neither_is_a_conflict_and_writes_nothing(imported, kb, run_id):
+    insert_profile(imported, kb, "桜野すずめ", "樱野雀", aliases=["桜野"], status="pending_human")
+    before = dump(imported)
+    rival = name(kb, 6, "すずめ", "铃", aliases=["すずめさん"])
+
+    outcomes = apply(imported, kb, 6, run_id, [rival], accept_all([rival]))   # even an "accept" cannot override it
+
+    assert results(outcomes) == [CONFLICT]
+    profiles_untouched(imported, before)   # no second profile, the first one as it was
+    row = proposal_row(imported, rival)
+    assert (row["status"], row["decided_at"] is not None) == ("pending_human", True)
+    profile_id = profiles(imported, kb)[0]["id"]
+    assert row["reason"] == (f"conflicts with profile {profile_id} (桜野すずめ → 樱野雀): すずめ is part of 桜野すずめ, "
+                             f"but 铃 does not agree with 樱野雀")
+    snapshot = load_snapshot(imported, kb)
+    assert snapshot.character("すずめ") is None and [p.name_tgt for p in snapshot.profiles] == ["樱野雀"]   # 铃 never spreads
+
+
+def test_a_name_that_matches_more_than_one_profile_is_a_conflict_and_writes_nothing(imported, kb, run_id):
+    insert_profile(imported, kb, "葬儀屋さん", "葬仪屋先生", aliases=["葬儀屋"], status="pending_human")
+    insert_profile(imported, kb, "烏丸枢", "乌丸枢", aliases=["烏丸", "社長"], status="pending_human")
+    before = dump(imported)
+    ambiguous = name(kb, 16, "枢", "枢", aliases=["葬儀屋さん", "葬儀屋"])   # agrees with 乌丸枢, and still waits
+
+    outcomes = apply(imported, kb, 16, run_id, [ambiguous])
+
+    assert results(outcomes) == [CONFLICT]
+    profiles_untouched(imported, before)
+    row = proposal_row(imported, ambiguous)
+    first, second = (p["id"] for p in profiles(imported, kb))
+    assert row["status"] == "pending_human" and row["reason"].startswith("conflicts with more than one profile")
+    assert f"profile {first} (葬儀屋さん → 葬仪屋先生): both are called 葬儀屋さん, both are called 葬儀屋" in row["reason"]
+    assert f"profile {second} (烏丸枢 → 乌丸枢): 枢 is part of 烏丸枢" in row["reason"]
+
+
+def test_two_characters_who_share_an_alias_are_taken_for_one_and_a_person_decides(imported, kb, run_id):
+    # A known false positive (task 026): sisters both called by their family name as an alias. The proposal is not
+    # made a profile of its own; it waits for a person, and nothing is written, which is the safe side.
+    insert_profile(imported, kb, "桜野すずめ", "樱野雀", aliases=["桜野"], status="pending_human")
+    before = dump(imported)
+    sister = name(kb, 7, "桜野ツバメ", "樱野燕", aliases=["桜野"])
+
+    outcomes = apply(imported, kb, 7, run_id, [sister])
+
+    assert results(outcomes) == [CONFLICT]
+    profiles_untouched(imported, before)
+    assert "both are called 桜野" in proposal_row(imported, sister)["reason"]
+
+
+@pytest.mark.parametrize("proposed_aliases", [[], ["桜野ツバメさん", "お姉さん"]], ids=["no-alias", "aliases-around-it"])
+def test_a_family_name_alias_alone_does_not_tie_two_names(imported, kb, run_id, proposed_aliases):
+    # 桜野 is the profile's alias, and it is part of the new name and of its aliases: aliases are compared for equality
+    # only, so this is a new character.
+    insert_profile(imported, kb, "桜野すずめ", "樱野雀", aliases=["桜野"], status="pending_human")
+    sister = name(kb, 7, "桜野ツバメ", "樱野燕", aliases=proposed_aliases)
+
+    outcomes = apply(imported, kb, 7, run_id, [sister])
+
+    assert results(outcomes) == [PENDING]
+    assert [(p["name_src"], aliases(p)) for p in profiles(imported, kb)] == [
+        ("桜野すずめ", ["桜野"]), ("桜野ツバメ", proposed_aliases)]
+
+
+@pytest.mark.parametrize("status", ["proposed", "rejected"])
+def test_a_proposed_or_rejected_profile_is_not_matched(imported, kb, run_id, status):
+    insert_profile(imported, kb, "桜野すずめ", "樱野雀", status=status)
+
+    outcomes = apply(imported, kb, 6, run_id, [name(kb, 6, "すずめ", "铃")])
+
+    assert results(outcomes) == [PENDING]   # not readable, so not there for the rule
+
+
+def test_the_same_name_is_still_a_confirmation_or_a_conflict_before_the_rule_looks_further(imported, kb, run_id):
+    insert_profile(imported, kb, "桜野すずめ", "樱野雀", status="pending_human")
+    insert_profile(imported, kb, "すずめ", "小雀", status="pending_human")   # a KB older than the rule
+    same, other = name(kb, 2, "すずめ", "小雀"), name(kb, 3, "すずめ", "雀")
+
+    assert results(apply(imported, kb, 2, run_id, [same])) == [CONFIRMED]   # though it also matches the full name
+    assert results(apply(imported, kb, 3, run_id, [other])) == [CONFLICT]
+    same_name_id = profiles(imported, kb)[1]["id"]
+    assert proposal_row(imported, other)["reason"].startswith(f"conflicts with profile {same_name_id},")   # rule 3's
+
+
+def test_a_name_that_is_a_terms_source_is_still_a_conflict_across_kinds(imported, kb, run_id):
+    insert_entry(imported, kb, "すずめ", "麻雀")
+    insert_profile(imported, kb, "桜野すずめ", "樱野雀")
+    before = dump(imported)
+    proposal = name(kb, 2, "すずめ", "雀")
+
+    assert results(apply(imported, kb, 2, run_id, [proposal])) == [CONFLICT_ACROSS_KINDS]
+    kinds_untouched(imported, kb, before)
+
+
+def test_on_one_page_a_later_name_joins_the_profile_an_earlier_one_made(imported, kb, run_id):
+    full, given = name(kb, 4, "桜野すずめ", "樱野雀", aliases=["桜野"]), name(kb, 4, "すずめ", "雀")
+
+    outcomes = apply(imported, kb, 4, run_id, [full, given])
+
+    assert results(outcomes) == [PENDING, "merged"]
+    (profile,) = profiles(imported, kb)
+    assert (aliases(profile), pages(profile)) == (["桜野", "すずめ"], [4])   # the page once in the evidence...
+    assert [h["event"] for h in history(profile)] == ["created", "merged"]   # ...and the merge in the history
+
+
+def test_a_merge_that_brings_no_new_name_still_joins_the_evidence(imported, kb, run_id):
+    insert_profile(imported, kb, "葬儀屋さん", "葬仪屋先生", aliases=["葬儀屋"], status="pending_human")
+    title = name(kb, 11, "葬儀屋", "葬仪屋", aliases=["葬儀屋さん"])
+
+    assert results(apply(imported, kb, 11, run_id, [title])) == ["merged"]
+
+    (profile,) = profiles(imported, kb)
+    assert (aliases(profile), pages(profile)) == (["葬儀屋"], [1, 11])
+    assert history(profile)[-1]["aliases"] == [] and proposal_row(imported, title)["reason"].endswith("no new alias")
+
+
+def test_a_merged_alias_is_found_by_the_snapshot_and_by_the_cross_kind_rule(imported, kb, run_id):
+    insert_profile(imported, kb, "桜野ツバメ", "樱野燕", aliases=["お姉さん"], status="pending_human")
+    apply(imported, kb, 10, run_id, [name(kb, 10, "ツバメ", "燕", aliases=["ツバメさん"])])
+
+    snapshot = load_snapshot(imported, kb)
+
+    for called in ("ツバメ", "ツバメさん", "お姉さん", "桜野ツバメ"):
+        found = snapshot.character(called)
+        assert (found.name_src, found.name_tgt, found.status) == ("桜野ツバメ", "樱野燕", "pending_human"), called
+    assert len(snapshot.profiles) == 1
+    word = term(kb, 12, "ツバメさん", "燕小姐")   # a later term with the new alias as its source meets the profile
+    assert results(apply(imported, kb, 12, run_id, [word], accept_all([word]))) == [CONFLICT_ACROSS_KINDS]
+
+
+def test_add_profile_aliases_keeps_the_order_and_never_repeats_a_name(imported, kb, run_id):
+    insert_profile(imported, kb, "ユキ", "小雪", aliases=["ゆき"])
+    profile_id = profiles(imported, kb)[0]["id"]
+
+    with store.transaction(imported):
+        added = store.add_profile_aliases(imported, profile_id, ["雪ちゃん", "ユキ", "ゆき", "雪ちゃん", "白瀬"], 1,
+                                          {"event": "merged"})
+
+    assert added == ["雪ちゃん", "白瀬"]
+    profile = profiles(imported, kb)[0]
+    assert (aliases(profile), pages(profile)) == (["ゆき", "雪ちゃん", "白瀬"], [1])
+    assert [h["event"] for h in history(profile)] == ["created", "merged"]
+
+
+def test_when_the_alias_write_fails_nothing_of_the_call_is_stored(imported, kb, run_id, monkeypatch):
+    insert_profile(imported, kb, "桜野すずめ", "樱野雀", status="pending_human")
+    page = [term(kb, 6, "封印", "封印"), name(kb, 6, "すずめ", "雀")]
+    before = dump(imported)
+
+    def failing(*args, **kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(store, "add_profile_aliases", failing)
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        apply(imported, kb, 6, run_id, page, accept_all(page))
+
+    assert dump(imported) == before and not imported.in_transaction
+
+
+# --- the replay of the dev runs' character proposals (#44), names, renderings and aliases only ---
+
+BOUREISOUGI = [   # (page, name_src, name_tgt, aliases, result), in page order
+    (1, "葬儀屋さん", "葬仪屋先生", ["葬儀屋"], PENDING),
+    (4, "烏丸枢", "乌丸枢", ["烏丸", "社長"], PENDING),
+    (4, "桜野すずめ", "樱野雀", ["桜野"], PENDING),
+    (6, "すずめ", "铃", ["すずめさん"], CONFLICT),                       # matches 桜野すずめ; 铃 does not agree with 樱野雀
+    (7, "桜野ツバメ", "樱野燕", ["桜野ツバメさん", "お姉さん", "お姉ちゃん"], PENDING),
+    (10, "ツバメ", "燕", ["ツバメさん", "桜野燕"], "merged"),             # into 桜野ツバメ
+    (11, "葬儀屋", "葬仪屋", ["葬儀屋さん"], "merged"),                   # into 葬儀屋さん, no new alias
+    (16, "枢", "枢", ["葬儀屋さん", "葬儀屋"], CONFLICT),                 # 葬儀屋さん by an alias, 烏丸枢 by containment
+]
+TOJIME_NO_SIORA = [
+    (1, "シオラ", "希奥拉", ["綴じ眼のシオラ"], PENDING),
+    (2, "レーネ", "蕾妮", [], PENDING),
+    (7, "ビル・トルティヤー", "比尔·托尔蒂亚", ["ビル"], PENDING),
+    (21, "レーネ", "蕾妮", [], CONFIRMED),
+]
+
+
+def replay(conn, kb_id, run_id, rows):
+    """Apply `rows` page by page, as the eval applied them, and return each proposal's result."""
+    got = []
+    for page_index in dict.fromkeys(r[0] for r in rows):
+        proposals = [name(kb_id, n, src, tgt, aliases=al) for n, src, tgt, al, _ in rows if n == page_index]
+        got += results(apply(conn, kb_id, page_index, run_id, proposals))
+    return got
+
+
+def final_profiles(conn, kb_id):
+    return [(p["name_src"], p["name_tgt"], aliases(p), p["status"], pages(p)) for p in profiles(conn, kb_id)]
+
+
+def test_the_replay_of_boureisougi_ends_with_one_profile_for_each_of_four_characters(imported, kb, run_id):
+    assert replay(imported, kb, run_id, BOUREISOUGI) == [r[-1] for r in BOUREISOUGI]
+
+    assert final_profiles(imported, kb) == [
+        ("葬儀屋さん", "葬仪屋先生", ["葬儀屋"], "pending_human", [1, 11]),
+        ("烏丸枢", "乌丸枢", ["烏丸", "社長"], "pending_human", [4]),
+        ("桜野すずめ", "樱野雀", ["桜野"], "pending_human", [4]),
+        ("桜野ツバメ", "樱野燕", ["桜野ツバメさん", "お姉さん", "お姉ちゃん", "ツバメ", "ツバメさん", "桜野燕"],
+         "pending_human", [7, 10]),
+    ]   # 4 profiles, not 8, and the 铃 profile is never created
+    assert [r["status"] for r in store.kb_proposals(imported, kb)] == [
+        "pending_human", "pending_human", "pending_human", "pending_human", "pending_human", "approved", "approved",
+        "pending_human"]
+    assert load_snapshot(imported, kb).character("ツバメさん").name_tgt == "樱野燕"
+
+
+def test_the_replay_of_tojime_no_siora_is_as_it_was(imported, kb, run_id):
+    assert replay(imported, kb, run_id, TOJIME_NO_SIORA) == [r[-1] for r in TOJIME_NO_SIORA]
+
+    assert final_profiles(imported, kb) == [
+        ("シオラ", "希奥拉", ["綴じ眼のシオラ"], "pending_human", [1]),
+        ("レーネ", "蕾妮", [], "pending_human", [2, 21]),
+        ("ビル・トルティヤー", "比尔·托尔蒂亚", ["ビル"], "pending_human", [7]),
+    ]
