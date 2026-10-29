@@ -492,6 +492,104 @@ def test_a_config_without_a_review_loop_has_no_such_section_and_a_reviewed_one_w
     assert "kb_reach" not in result["pooled"]["full_no_kb"]
 
 
+def off_common_set(tmp_path):
+    """Book A, pages 1-3, three configs. `baseline` failed page 3, so page 3 is off the common pages; `full_no_kb` and
+    `full` scored it, with values that show if they are counted anyway."""
+    glossary_dir = make_glossary_dir(tmp_path)
+    dirs = [
+        make_eval(tmp_path, "baseline", A, [page(1), page(2), page(3, "failed", error="E", cost_usd=0.5)],
+                  glossary_dir=glossary_dir),
+        make_eval(tmp_path, "full_no_kb", A, [
+            page(1), page(2, fell_back=True, fallback_reason="step_limit", send_backs=1),
+            page(3, fell_back=True, fallback_reason="step_limit", send_backs=2, final_stop="send_back_limit")],
+            glossary_dir=glossary_dir),
+        make_eval(tmp_path, "full", A, [
+            page(1, proposal_outcomes=outcomes(accepted=1), kb_reach=kb_reach(1, [("term", "a")], {("translator", "lookup_term"): (1, 1, 0)})),
+            page(2, curator_status="skipped", proposal_outcomes=outcomes(pending_human=2), kb_reach=kb_reach(0)),
+            page(3, fell_back=True, send_backs=2, final_stop="send_back_limit", curator_status="failed",
+                 proposal_outcomes=outcomes(undecided=7),
+                 kb_reach=kb_reach(5, [("term", "x"), ("term", "y")], {("reviewer", "lookup_term"): (9, 9, 0)}))],
+            glossary_dir=glossary_dir)]
+    return dirs, glossary_dir
+
+
+def test_the_review_loop_the_curator_and_the_kb_reach_leave_out_a_page_off_the_common_pages(tmp_path):
+    dirs, glossary_dir = off_common_set(tmp_path)
+
+    pooled = report.build_report(dirs, glossary_dir)["pooled"]
+
+    assert pooled["full_no_kb"]["review_loop"] == {
+        "final_stops": {"approved": 2, "review_unusable": 0, "revision_unusable": 0, "send_back_limit": 0}, "send_backs": 1}
+    full = pooled["full"]
+    assert full["review_loop"] == {
+        "final_stops": {"approved": 2, "review_unusable": 0, "revision_unusable": 0, "send_back_limit": 0}, "send_backs": 0}
+    assert full["curator"]["statuses"] == {"ok": 1, "unusable": 0, "failed": 0, "skipped": 1}
+    assert full["curator"]["proposal_outcomes"] == outcomes(accepted=1, pending_human=2)
+    assert full["kb_reach"]["snippet_pages"] == {"nonempty": 1, "empty": 1, "unknown": 0}
+    assert (full["kb_reach"]["lookups"]["calls"], full["kb_reach"]["lookups"]["found"]) == (1, 1)
+    assert full["kb_reach"]["items_reached"] == 1  # page 3's x and y are not counted
+    assert [pooled[c]["pages"] for c in ("baseline", "full_no_kb", "full")] == [2, 2, 2]
+
+
+def test_a_page_that_fell_back_is_counted_when_it_is_common_and_not_when_it_is_off_the_common_pages(tmp_path):
+    dirs, glossary_dir = off_common_set(tmp_path)
+
+    result = report.build_report(dirs, glossary_dir)
+
+    # full_no_kb fell back on pages 2 (common) and 3 (off the common pages); full on page 3 only; baseline never
+    assert [result["pooled"][c]["fallback_pages"] for c in ("baseline", "full_no_kb", "full")] == [0, 1, 0]
+    row = [l for l in report.render(result).splitlines() if l.startswith("fallback to baseline")][0]
+    assert row.split() == ["fallback", "to", "baseline", "(pages)", "0", "1", "0"]
+
+
+def test_the_spend_of_all_runs_includes_the_page_off_the_common_pages_and_the_failed_run(tmp_path):
+    dirs, glossary_dir = off_common_set(tmp_path)
+
+    spend = report.build_report(dirs, glossary_dir)["spend"]
+
+    assert spend["baseline"]["total_usd"] == 0.52 and (spend["baseline"]["runs"], spend["baseline"]["failed_runs"]) == (3, 1)
+    assert spend["full_no_kb"]["total_usd"] == 0.03 and spend["full"]["total_usd"] == 0.03
+
+
+def test_a_failed_run_whose_cost_is_unknown_makes_the_spend_unknown_not_a_cheaper_total(tmp_path):
+    glossary_dir = make_glossary_dir(tmp_path)
+    run_dir = make_eval(tmp_path, "baseline", A, [page(1), page(2, "failed", error="E", cost_usd=None)],
+                        glossary_dir=glossary_dir)
+
+    spend = report.build_report([run_dir], glossary_dir)["spend"]["baseline"]
+
+    assert (spend["total_usd"], spend["unknown_cost_runs"], spend["runs"], spend["failed_runs"]) == (None, 1, 2, 1)
+
+
+def test_a_review_loop_or_curator_field_a_row_lacks_is_unknown_not_a_default(tmp_path):
+    glossary_dir = make_glossary_dir(tmp_path)
+    no_loop = make_eval(tmp_path, "full_no_kb", A, [page(1, final_stop=DROP, send_backs=DROP), page(2)],
+                        glossary_dir=glossary_dir)
+    no_curator = make_eval(tmp_path, "full", A, [page(1, curator_status=DROP, proposal_outcomes=DROP), page(2)],
+                           glossary_dir=glossary_dir)
+
+    pooled = report.build_report([no_loop, no_curator], glossary_dir)["pooled"]
+
+    assert pooled["full_no_kb"]["review_loop"] == {"final_stops": None, "send_backs": None}
+    assert pooled["full"]["review_loop"]["final_stops"]["approved"] == 2
+    assert pooled["full"]["curator"] == {"statuses": None, "proposal_outcomes": None}
+    text = report.render(report.build_report([no_loop, no_curator], glossary_dir))
+    assert [l for l in text.splitlines() if l.startswith("send-backs")][0].split() == ["send-backs", "n/a", "0"]
+
+
+def test_a_stop_or_result_the_report_does_not_know_is_counted_so_that_the_counts_add_up(tmp_path):
+    glossary_dir = make_glossary_dir(tmp_path)
+    run_dir = make_eval(tmp_path, "full", A, [
+        page(1, final_stop="a_new_stop", curator_status="a_new_status", proposal_outcomes=outcomes(a_new_result=2)),
+        page(2)], glossary_dir=glossary_dir)
+
+    full = report.build_report([run_dir], glossary_dir)["pooled"]["full"]
+
+    assert full["review_loop"]["final_stops"] == {**dict.fromkeys(report.FINAL_STOPS, 0), "approved": 1, "a_new_stop": 1}
+    assert full["curator"]["statuses"]["a_new_status"] == 1 and full["curator"]["statuses"]["ok"] == 1
+    assert full["curator"]["proposal_outcomes"]["a_new_result"] == 2
+
+
 # --- provenance -------------------------------------------------------------------------------------------------------------
 
 def test_each_run_is_listed_with_its_provenance(tmp_path):
@@ -590,6 +688,68 @@ def test_the_summary_shows_the_pages_left_out_with_their_status_and_error_and_n_
     assert f"{result['pooled']['baseline']['chrf']['score']:.2f}" in chrf
     assert "-" in [l for l in text.splitlines() if l.startswith("final_stop approved")][0].split()  # baseline has none
     assert [l for l in text.splitlines() if l.startswith("spend")][0].split() == ["spend,", "all", "runs", "$0.050000", "$0.070000"]
+
+
+def row_tokens(text, label):
+    """The label's words and then the cells of the first table row that has exactly this label (the pooled rows come
+    first; a per-book block repeats a few labels)."""
+    for l in text.splitlines():
+        if l[:report.LABEL_WIDTH].rstrip() == label:
+            return label.split() + l[report.LABEL_WIDTH:].split()
+    raise AssertionError(f"no row labelled {label!r}")
+
+
+def block_after(text, header_start):
+    """The lines under the line that starts with `header_start`, up to the next blank line."""
+    lines = text.splitlines()
+    first = next(i for i, l in enumerate(lines) if l.startswith(header_start)) + 1
+    last = next((i for i in range(first, len(lines)) if not lines[i].strip()), len(lines))
+    return lines[first:last]
+
+
+def test_every_row_of_the_summary_shows_its_own_number_under_its_own_label(tmp_path):
+    result = build(*two_by_two(tmp_path))
+    text = report.render(result)
+    p = result["pooled"]
+
+    # the pooled rows, one column for each of baseline and full_no_kb; the values differ from row to row and column to
+    # column, so a row that shows another row's number, or the columns swapped, is caught
+    assert row_tokens(text, "pages") == ["pages", "4", "4"] and row_tokens(text, "segments") == ["segments", "6", "6"]
+    assert row_tokens(text, "chrF")[1:] == [f"{p[c]['chrf']['score']:.2f}" for c in ("baseline", "full_no_kb")]
+    assert row_tokens(text, "BLEU")[1:] == [f"{p[c]['bleu']['score']:.2f}" for c in ("baseline", "full_no_kb")]
+    assert row_tokens(text, "BLEU")[1:] != row_tokens(text, "chrF")[1:]
+    assert row_tokens(text, "COMET (wmt22-comet-da)") == ["COMET", "(wmt22-comet-da)", f"{2.6 / 6:.4f}", f"{3.2 / 6:.4f}"]
+    assert row_tokens(text, "term accuracy, primary") == ["term", "accuracy,", "primary", "60.0%", "(3/5)", "100.0%", "(5/5)"]
+    assert row_tokens(text, "term accuracy, all entries") == ["term", "accuracy,", "all", "entries", "66.7%", "(4/6)", "83.3%", "(5/6)"]
+    assert row_tokens(text, "cost per page") == ["cost", "per", "page", "$0.002500", "$0.012500"]
+    assert row_tokens(text, "latency p50 / p95 (s)") == ["latency", "p50", "/", "p95", "(s)", "2.5", "/", f"{p['baseline']['latency']['p95_s']:.1f}",
+                                           "15.0", "/", "20.0"]
+    assert row_tokens(text, "fallback to baseline (pages)") == ["fallback", "to", "baseline", "(pages)", "0", "0"]
+    assert row_tokens(text, "spend, all runs") == ["spend,", "all", "runs", "$0.050000", "$0.070000"]
+    assert row_tokens(text, "  runs (failed)") == ["runs", "(failed)", "5", "(0)", "5", "(1)"]
+    # the same columns again for each book, with that book's own numbers
+    book_a, book_b = block_after(text, f"{A}  (2 common pages)"), block_after(text, f"{B}  (2 common pages)")
+    assert book_a[0].split() == ["baseline", "full_no_kb"]
+    assert book_a[1].split() == ["chrF"] + [f"{result['by_book'][A][c]['chrf']['score']:.2f}" for c in ("baseline", "full_no_kb")]
+    assert book_a[2].split() == ["COMET", "(wmt22-comet-da)", "0.5000", "0.6000"]
+    assert book_b[2].split() == ["COMET", "(wmt22-comet-da)", "0.3000", "0.4000"]
+    assert book_a[3].split() == ["term", "accuracy,", "primary", "66.7%", "(2/3)", "100.0%", "(3/3)"]
+    assert book_b[3].split() == ["term", "accuracy,", "primary", "50.0%", "(1/2)", "100.0%", "(2/2)"]
+
+
+def test_a_long_cell_never_touches_the_column_before_it(tmp_path):
+    """`n/a (16 unknown)` is wider than a column of 16: the layout widens the columns instead of running cells together."""
+    glossary_dir = make_glossary_dir(tmp_path)
+    unknown = [page(i, cost_usd=None, unknown_usage_calls=1) for i in range(1, 17)]
+    dirs = [make_eval(tmp_path, "baseline", A, [page(i) for i in range(1, 17)], glossary_dir=glossary_dir),
+            make_eval(tmp_path, "full_no_kb", A, unknown, glossary_dir=glossary_dir)]
+
+    text = report.render(report.build_report(dirs, glossary_dir))
+
+    assert row_tokens(text, "cost per page") == ["cost", "per", "page", "$0.010000", "n/a", "(16", "unknown)"]
+    widths = {len(l) for l in text.splitlines() if l.startswith(("segments", "chrF", "cost per page", "spend"))}
+    assert len(widths) == 1  # every row of the table is as wide as the others
+    assert "  n/a (16 unknown)" in text  # at least two spaces before it
 
 
 # --- reading the files: refusals -----------------------------------------------------------------------------------------------
@@ -712,6 +872,31 @@ def refusals(tmp_path):
         (run_dir / report.COMET_FILE).read_text(encoding="utf-8").replace('"score": 0.5', '"score": NaN', 1), encoding="utf-8")
     case("a COMET score that is not a finite number", [run_dir], g, "not a finite number", run_dir)
 
+    sub, g, run_dir = fresh("nan-cost")
+    edit_json(run_dir / "scores.json", lambda d: d["pages"][0].update(cost_usd=float("nan")))
+    case("a page row whose cost is NaN", [run_dir], g, "`cost_usd` that is neither a finite number nor null", run_dir)
+
+    sub, g, run_dir = fresh("boolean-cost")
+    edit_json(run_dir / "scores.json", lambda d: d["pages"][0].update(cost_usd=True))
+    case("a page row whose cost is a boolean", [run_dir], g, "`cost_usd` that is neither a finite number nor null", run_dir)
+
+    sub, g, run_dir = fresh("infinite-latency")
+    edit_json(run_dir / "scores.json", lambda d: d["pages"][0].update(latency_s=float("inf")))
+    case("a page row whose latency is Infinity", [run_dir], g, "`latency_s` that is not a finite number", run_dir)
+
+    sub, g, run_dir = fresh("text-unknown-calls")
+    edit_json(run_dir / "scores.json", lambda d: d["pages"][0].update(unknown_usage_calls="0"))
+    case("a page row whose unknown_usage_calls is not a number", [run_dir], g,
+         "`unknown_usage_calls` that is not an integer", run_dir)
+
+    sub, g, run_dir = fresh("nan-failed-cost")
+    (sub / "failed").mkdir()
+    failed_run = make_eval(sub / "failed", "baseline", B, [page(1), page(2, "failed", error="E", cost_usd=0.1)],
+                           glossary_dir=g)
+    edit_json(failed_run / "scores.json", lambda d: d["failed_pages"][0].update(cost_usd=float("nan")))
+    case("a failed page row whose cost is NaN", [failed_run], g, "`cost_usd` that is neither a finite number nor null",
+         failed_run)
+
     sub, g, run_dir = fresh("broken-json")
     (run_dir / "scores.json").write_text("{not json", encoding="utf-8")
     case("a file that is not JSON", [run_dir], g, "scores.json cannot be read as JSON", run_dir)
@@ -825,6 +1010,15 @@ def test_the_names_the_report_repeats_are_the_ones_the_harness_and_the_agents_us
     assert report.CURATOR_STATUSES == curator_agent.STATUSES == harness.CURATOR_STATUSES
     assert report.PROPOSAL_RESULTS == curator_rules.RESULTS
     assert report.LOOKUP_AGENTS == harness.LOOKUP_AGENTS and report.LOOKUP_TOOLS == tuple(harness.LOOKUP_TOOLS)
+
+
+def test_the_comet_model_and_file_name_are_the_ones_eval_comet_writes():
+    spec = importlib.util.spec_from_file_location("comet_script_for_the_report_test", config.ROOT / "eval" / "comet.py")
+    comet_script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(comet_script)
+
+    assert report.COMET_MODEL == comet_script.DEFAULT_MODEL
+    assert report.COMET_FILE == comet_script.output_name(comet_script.DEFAULT_MODEL)
 
 
 def test_the_report_reads_files_only():
