@@ -11,12 +11,18 @@ has them. The pages left out, and what each config's Runs cost altogether, are l
 numbers wrong (a dirty tree, different commits, different models) is a warning. There are no confidence intervals: the
 paired bootstrap is M8.
 
+Term consistency (eval/consistency.py) is optional, but all or none: when every run has a consistency-<judge model>.json
+from the same judge model, each config also gets its consistency (the KB ablation's secondary metric; term accuracy is
+its primary one), the reference's consistency, the extractor's accuracy and whether consistency is reportable, and the
+occurrences by status, pooled and per book; the summary gains one consistency line per config. When no run has one, the
+report is what it was before; when only some have one, or the files differ in judge model or rules, it refuses.
+
 Writes runs/report/<UTC time>-report/report.json (a new directory each time, the file replaced through a temporary
 file) and prints a plain-text summary. It reads only files: nothing here calls a model, opens a network connection or
 reads the database.
 Exit code: 0 when report.json is written; 2 (with a message naming the directory and the cause, and nothing written) when
-a directory is missing or unfinished, a file is missing or does not match the others, or the runs are not one for each
-config and book over the same books; 1 when the report cannot be written.
+a directory is missing or unfinished, a file is missing or does not match the others, the runs are not one for each
+config and book over the same books, or only some runs have a consistency file; 1 when the report cannot be written.
 """
 
 from __future__ import annotations

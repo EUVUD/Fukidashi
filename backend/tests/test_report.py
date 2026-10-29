@@ -1063,3 +1063,339 @@ def test_the_script_runs_as_a_program(tmp_path):
     refused = subprocess.run([sys.executable, script, str(tmp_path / "nowhere")], capture_output=True, text=True,
                              env={"PATH": "/usr/bin:/bin"}, timeout=60)
     assert refused.returncode == 2 and "Nothing was written" in refused.stderr
+
+
+# --- term consistency (eval/consistency.py): all or none -----------------------------------------------------------------
+
+JUDGE_MODEL = "gpt-4o-mini-2024-07-18"
+
+
+def consistency_rules():
+    from fukidashi.evaluation import consistency
+    return consistency.RULES
+
+
+def occ(page_index, idx, translation, reference, checked=False, correct=None):
+    """One occurrence of a consistency file. `translation` and `reference` are a rendering (already normalised) or one
+    of the statuses that has none; `correct` matters only where the occurrence is `checked`."""
+    def text(value):
+        if value in ("omitted", "not_this_term", "invalid"):
+            return {"status": value, "rendering": None, "normalised": None, "attempts": 1, "problems": [], "answer": "{}"}
+        return {"status": "rendered", "rendering": value, "normalised": value, "attempts": 1, "problems": [],
+                "answer": "{}"}
+    return {"page_index": page_index, "idx": idx, "form": "x", "translation": text(translation),
+            "reference": text(reference), "extractor": {"checked": checked, "correct": correct if checked else None}}
+
+
+def write_consistency(run_dir, glossary_dir, entries, *, model=JUDGE_MODEL, rules=None, response_model=JUDGE_MODEL):
+    """A consistency file as eval/consistency.py writes it, as far as the report reads it. `entries` maps an entry id to
+    its occurrences (`occ`)."""
+    manifest = read_json(run_dir / "manifest.json")
+    book = manifest["book"]
+    path = run_dir / f"consistency-{model.rsplit('/', 1)[-1]}.json"
+    write_json(path, {
+        "eval_id": manifest["eval_id"], "book": book, "segments_sha256": sha256_of(run_dir / "segments.jsonl"),
+        "glossary_sha256": sha256_of(glossary_dir / f"{book}.json"), "rules": rules or consistency_rules(),
+        "judge": {"prefix": "JUDGE", "model": model, "requested_model": model, "response_model": response_model,
+                  "temperature": 0.0, "reasoning_effort": None, "json_mode": "json_object", "max_tokens": 200},
+        "occurrences": sum(len(o) for o in entries.values()),
+        "entries": [{"id": entry_id, "segments": occurrences} for entry_id, occurrences in entries.items()],
+        "usage": {"calls": 2, "unknown_usage_calls": 0, "input_tokens": 600, "output_tokens": 24, "cost_usd": 0.0001},
+        "scored_at": FINISHED, "elapsed_s": 1.0})
+    return path
+
+
+# On two_by_two's runs. Page 3 of book A is off the common pages: baseline scored it, full_no_kb failed it.
+CONSISTENCY = {
+    ("baseline", A): {"ryu": [occ(1, 0, "龙", "龙", True, True), occ(2, 0, "龙", "龙", True, True),
+                              occ(2, 1, "飞龙", "omitted", True, False), occ(3, 0, "龙王", "龙", True, True)],
+                      "ghost": [occ(1, 1, "omitted", "鬼"), occ(3, 1, "鬼", "鬼")]},
+    ("baseline", B): {"shiora": [occ(1, 0, "希奥拉", "希奥拉", True, True), occ(2, 0, "希奥拉", "希奥拉", True, True)],
+                      "kururu": [occ(1, 0, "invalid", "枢"), occ(2, 0, "枢", "枢")]},
+    ("full_no_kb", A): {"ryu": [occ(1, 0, "龙", "龙", True, True), occ(2, 0, "龙", "龙", True, True),
+                                occ(2, 1, "龙", "龙", True, True)],
+                        "ghost": [occ(1, 1, "not_this_term", "鬼")]},
+    ("full_no_kb", B): {"shiora": [occ(1, 0, "希奥拉", "希奥拉", True, True), occ(2, 0, "西奥拉", "希奥拉", True, True)],
+                        "kururu": [occ(1, 0, "枢", "枢"), occ(2, 0, "枢", "枢")]},
+}
+
+
+def with_consistency(tmp_path, **options):
+    dirs, glossary_dir = two_by_two(tmp_path)
+    for key, run_dir in dirs.items():
+        write_consistency(run_dir, glossary_dir, CONSISTENCY[key], **options)
+    return dirs, glossary_dir
+
+
+def test_consistency_is_pooled_per_config_over_the_common_pages_of_both_books(tmp_path):
+    result = build(*with_consistency(tmp_path))
+
+    baseline = result["pooled"]["baseline"]["consistency"]
+    # translation, common pages only: ryu 龙 龙 飞龙 (2 of 3; page 3's 龙王 is off), ghost nothing rendered, shiora 2 of 2,
+    # kururu one rendering (left out). (2 + 2) / (3 + 2); with page 3 it would be (2 + 2) / (4 + 2).
+    assert baseline["translation"] == {"entries": 2, "rendered": 5, "most_common_count": 4, "consistency": 0.8}
+    # the reference: ryu 2 of 2 (one omitted), ghost one rendering on the common pages, shiora 2 of 2, kururu 2 of 2
+    assert baseline["reference"] == {"entries": 3, "rendered": 6, "most_common_count": 6, "consistency": 1.0}
+    assert baseline["statuses"] == {"translation": {"rendered": 6, "omitted": 1, "not_this_term": 0, "invalid": 1},
+                                    "reference": {"rendered": 7, "omitted": 1, "not_this_term": 0, "invalid": 0}}
+    assert baseline["extractor"] == {"checked": 5, "correct": 4, "accuracy": 0.8, "reportable": False}
+    full_no_kb = result["pooled"]["full_no_kb"]["consistency"]
+    # ryu 3 of 3, ghost not this term, shiora 希奥拉 / 西奥拉 (1 of 2), kururu 2 of 2
+    assert full_no_kb["translation"] == {"entries": 3, "rendered": 7, "most_common_count": 6,
+                                         "consistency": pytest.approx(6 / 7)}
+    assert full_no_kb["statuses"]["translation"] == {"rendered": 7, "omitted": 0, "not_this_term": 1, "invalid": 0}
+    assert full_no_kb["extractor"] == {"checked": 5, "correct": 5, "accuracy": 1.0, "reportable": True}
+
+
+def test_consistency_per_book_counts_that_books_entries_only(tmp_path):
+    by_book = build(*with_consistency(tmp_path))["by_book"]
+
+    assert by_book[A]["baseline"]["consistency"]["translation"] == {
+        "entries": 1, "rendered": 3, "most_common_count": 2, "consistency": pytest.approx(2 / 3)}
+    assert by_book[B]["baseline"]["consistency"]["translation"] == {
+        "entries": 1, "rendered": 2, "most_common_count": 2, "consistency": 1.0}
+    assert by_book[A]["baseline"]["consistency"]["extractor"] == {
+        "checked": 3, "correct": 2, "accuracy": pytest.approx(2 / 3), "reportable": False}
+    assert by_book[B]["baseline"]["consistency"]["extractor"]["reportable"] is True
+    assert by_book[B]["full_no_kb"]["consistency"]["translation"]["consistency"] == pytest.approx(3 / 4)  # 1/2 + 2/2
+
+
+def test_reportable_is_decided_on_the_pooled_counts_not_book_by_book(tmp_path):
+    glossary_dir = make_glossary_dir(tmp_path)
+    five = [("甲", "甲")] * 5
+    a, b = (make_eval(tmp_path, "baseline", book, [page(1, segments=five)], glossary_dir=glossary_dir) for book in (A, B))
+    write_consistency(a, glossary_dir, {"x": [occ(1, i, "甲", "甲", True, i != 0) for i in range(5)]})  # 4 of 5
+    write_consistency(b, glossary_dir, {"y": [occ(1, i, "乙", "乙", True, True) for i in range(5)]})  # 5 of 5
+
+    result = report.build_report([a, b], glossary_dir)
+
+    assert result["pooled"]["baseline"]["consistency"]["extractor"] == {
+        "checked": 10, "correct": 9, "accuracy": 0.9, "reportable": True}  # 90% is enough
+    assert result["by_book"][A]["baseline"]["consistency"]["extractor"]["reportable"] is False
+
+
+def strip_consistency(result):
+    """The report with everything consistency added taken out again."""
+    result = json.loads(json.dumps(result))
+    result.pop("consistency")
+    result.pop("kb_ablation")
+    for metrics in [*result["pooled"].values(), *(m for by_config in result["by_book"].values() for m in by_config.values())]:
+        metrics.pop("consistency")
+    for run in result["runs"]:
+        run.pop("consistency")
+    return result
+
+
+def test_consistency_files_add_their_sections_and_change_nothing_else(tmp_path, monkeypatch):
+    monkeypatch.setattr(report, "datetime", FixedClock)
+    dirs, glossary_dir = two_by_two(tmp_path)
+    before = json.loads(json.dumps(build(dirs, glossary_dir)))
+    text_before = report.render(before)
+    for key, run_dir in dirs.items():
+        write_consistency(run_dir, glossary_dir, CONSISTENCY[key])
+
+    after = build(dirs, glossary_dir)
+
+    assert strip_consistency(after) == before
+    assert list(after) == [*before, "consistency", "kb_ablation"]
+    assert after["consistency"] == {"judge_model": JUDGE_MODEL, "rules": consistency_rules(), "min_rendered": 2,
+                                    "threshold": 0.9}
+    assert after["kb_ablation"] == {"comparison": "full vs full_no_kb", "primary_metric": "term accuracy (terms.primary)",
+                                    "secondary_metric": "term consistency (consistency.translation)"}
+    assert after["runs"][0]["consistency"]["file"] == f"consistency-{JUDGE_MODEL}.json"
+    assert after["runs"][0]["consistency"]["model"] == JUDGE_MODEL
+    lines = report.render(after).splitlines()
+    heading = next(i for i, l in enumerate(lines) if l.startswith("term consistency"))
+    block = lines[heading - 1:heading + 1 + len(after["configs"])]  # a blank line, the heading, one line per config
+    assert block[0] == "" and all(l.startswith("  ") for l in block[2:])
+    assert lines[:heading - 1] + lines[heading + 1 + len(after["configs"]):] == text_before.splitlines()
+
+
+def test_without_any_consistency_file_the_report_has_no_consistency_at_all(tmp_path):
+    result = build(*two_by_two(tmp_path))
+
+    def keys(value):
+        if isinstance(value, dict):
+            return set(value) | set().union(*map(keys, value.values()))
+        return set().union(*map(keys, value)) if isinstance(value, list) else set()
+
+    assert not {"consistency", "kb_ablation"} & keys(result)
+    assert "consistency" not in report.render(result).replace(str(tmp_path), "")
+
+
+def test_the_summary_has_one_consistency_line_per_config_and_marks_the_primary_and_secondary_metrics(tmp_path):
+    text = report.render(build(*with_consistency(tmp_path)))
+
+    lines = text.splitlines()
+    heading = next(i for i, l in enumerate(lines) if l.startswith("term consistency"))
+    assert "secondary metric" in lines[heading] and "term accuracy is its primary" in lines[heading]
+    assert JUDGE_MODEL in lines[heading] and "90%" in lines[heading]
+    assert lines[heading + 1] == (
+        f"  baseline: 80.0% (4/5) [{A} 66.7% (2/3), {B} 100.0% (2/2)]; reference 100.0% (6/6); extractor 80.0% (4/5), "
+        "for reference only; translation rendered 6 omitted 1 not_this_term 0 invalid 1; "
+        "reference rendered 7 omitted 1 not_this_term 0 invalid 0")
+    assert lines[heading + 2].startswith(f"  full_no_kb: 85.7% (6/7) [{A} 100.0% (3/3), {B} 75.0% (3/4)]; ")
+    assert "extractor 100.0% (5/5), reportable;" in lines[heading + 2]
+    assert lines.index(f"{A}  (2 common pages)") > heading + 2  # before the per-book blocks
+
+
+def test_different_judge_response_models_are_a_warning(tmp_path):
+    dirs, glossary_dir = two_by_two(tmp_path)
+    for key, run_dir in dirs.items():
+        write_consistency(run_dir, glossary_dir, CONSISTENCY[key],
+                          response_model="gpt-4o-mini-2024-07-18" if key[1] == A else "gpt-4o-mini-2025-01-01")
+
+    warnings = build(dirs, glossary_dir)["warnings"]
+
+    assert len(warnings) == 1 and "judge responses came from different models" in warnings[0]
+
+
+def consistency_refusals(tmp_path):
+    """[(what is wrong, run directories, glossary dir, text the message must hold, the directory it must name)]."""
+    cases = []
+
+    def fresh(name, *, with_file=True):
+        sub = tmp_path / name
+        sub.mkdir()
+        glossary_dir = make_glossary_dir(sub)
+        dirs = [make_eval(sub, "baseline", A, [page(1, segments=[("甲", "甲"), ("乙", "乙")])], glossary_dir=glossary_dir),
+                make_eval(sub, "full_no_kb", A, [page(1, segments=[("甲", "甲"), ("乙", "乙")])], glossary_dir=glossary_dir)]
+        files = [write_consistency(d, glossary_dir, {"x": [occ(1, 0, "甲", "甲", True, True), occ(1, 1, "甲", "乙")]})
+                 for d in (dirs if with_file else dirs[:1])]
+        return dirs, glossary_dir, files
+
+    dirs, g, files = fresh("some-but-not-all", with_file=False)
+    cases.append(("a consistency file in some runs but not all", dirs, g, "for every run or for none", dirs[1]))
+
+    dirs, g, files = fresh("other-judge")
+    files[1].unlink()
+    write_consistency(dirs[1], g, {"x": [occ(1, 0, "甲", "甲", True, True)]}, model="openai/another-judge")
+    cases.append(("another judge model", dirs, g, "another judge model ('openai/another-judge')", dirs[1]))
+
+    dirs, g, files = fresh("other-rules")
+    edit_json(files[1], lambda d: d.update(rules="OUTLINE §4.7 term consistency (v0.01)"))
+    cases.append(("other rules", dirs, g, "has another rules", dirs[1]))
+
+    dirs, g, files = fresh("other-glossary")
+    edit_json(files[0], lambda d: d.update(glossary_sha256="0" * 64))
+    cases.append(("another glossary", dirs, g, f"{files[0].name} was scored against another {A}.json", dirs[0]))
+
+    dirs, g, files = fresh("other-segments")
+    edit_json(files[1], lambda d: d.update(segments_sha256="0" * 64))
+    cases.append(("another segments.jsonl", dirs, g, f"{files[1].name} scored another segments.jsonl", dirs[1]))
+
+    dirs, g, files = fresh("other-eval-id")
+    edit_json(files[0], lambda d: d.update(eval_id="20260101T000000Z-baseline"))
+    cases.append(("another eval run", dirs, g, f"{files[0].name} is of eval run", dirs[0]))
+
+    dirs, g, files = fresh("two-files")
+    write_consistency(dirs[0], g, {"x": []}, model="another-judge")
+    cases.append(("two consistency files in one run", dirs, g, "more than one consistency file", dirs[0]))
+
+    dirs, g, files = fresh("bad-shape")
+    edit_json(files[0], lambda d: d.update(entries=[{"id": "x"}]))
+    cases.append(("a file of another shape", dirs, g, "not shaped as eval/consistency.py writes it", dirs[0]))
+
+    dirs, g, files = fresh("bad-status")
+    edit_json(files[0], lambda d: d["entries"][0]["segments"][0]["translation"].update(status="maybe"))
+    cases.append(("an unknown status", dirs, g, "unknown status 'maybe'", dirs[0]))
+
+    dirs, g, files = fresh("rendered-without-rendering")
+    edit_json(files[0], lambda d: d["entries"][0]["segments"][0]["reference"].update(normalised=None))
+    cases.append(("a rendered occurrence without its rendering", dirs, g, "without its normalised rendering", dirs[0]))
+
+    dirs, g, files = fresh("unchecked-but-correct")
+    edit_json(files[0], lambda d: d["entries"][0]["segments"][1]["extractor"].update(correct=True))
+    cases.append(("an extractor result where nothing was checked", dirs, g, "an extractor check", dirs[0]))
+
+    dirs, g, files = fresh("no-judge-model")
+    edit_json(files[0], lambda d: d["judge"].pop("model"))
+    cases.append(("a file without its judge model", dirs, g, "has no judge `model`", dirs[0]))
+    return cases
+
+
+def test_every_consistency_refusal_exits_2_names_the_directory_and_writes_nothing(cli, tmp_path, capsys):
+    cases = consistency_refusals(tmp_path)
+
+    for what, dirs, glossary_dir, expected, names in cases:
+        out_root = tmp_path / f"report-{abs(hash(what))}"
+        before = snapshot(*dirs, glossary_dir)
+
+        code = run_cli(cli, dirs, glossary_dir, out_root)
+
+        err = capsys.readouterr().err
+        assert code == 2, what
+        assert err.startswith("Nothing was written: ") and expected in err, (what, err)
+        assert str(names) in err, (what, err)
+        assert not out_root.exists() and snapshot(*dirs, glossary_dir) == before, what
+
+
+def test_the_consistency_names_the_report_repeats_are_the_scorers():
+    from fukidashi.evaluation import consistency
+
+    spec = importlib.util.spec_from_file_location("consistency_script_for_the_report_test",
+                                                  config.ROOT / "eval" / "consistency.py")
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+
+    assert report.CONSISTENCY_TEXTS == consistency.TEXTS and report.CONSISTENCY_STATUSES == consistency.STATUSES
+    assert report.CONSISTENCY_MIN_RENDERED == consistency.MIN_RENDERED
+    assert report.CONSISTENCY_REPORTABLE_PERCENT == consistency.REPORTABLE_PERCENT
+    import fnmatch
+    assert fnmatch.fnmatch(script.output_name("openai/gpt-4o-mini-2024-07-18"), report.CONSISTENCY_GLOB)
+    assert not fnmatch.fnmatch(script.output_name("openai/gpt-4o-mini-2024-07-18") + ".tmp", report.CONSISTENCY_GLOB)
+
+
+def test_the_report_pools_one_run_as_the_scorer_does(tmp_path, monkeypatch):
+    """eval/consistency.py on a run of the report's fixtures, with a scripted judge: the report over that one run gives
+    the scorer's own pooled numbers."""
+    import os
+    import re
+
+    import httpx
+
+    glossary_dir = tmp_path / "glossaries"
+    glossary_dir.mkdir()
+    write_json(glossary_dir / f"{A}.json", {
+        "book_title": A, "split": "dev", "opencc_config": "t2s", "drafted_by": "test", "reviewed_by_author": None,
+        "entries": [  # make_eval's Japanese text is 日<page>-<idx>
+            {"id": "zero", "category": "term", "source": "-0", "target": "龙", "borderline": False},
+            {"id": "two", "category": "character", "source": "日2", "target": "希奥拉", "target_variants": ["西奥拉"],
+             "borderline": False},
+            {"id": "one", "category": "term", "source": "-1", "target": "好", "borderline": True}]})
+    pages = [page(1, segments=[("龙来了", "龙来了"), ("好", "好")]),
+             page(2, segments=[("希奥拉龙", "希奥拉的龙"), ("西奥拉", "希奥拉")]), page(3, segments=[("飞龙", "龙")])]
+    run_dir = make_eval(tmp_path, "full", A, pages, glossary_dir=glossary_dir)
+    known = {"-0": ("龙",), "日2": ("希奥拉", "西奥拉")}
+
+    def judge(request):
+        content = json.loads(request.content)["messages"][1]["content"]
+        text, form = re.findall(r"```(.*?)```", content, re.S)[1], re.search(r"「(.*?)」", content).group(1)
+        found = next((k for k in known[form] if k in text), None)
+        answer = {"status": "rendered", "rendering": found} if found else {"status": "omitted"}
+        return httpx.Response(200, json={"id": "c", "object": "chat.completion", "created": 0, "model": "judge-1",
+                                         "choices": [{"index": 0, "finish_reason": "stop", "message": {
+                                             "role": "assistant", "content": json.dumps(answer, ensure_ascii=False)}}],
+                                         "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}})
+
+    for name in list(os.environ):
+        if name.startswith(("LLM_", "JUDGE")):
+            monkeypatch.delenv(name)
+    for name, value in {"JUDGE_BASE_URL": "http://judge.test/v1", "JUDGE_API_KEY": "k", "JUDGE_MODEL": "judge"}.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(config, "JUDGE_LEDGER_PATH", tmp_path / "judge_usage.jsonl")
+    spec = importlib.util.spec_from_file_location("consistency_script_for_agreement", config.ROOT / "eval" / "consistency.py")
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    monkeypatch.setattr(script, "load_dotenv", lambda path: None)
+    assert script.main([str(run_dir), "--glossary-dir", str(glossary_dir)],
+                       http_client=httpx.Client(transport=httpx.MockTransport(judge))) == 0
+    scored = read_json(run_dir / "consistency-judge.json")
+
+    pooled = report.build_report([run_dir], glossary_dir)["pooled"]["full"]["consistency"]
+
+    assert pooled["translation"] == scored["pooled"]["translation"] == {
+        "entries": 2, "rendered": 5, "most_common_count": 4, "consistency": 0.8}  # zero 3 of 3, two 1 of 2
+    assert pooled["reference"] == scored["pooled"]["reference"]
+    assert pooled["statuses"] == scored["statuses"]
+    assert pooled["extractor"] == {k: v for k, v in scored["extractor"].items() if k != "threshold"}
