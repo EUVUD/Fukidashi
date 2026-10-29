@@ -166,6 +166,17 @@ def _rows(directory: Path, scores: dict) -> tuple[dict[int, dict], dict[int, dic
         for key in ROW_KEYS:
             if key not in row:
                 raise Refused(f"{directory}: the row of page {page_index} in scores.json has no `{key}`")
+        if not _is_int(row["unknown_usage_calls"]):
+            raise Refused(f"{directory}: the row of page {page_index} in scores.json has an `unknown_usage_calls` "
+                          "that is not an integer")
+        if not _is_finite(row["latency_s"]):
+            raise Refused(f"{directory}: the row of page {page_index} in scores.json has a `latency_s` "
+                          "that is not a finite number")
+    # a cost is a finite number, or null for "unknown"; NaN or Infinity would reach report.json, which cannot hold them
+    for page_index, row in [*found["pages"].items(), *found["failed_pages"].items()]:
+        if row.get("cost_usd") is not None and not _is_finite(row["cost_usd"]):
+            raise Refused(f"{directory}: the row of page {page_index} in scores.json has a `cost_usd` "
+                          "that is neither a finite number nor null")
     return found["pages"], found["failed_pages"]
 
 
@@ -215,7 +226,7 @@ def _comet_scores(directory: Path, comet: dict) -> dict[tuple[str, int, int], fl
         if not isinstance(entry, dict) or not all(k in entry for k in ("book", "page_index", "idx", "score")):
             raise Refused(f"{directory}: segment {number} of {COMET_FILE} has no book, page_index, idx and score")
         score = entry["score"]
-        if not isinstance(score, (int, float)) or isinstance(score, bool) or not math.isfinite(score):
+        if not _is_finite(score):
             raise Refused(f"{directory}: segment {number} of {COMET_FILE} has a score that is not a finite number")
         key = (entry["book"], entry["page_index"], entry["idx"])
         if key in scores:
@@ -235,6 +246,10 @@ def _term_entries(directory: Path, terms: dict) -> list[tuple[str, bool, list[tu
 
 def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_finite(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 # --- the set of runs --------------------------------------------------------------------------------------------------
@@ -519,7 +534,7 @@ def write_report(report: dict, out_root: Path) -> Path:
 
 # --- the printed summary -----------------------------------------------------------------------------------------------
 
-LABEL_WIDTH, CELL_WIDTH = 40, 16
+LABEL_WIDTH, CELL_WIDTH = 40, 14  # CELL_WIDTH: the least width of a column's cells
 
 
 def _num(value: float | None, spec: str) -> str:
@@ -534,8 +549,18 @@ def _usd(value: float | None) -> str:
     return "n/a" if value is None else f"${value:.6f}"
 
 
-def _row(label: str, cells: Sequence[str]) -> str:
-    return f"{label:<{LABEL_WIDTH}}" + "".join(f"{cell:>{CELL_WIDTH}}" for cell in cells)
+def _row(label: str, cells: Sequence[str]) -> tuple[str, list[str]]:
+    """A table row; `_layout` pads the cells of all rows to one width, once the widest is known."""
+    return label, list(cells)
+
+
+def _layout(lines: Sequence[str | tuple[str, list[str]]]) -> str:
+    """The summary's text. Cells are right-aligned in columns as wide as the widest cell plus two spaces, so that no
+    cell, however long (`n/a (16 unknown)`), touches the one before it."""
+    width = max([len(cell) for line in lines if isinstance(line, tuple) for cell in line[1]] + [CELL_WIDTH]) + 2
+    return "\n".join(line if isinstance(line, str)
+                     else f"{line[0]:<{LABEL_WIDTH}}" + "".join(f"{cell:>{width}}" for cell in line[1])
+                     for line in lines)
 
 
 def _term_cell(score: dict) -> str:
@@ -621,4 +646,4 @@ def render(report: dict) -> str:
         lines += ["", "warnings:", *(f"  {w}" for w in report["warnings"])]
     else:
         lines += ["", "warnings: none"]
-    return "\n".join(lines)
+    return _layout(lines)
