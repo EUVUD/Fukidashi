@@ -26,6 +26,12 @@ repository (MIT; LICENSE lists the files that are not), is licensed under CC BY-
   error level for ...") and dropped, so an answer in another format scores 0, as if it had no error. Here such an
   answer is unreadable (`Unreadable`), and so is an empty one. The scorer retries it once and then marks the segment
   failed (unknown, not 0), where GEMBA would resend it at a higher temperature.
+- **No-error answers without headings.** The one exception to the rule above: an answer whose first non-empty line is
+  a no-error line (one the parser skips, below) and that has no severity heading line anywhere has no error and scores
+  0, and its other lines are ignored, as GEMBA ignores them. GPT-5.1 answers a correct translation this way: a
+  `No-error:` line, then lines that explain it. Any other answer is read as the rule above says: one with a severity
+  heading keeps the heading rule (a line before the first heading is still unreadable), and one that neither starts
+  with a no-error line nor has a heading is still unreadable.
 - **Errors.** Each error keeps its severity, its class (GEMBA's `parse_error_class`, read from the text before the span,
   so a span that happens to contain a class's name does not change it) and the span in quotes. GEMBA keeps the
   lower-cased line.
@@ -227,17 +233,27 @@ def _split(line: str) -> tuple[str, str | None]:
     return label, span
 
 
+def _says_no_error(lowered: str) -> bool:
+    """A line GEMBA's parser skips, as it skips an empty one: it mentions "no-error" or "no error"."""
+    return "no-error" in lowered or "no error" in lowered
+
+
 def parse_answer(answer: str) -> tuple[MQMError, ...]:
     """The errors of one answer in GEMBA's text format, in the answer's order. Raises Unreadable for an empty answer
-    and for a line GEMBA's parser would drop because no severity heading comes before it."""
+    and for a line GEMBA's parser would drop because no severity heading comes before it, except in an answer whose
+    first non-empty line says no error and that has no severity heading at all: that answer has no error."""
     if not answer.strip():
         raise Unreadable("the answer is empty")
+    lowered_lines = [raw.strip().lower() for raw in answer.split("\n")]
+    first = next(line for line in lowered_lines if line)
+    if _says_no_error(first) and not any(line in _HEADINGS for line in lowered_lines):
+        return ()  # GEMBA drops every line of an answer without a heading: no error
     level: str | None = None
     errors: list[MQMError] = []
     for number, raw in enumerate(answer.split("\n"), start=1):
         line = raw.strip()
         lowered = line.lower()
-        if "no-error" in lowered or "no error" in lowered or not line:
+        if _says_no_error(lowered) or not line:
             continue
         if lowered in _HEADINGS:
             level = _HEADINGS[lowered]
