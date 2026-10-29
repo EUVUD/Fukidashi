@@ -1,0 +1,30 @@
+{
+  "book_title": "tencho_isoro",
+  "split": "test",
+  "opencc_config": "t2s",
+  "drafted_by": "Claude (an AI coding assistant, not the translation model), 2026-10-29, from text_ja and the OpenCC t2s-converted text_zh of annotation.json only, before any page of the book was translated; no stored Runs, Translations, eval outputs or KBs of any book were opened",
+  "reviewed_by_author": "2026-10-29",
+  "entries": [
+    {"id": "mel", "category": "character", "source": "メル", "target": "梅尔", "note": "The boy the manager takes in as a live-in helper, one of the two leads.", "borderline": false},
+    {"id": "tencho", "category": "character", "source": "店長", "source_aliases": ["てんちょ"], "target": "店长", "note": "The shop manager, the other lead: never named, always called by his title.", "borderline": false},
+    {"id": "frog", "category": "term", "source": "カエル", "target": "青蛙", "note": "Mel's motif: the alarm clock, the apron, the hat and the ornament. Close call: an everyday word, kept as a recurring motif; the reference renders it one way throughout.", "borderline": false},
+    {"id": "alarm-clock", "category": "term", "source": "目覚まし時計", "target": "闹钟", "note": "Mel's alarm clock, one of the few things he owns.", "borderline": false},
+    {"id": "peeler", "category": "term", "source": "ピーラー", "target": "削皮刀", "note": "What Mel asks for when they go shopping.", "borderline": false},
+    {"id": "cat-paw", "category": "term", "source": "猫の手", "source_aliases": ["ねこのて"], "target": "猫手", "note": "The knife grip the manager teaches Mel. Occurs on one page only.", "borderline": false},
+    {"id": "ornament", "category": "term", "source": "置物", "target": "摆件", "note": "The frog ornament bought for the shop. Occurs on one page only.", "borderline": false},
+    {"id": "umbrella", "category": "term", "source": "傘", "target": "伞", "note": "Borderline: an ordinary word, kept as a plot noun (the umbrella they share at the end).", "borderline": true},
+    {"id": "vegetable", "category": "term", "source": "野菜", "target": "蔬菜", "note": "Borderline: an ordinary word, kept as a plot noun (what Mel learns to peel and cut).", "borderline": true},
+    {"id": "peeling", "category": "term", "source": "皮むき", "target": "削皮", "note": "Borderline: an ordinary word, kept as the job Mel takes on.", "borderline": true},
+    {"id": "clothes", "category": "term", "source": "服", "target": "衣服", "note": "Borderline: an ordinary word, kept as a plot noun (the clothes they buy for Mel).", "borderline": true},
+    {"id": "fire", "category": "term", "source": "火事", "target": "火灾", "note": "Borderline: an ordinary word, kept as the event that left Mel without work or a home.", "borderline": true},
+    {"id": "help", "category": "term", "source": "手伝い", "source_aliases": ["手伝え"], "target": "帮忙", "note": "Borderline: an ordinary word, kept as a plot noun (Mel's work in the shop).", "borderline": true},
+    {"id": "medicine", "category": "term", "source": "薬", "source_aliases": ["おくすり"], "target": "药", "note": "Borderline: an ordinary word; what Mel asks for when he first walks into the shop.", "borderline": true},
+    {"id": "hat", "category": "term", "source": "帽子", "source_aliases": ["ぼうし"], "target": "帽子", "note": "Borderline: an ordinary word, kept as a plot noun (Mel's frog hat).", "borderline": true},
+    {"id": "grandma", "category": "term", "source": "おばあちゃん", "target": "奶奶", "note": "Borderline: an ordinary word, kept as a plot noun (a customer, unnamed).", "borderline": true},
+    {"id": "kitchen-knife", "category": "term", "source": "包丁", "target": "菜刀", "note": "Borderline: an ordinary word, kept as a plot noun (what Mel is bad at using).", "borderline": true},
+    {"id": "stomach", "category": "term", "source": "腹", "target": "肚子", "note": "Borderline: an ordinary word, kept as a plot noun (the stomach ache that brings Mel to the shop).", "borderline": true},
+    {"id": "cleaning", "category": "term", "source": "掃除", "target": "打扫", "note": "Borderline: an ordinary word, kept as Mel's first job.", "borderline": true},
+    {"id": "dinner", "category": "term", "source": "夕飯", "target": "晚饭", "note": "Borderline: an ordinary word, kept as a plot noun.", "borderline": true},
+    {"id": "money", "category": "term", "source": "お金", "source_aliases": ["お代"], "target": "钱", "note": "Borderline: an ordinary word, kept as a plot noun.", "borderline": true}
+  ]
+}
