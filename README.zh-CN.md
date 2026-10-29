@@ -19,7 +19,7 @@
 Fukidashi 按产品评测，不做研究型对照实验（细节见 [OUTLINE.md 第 4 节](OUTLINE.md#4-evaluation)）：
 
 - **主对比：** full system vs `baseline`（每页一次调用）。**KB ablation：** full system 开 / 关 Knowledge Base。
-- **Metric：** chrF / BLEU（sacreBLEU，附 signature）、COMET（`wmt22-comet-da`）、GEMBA-MQM（LLM-as-judge，先在约 30 个人工标注的 segment 上检查一致性）、对照 gold glossary 的 term accuracy、每页成本和 latency。
+- **Metric：** chrF / BLEU（sacreBLEU，附 signature）、COMET（`wmt22-comet-da`）、GEMBA-MQM（LLM-as-judge，judge 是 GPT-4o mini，先在约 30 个人工标注的 segment 上检查一致性）、对照 gold glossary 的 term accuracy 和 term consistency、每页成本和 latency。
 - **严谨性：** 按作品划分（2 部 dev、3 部 test），冻结前写好 eval protocol，test split 只跑一次，按页 paired bootstrap 95% CI。
 
 ## 工程上的几点
