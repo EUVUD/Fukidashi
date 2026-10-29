@@ -141,6 +141,47 @@ def test_an_answer_the_parser_cannot_place_is_unreadable(answer):
         mqm.parse_answer(answer)
 
 
+# GPT-5.1's shape for a correct translation: a no-error line, then lines that explain it, and no severity heading
+NO_ERROR_EXPLAINED = ("No-error:  \nThe translation conveys the meaning and the tone of the source. No accuracy, fluency, "
+                      "style, or terminology errors.")
+
+
+@pytest.mark.parametrize("answer", [
+    NO_ERROR_EXPLAINED,
+    "No-error:\n- The translation is accurate and fluent.\n- The register fits.",
+    "\n  \nNo-error:\nThe translation is accurate.",  # the first non-empty line counts
+    "No error.\nThe translation is accurate.",  # "no error" is a no-error line too
+    'No-error\naccuracy/mistranslation - "x"',  # a line that looks like an error, with no heading above it
+    'No-error:\nThe translation is not a non-translation.',  # no heading: GEMBA drops even this line
+    "No-error:\nMajor: none found",  # not a heading: a heading is a line of its own
+])
+def test_an_answer_that_starts_with_no_error_and_has_no_heading_has_no_error(answer):
+    assert mqm.parse_answer(answer) == ()
+    assert mqm.mqm_score(e.severity for e in mqm.parse_answer(answer)) == 0
+
+
+def test_a_no_error_first_line_does_not_excuse_an_answer_with_a_heading():
+    with pytest.raises(mqm.Unreadable, match="line 2 comes before any severity heading"):
+        mqm.parse_answer('No-error:\nThe translation is fine.\nMajor:\naccuracy/mistranslation - "x"\n')
+    with pytest.raises(mqm.Unreadable, match="line 2 comes before any severity heading"):
+        mqm.parse_answer("No-error:\nThe translation is fine.\nminor:\n")  # an empty section is still a heading
+
+    errors = mqm.parse_answer('No-error\nMajor:\naccuracy/mistranslation - "x"\n')  # read under its heading, as before
+
+    assert [(e.severity, e.category, e.span) for e in errors] == [("major", "accuracy-mistranslation", "x")]
+
+
+@pytest.mark.parametrize("answer", [
+    "The translation is accurate.\nNo-error",  # the no-error line is not the first
+    "The translation is accurate.\n\nNo-error:\nNothing to fix.",
+    "Looks good.\nNothing to fix.",  # no no-error line at all
+    "", "\n\n", "   ",  # empty
+])
+def test_a_no_error_line_that_is_not_first_or_none_at_all_is_still_unreadable(answer):
+    with pytest.raises(mqm.Unreadable):
+        mqm.parse_answer(answer)
+
+
 def test_an_unknown_severity_cannot_be_scored():
     with pytest.raises(ValueError):
         mqm.mqm_score(["serious"])
@@ -358,6 +399,17 @@ def test_a_retry_that_reads_scores_the_segment(cli, tmp_path):
     assert "cut off" in segment["problems"][0]
 
 
+def test_a_no_error_answer_without_headings_scores_zero_with_no_retry(cli, tmp_path):
+    run_dir = make_run(tmp_path, [line(1, 0, "おはよう", "早上好")])
+    judge = Judge(NO_ERROR_EXPLAINED)
+
+    assert run(cli, run_dir, judge) == 0
+
+    (segment,) = written(run_dir)["segments"]
+    assert (segment["status"], segment["score"], segment["errors"], segment["attempts"]) == ("scored", 0, [], 1)
+    assert len(judge.bodies) == 1
+
+
 def test_no_segment_scored_gives_no_system_score(cli, tmp_path):
     run_dir = make_run(tmp_path, [line(1, 0, "おはよう", "早上好")])
 
@@ -496,6 +548,199 @@ def test_the_script_runs_as_a_program_and_refuses_a_missing_directory(tmp_path):
                           capture_output=True, text=True, env={"PATH": "/usr/bin:/bin"}, timeout=60)
 
     assert done.returncode == 2 and "Cannot score" in done.stderr and "not a directory" in done.stderr
+
+
+# --- the re-parse (eval/mqm.py --reparse) ------------------------------------------------------------------------------
+
+real_parse_answer = mqm.parse_answer
+
+
+def parse_as_023(answer):
+    """The parser before the no-error rule: in an answer without a severity heading, every line that is neither empty
+    nor a no-error line is unreadable. With a heading, the two parsers are the same."""
+    lowered = [l.strip().lower() for l in answer.split("\n")]
+    if not answer.strip() or any(l in mqm._HEADINGS for l in lowered):
+        return real_parse_answer(answer)
+    for number, l in enumerate(lowered, start=1):
+        if l and not mqm._says_no_error(l):
+            raise mqm.Unreadable(f"line {number} comes before any severity heading: {l!r}")
+    return ()
+
+
+REPARSE_LINES = [line(1, 0, "おはよう", "早上好"), line(1, 1, "", "……"), line(2, 0, "行くぞ 今だ", "走吧 就是现在"),
+                 line(2, 1, "ありがとう", "谢谢"), line(3, 0, "はい", "是"), line(3, 1, "いいえ", "不"),
+                 line(4, 0, "さあ", "来吧")]
+# (1,0) failed under 023 with GPT-5.1's no-error shape; (1,1) skipped; (2,0) scored; (2,1) unreadable both times;
+# (3,0) cut off both times; (3,1) unreadable, then cut off; (4,0) cut off, then the no-error shape
+
+
+def reparse_answers():
+    cut = lambda: reply(NO_ERROR_EXPLAINED, finish="length")  # noqa: E731
+    return [NO_ERROR_EXPLAINED, NO_ERROR_EXPLAINED, MIXED, "Looks fine to me.", "Still fine.", cut(), cut(),
+            "Looks fine.", cut(), cut(), NO_ERROR_EXPLAINED]
+
+
+NOW_SCORED = [(1, 0), (4, 0)]
+
+
+@pytest.fixture
+def scored_by_023(cli, tmp_path, monkeypatch):
+    """A run scored when the parser was 023's: (run directory, its MQM file, the file's bytes)."""
+    run_dir = make_run(tmp_path, REPARSE_LINES)
+    with monkeypatch.context() as m:
+        m.setattr(mqm, "parse_answer", parse_as_023)
+        assert run(cli, run_dir, Judge(*reparse_answers())) == 0
+    doc = written(run_dir)
+    assert [(s["page_index"], s["idx"]) for s in doc["segments"] if s["status"] == "failed"] == [
+        (1, 0), (2, 1), (3, 0), (3, 1), (4, 0)]
+    return run_dir, run_dir / OUT, (run_dir / OUT).read_bytes()
+
+
+@pytest.fixture
+def offline(cli, scored_by_023, monkeypatch):
+    """eval/mqm.py once the run is scored: from now on nothing may read .env or make a client."""
+    def refuse(*args, **kwargs):
+        raise AssertionError("the re-parse reached for the judge")
+
+    monkeypatch.setattr(cli, "load_dotenv", refuse)
+    monkeypatch.setattr(mqm_scorer, "make_client", refuse)
+    monkeypatch.setattr(mqm_scorer, "LLMClient", refuse)
+    return cli
+
+
+def test_the_reparse_scores_only_failed_segments_the_parser_could_not_read(offline, scored_by_023, tmp_path, monkeypatch,
+                                                                           capsys):
+    run_dir, path, old_bytes = scored_by_023
+    old = json.loads(old_bytes)
+    calls_before = len(ledger(config.JUDGE_LEDGER_PATH))
+    replaced = []
+    real_replace = os.replace
+    monkeypatch.setattr(os, "replace", lambda src, dst: replaced.append((src, dst)) or real_replace(src, dst))
+
+    assert offline.main(["--reparse", str(path)]) == 0
+
+    new = written(run_dir)
+    for before, after in zip(old["segments"], new["segments"], strict=True):
+        if (before["page_index"], before["idx"]) in NOW_SCORED:
+            assert after == {**before, "status": "scored", "errors": [], "score": 0}  # attempts, answer, problems kept
+        else:
+            assert after == before  # scored, skipped, cut off, and unreadable by the current parser too
+    assert (new["scored"], new["failed"]["count"]) == (old["scored"] + 2, old["failed"]["count"] - 2)
+    assert [(s["page_index"], s["idx"]) for s in new["failed"]["segments"]] == [(2, 1), (3, 0), (3, 1)]
+    assert new["system_score"] == pytest.approx(-2.0)  # (0 - 6 + 0) / 3; it was -6 over one scored segment
+    assert new["breakdown"] == {"segments": {"scored": 3, "failed": 3}, **mqm.breakdown(
+        [(), mqm.parse_answer(MIXED), ()])}
+    assert list(new) == [*old, "reparsed"]  # every other field, the spend and scored_at among them, is as it was
+    assert {k: v for k, v in new.items() if k not in ("scored", "failed", "system_score", "breakdown", "segments",
+                                                      "reparsed")} == \
+           {k: v for k, v in old.items() if k not in ("scored", "failed", "system_score", "breakdown", "segments")}
+    (record,) = new["reparsed"]
+    assert record["at"].endswith("+00:00") and set(record) == {"at", "commit", "dirty", "parser", "segments",
+                                                               "still_failed", "not_reread"}
+    assert record["commit"] is None or len(record["commit"]) == 40
+    assert [(s["page_index"], s["idx"], s["score"]) for s in record["segments"]] == [(1, 0, 0), (4, 0, 0)]
+    assert [(s["page_index"], s["idx"]) for s in record["still_failed"]] == [(2, 1)]
+    assert [(s["page_index"], s["idx"]) for s in record["not_reread"]] == [(3, 0), (3, 1)]
+    ((src, dst),) = replaced
+    assert os.path.basename(src) == OUT + ".tmp" and os.path.basename(dst) == OUT
+    assert len(ledger(config.JUDGE_LEDGER_PATH)) == calls_before and not config.LEDGER_PATH.exists()
+    out = capsys.readouterr().out
+    assert "book_a/1 idx 0: failed -> scored, score 0" in out and "book_a/2 idx 1: still failed" in out
+
+
+def test_the_reparsed_totals_are_those_of_scoring_with_the_current_parser(scored_by_023, cli, tmp_path):
+    run_dir, path, _ = scored_by_023
+    fresh_dir = make_run(tmp_path, REPARSE_LINES, name="fresh")
+    assert run(cli, fresh_dir, Judge(*reparse_answers()[1:])) == 0  # (1,0) is read on its first attempt now
+
+    assert cli.main(["--reparse", str(path)]) == 0
+
+    reparsed, fresh = written(run_dir), written(fresh_dir)
+    for key in ("scored", "failed", "system_score", "breakdown"):
+        assert reparsed[key] == fresh[key], key
+
+
+def test_a_dry_run_says_what_would_change_and_writes_nothing(offline, scored_by_023, capsys):
+    run_dir, path, old_bytes = scored_by_023
+
+    assert offline.main(["--reparse", str(path), "--dry-run"]) == 0
+
+    assert path.read_bytes() == old_bytes and sorted(p.name for p in run_dir.iterdir()) == [
+        "manifest.json", OUT, "segments.jsonl"]
+    out = capsys.readouterr().out
+    assert "2 failed segment(s) read again (dry run, nothing written)" in out
+    assert "book_a/4 idx 0: failed -> scored, score 0 (0 error(s))" in out
+    assert "scored 1 -> 3, failed 5 -> 3, system score -6.000 -> -2.000" in out
+
+
+def test_a_file_with_nothing_to_reparse_is_left_as_it_is(offline, scored_by_023, capsys):
+    run_dir, path, _ = scored_by_023
+    assert offline.main(["--reparse", str(path)]) == 0
+    once = path.read_bytes()
+
+    assert offline.main(["--reparse", str(path)]) == 0
+
+    assert path.read_bytes() == once and "Nothing to change" in capsys.readouterr().out
+
+
+def test_the_reparse_refuses_a_file_that_is_not_its_runs(offline, scored_by_023, capsys):
+    run_dir, path, old_bytes = scored_by_023
+
+    def tamper(change):
+        def apply():
+            doc = json.loads(old_bytes)
+            change(doc)
+            path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+        return apply
+
+    def other_segments():
+        (run_dir / "segments.jsonl").write_text(
+            "".join(json.dumps(l, ensure_ascii=False) + "\n" for l in REPARSE_LINES[:-1]), encoding="utf-8")
+
+    cases = [
+        ("another segments.jsonl", other_segments, "segments_sha256"),
+        ("another eval id", tamper(lambda d: d.update(eval_id="other")), "eval run 'other'"),
+        ("totals that are not its segments'", tamper(lambda d: d.update(system_score=-1.0)), "not its segments' totals"),
+        ("another template", tamper(lambda d: d["gemba"].update(template_sha256="0" * 64)), "prompt template"),
+        ("other weights", tamper(lambda d: d.update(weights={"critical": 10, "major": 5, "minor": 1})), "weights"),
+        ("another judge's name", tamper(lambda d: d["judge"].update(model="someone-else")), "judge model"),
+        ("not JSON", lambda: path.write_text("{", encoding="utf-8"), "not valid JSON"),
+    ]
+    segments_bytes = (run_dir / "segments.jsonl").read_bytes()
+    for what, setup, message in cases:
+        path.write_bytes(old_bytes)
+        (run_dir / "segments.jsonl").write_bytes(segments_bytes)
+        setup()
+        before = path.read_bytes()
+
+        assert offline.main(["--reparse", str(path)]) == 2, what
+
+        assert message in capsys.readouterr().err, what
+        assert path.read_bytes() == before and not (run_dir / (OUT + ".tmp")).exists(), what
+
+
+@pytest.mark.parametrize("change, rereadable", [
+    ({}, True),
+    ({"problems": ["attempt 1: the answer is empty", "attempt 2: the answer is empty"]}, True),
+    ({"problems": ["attempt 1: line 2 comes before any severity heading: 'x'"]}, False),  # not the last attempt's
+    ({"problems": ["attempt 1: x", "attempt 2: the answer was cut off (finish_reason 'length')"]}, False),
+    ({"problems": []}, False), ({"answer": None}, False), ({"status": "scored"}, False), ({"status": "skipped"}, False),
+])
+def test_only_a_failed_segment_whose_last_answer_the_parser_could_not_read_is_read_again(cli, change, rereadable):
+    segment = {"book": BOOK, "page_index": 1, "idx": 0, "run_id": 7, "status": "failed", "errors": [], "score": None,
+               "answer": NO_ERROR_EXPLAINED, "attempts": 2,
+               "problems": ["attempt 1: line 2 comes before any severity heading: 'x'",
+                            "attempt 2: line 2 comes before any severity heading: 'y'"]}
+
+    assert cli.rereadable({**segment, **change}) is rereadable
+
+
+@pytest.mark.parametrize("args", [[], ["run-dir", "--reparse", "mqm-x.json"], ["run-dir", "--dry-run"],
+                                  ["--reparse", "mqm-x.json", "--judge-prefix", "JUDGE2"]])
+def test_the_reparse_options_go_together_only_one_way(offline, args):
+    with pytest.raises(SystemExit) as stopped:
+        offline.main(args)
+    assert stopped.value.code == 2
 
 
 # --- boundaries ------------------------------------------------------------------------------------------------------
