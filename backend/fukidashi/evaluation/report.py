@@ -15,6 +15,13 @@ tests can import it.
   and occurrences; its mean over entries is taken over every entry, of any book, that has an occurrence.
 - **Unknown is not 0.** A field an older run's files do not have (`fell_back` before the `translator` config,
   `kb_reach` before #40) and a cost that `cost_summary` cannot total are `None`, here and in report.json.
+- **Term consistency is optional, but all or none** (OUTLINE 4.7). When every run has a `consistency-<judge model>.json`
+  (eval/consistency.py) from the same judge model and rules, each config gets a `consistency` section: the Translations'
+  consistency (the sums of the most common renderings' counts over the sums of the rendered occurrences, of the entries
+  with 2 or more rendered occurrences on the common pages, both books together), the reference's, the extractor's
+  accuracy and whether consistency is reportable, and the occurrences by status. report.json then also says that term
+  accuracy is the KB ablation's primary metric and consistency its secondary one (OUTLINE 4.3, 8). When no run has
+  such a file the report is what it was before; when only some have one, the report refuses.
 - **Warnings, not refusals,** for provenance: a dirty tree, runs from different commits, different models.
   Everything that would make the numbers wrong is a refusal (`Refused`).
 """
@@ -25,6 +32,7 @@ import hashlib
 import json
 import math
 import os
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -51,10 +59,43 @@ LOOKUP_TOOLS = ("lookup_term", "lookup_character")
 LOOKUP_COUNTS = ("calls", "found", "not_found")
 ROW_KEYS = ("cost_usd", "unknown_usage_calls", "latency_s")  # every scored page row must have these
 SEGMENT_FIELDS = (("book", str), ("page_index", int), ("idx", int), ("hyp", str), ("ref_zh_hans", str))
+# Term consistency (eval/consistency.py). These repeat evaluation/consistency.py's rules, which this module does not
+# import either; a test pins each to its source, and another checks that the report and the scorer pool one run alike.
+CONSISTENCY_GLOB = "consistency-*.json"
+CONSISTENCY_TEXTS = ("translation", "reference")
+CONSISTENCY_STATUSES = ("rendered", "omitted", "not_this_term", "invalid")
+CONSISTENCY_MIN_RENDERED = 2  # an entry counts in the pooled consistency with this many rendered occurrences
+CONSISTENCY_REPORTABLE_PERCENT = 90  # the extractor's accuracy at which consistency is a result
+KB_ABLATION = {"comparison": "full vs full_no_kb", "primary_metric": "term accuracy (terms.primary)",
+               "secondary_metric": "term consistency (consistency.translation)"}  # OUTLINE 4.3, 8
 
 
 class Refused(Exception):
     """The runs cannot be pooled; the message names the directory and the cause. Nothing has been written."""
+
+
+@dataclass(frozen=True)
+class ConsistencyOccurrence:
+    """One occurrence of a consistency file, as far as the report pools it."""
+
+    page_index: int
+    statuses: dict[str, str]  # by text (translation, reference)
+    renderings: dict[str, str | None]  # by text: the normalised rendering of a `rendered` occurrence
+    checked: bool  # the reference holds the target or a variant: the extractor's answer is known
+    correct: bool  # the reference's extraction is correct (False where it is not checked)
+
+
+@dataclass(frozen=True)
+class Consistency:
+    """A run's consistency-<model>.json: its name, the file without its entries, and each entry's occurrences."""
+
+    name: str
+    document: dict
+    entries: list[tuple[str, list[ConsistencyOccurrence]]]  # (entry id, its occurrences)
+
+    @property
+    def judge_model(self) -> Any:
+        return self.document["judge"]["model"]
 
 
 @dataclass(frozen=True)
@@ -74,6 +115,7 @@ class Run:
     comet: dict  # the COMET file without its segments
     comet_scores: dict[tuple[str, int, int], float]  # (book, page_index, idx) -> score
     terms: dict  # terms.json without its entries
+    consistency: Consistency | None = None  # the run's consistency file, if it has one
 
 
 # --- reading one run --------------------------------------------------------------------------------------------------
@@ -122,9 +164,11 @@ def load_run(directory: Path, glossary_dir: Path) -> Run:
     glossary_path = glossary_dir / f"{book}.json"
     if not glossary_path.is_file():
         raise Refused(f"{directory}: there is no glossary for book {book!r} at {glossary_path}")
-    if terms.get("glossary_sha256") != file_sha256(glossary_path):
+    glossary_sha256 = file_sha256(glossary_path)
+    if terms.get("glossary_sha256") != glossary_sha256:
         raise Refused(f"{directory}: terms.json was scored against another {glossary_path.name} than the one there "
                       "now (its glossary_sha256 differs): score the run again with eval/terms.py")
+    consistency = _consistency_file(directory, eval_id, book, segments_sha256, glossary_path.name, glossary_sha256)
 
     for page_index, status in sorted(statuses.items()):
         if status != "scored":
@@ -140,7 +184,7 @@ def load_run(directory: Path, glossary_dir: Path) -> Run:
                           f"idx {s['idx']}")
     return Run(directory, manifest, eval_id, config, book, statuses, rows, failed, segments,
                _term_entries(directory, terms), {k: v for k, v in comet.items() if k != "segments"}, comet_scores,
-               {k: v for k, v in terms.items() if k != "entries"})
+               {k: v for k, v in terms.items() if k != "entries"}, consistency)
 
 
 def _statuses(directory: Path, manifest: dict) -> dict[int, str]:
@@ -244,6 +288,58 @@ def _term_entries(directory: Path, terms: dict) -> list[tuple[str, bool, list[tu
         raise Refused(f"{directory}: terms.json is not shaped as eval/terms.py writes it ({type(e).__name__}: {e})")
 
 
+def _consistency_file(directory: Path, eval_id: str, book: str, segments_sha256: str, glossary_name: str,
+                      glossary_sha256: str) -> Consistency | None:
+    """The run's consistency file, checked against the run; None when it has none."""
+    found = sorted(p.name for p in directory.glob(CONSISTENCY_GLOB) if p.is_file())
+    if not found:
+        return None
+    if len(found) > 1:
+        raise Refused(f"{directory}: it has more than one consistency file ({', '.join(found)}); the report pools one "
+                      "judge's renderings")
+    name = found[0]
+    document = _json_file(directory, name)
+    if document.get("eval_id") != eval_id:
+        raise Refused(f"{directory}: {name} is of eval run {document.get('eval_id')!r}, the manifest's is {eval_id!r}")
+    if document.get("book") != book:
+        raise Refused(f"{directory}: {name} is of book {document.get('book')!r}, the run is of {book!r}")
+    if document.get("segments_sha256") != segments_sha256:
+        raise Refused(f"{directory}: {name} scored another segments.jsonl than the one there now (its segments_sha256 "
+                      "differs): score the run again with eval/consistency.py")
+    if document.get("glossary_sha256") != glossary_sha256:
+        raise Refused(f"{directory}: {name} was scored against another {glossary_name} than the one there now (its "
+                      "glossary_sha256 differs): score the run again with eval/consistency.py")
+    judge = document.get("judge")
+    if not isinstance(judge, dict) or not isinstance(judge.get("model"), str) or not judge["model"] \
+            or not isinstance(document.get("rules"), str):
+        raise Refused(f"{directory}: {name} has no judge `model` and `rules`")
+    return Consistency(name, {k: v for k, v in document.items() if k != "entries"},
+                       _consistency_entries(directory, name, document))
+
+
+def _consistency_entries(directory: Path, name: str, document: dict) -> list[tuple[str, list[ConsistencyOccurrence]]]:
+    def occurrence(segment: dict) -> ConsistencyOccurrence:
+        statuses, renderings = {}, {}
+        for which in CONSISTENCY_TEXTS:
+            status, rendering = segment[which]["status"], segment[which]["normalised"]
+            if status not in CONSISTENCY_STATUSES:
+                raise ValueError(f"unknown status {status!r}")
+            if status == "rendered" and not (isinstance(rendering, str) and rendering):
+                raise ValueError("a rendered occurrence without its normalised rendering")
+            statuses[which], renderings[which] = status, rendering if status == "rendered" else None
+        checked, correct = segment["extractor"]["checked"], segment["extractor"]["correct"]
+        if not isinstance(checked, bool) or (not isinstance(correct, bool) if checked else correct is not None):
+            raise ValueError("an extractor check that is not true or false where it is checked, and null elsewhere")
+        if not _is_int(segment["page_index"]):
+            raise ValueError("a page_index that is not an integer")
+        return ConsistencyOccurrence(segment["page_index"], statuses, renderings, checked, bool(correct))
+
+    try:
+        return [(entry["id"], [occurrence(s) for s in entry["segments"]]) for entry in document["entries"]]
+    except (KeyError, TypeError, ValueError) as e:
+        raise Refused(f"{directory}: {name} is not shaped as eval/consistency.py writes it ({type(e).__name__}: {e})")
+
+
 def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -269,6 +365,30 @@ def _check_set(runs: Sequence[Run]) -> None:
             f"{config} has {', '.join(sorted(books))} ("
             + ", ".join(str(r.directory) for r in runs if r.config == config) + ")"
             for config, books in sorted(covered.items(), key=lambda item: _config_order(item[0]))))
+
+
+def _check_consistency(runs: Sequence[Run]) -> dict | None:
+    """All or none: what every run's consistency file shares (judge model, rules), or None when no run has one."""
+    having = [r for r in runs if r.consistency is not None]
+    if not having:
+        return None
+    first = having[0]
+    for run in runs:
+        if run.consistency is None:
+            raise Refused(f"{run.directory}: it has no {CONSISTENCY_GLOB}, but {first.directory} has "
+                          f"{first.consistency.name}: the report pools term consistency for every run or for none "
+                          "(score this one with eval/consistency.py)")
+    for key, label in (("model", "judge model"), ("rules", "rules")):
+        def value(run: Run):
+            return run.consistency.judge_model if key == "model" else run.consistency.document["rules"]
+
+        for run in runs:
+            if value(run) != value(first):
+                raise Refused(f"{run.directory}: {run.consistency.name} has another {label} ({value(run)!r}) than "
+                              f"{first.directory} ({value(first)!r}): the report pools one judge's renderings under "
+                              "one set of rules")
+    return {"judge_model": first.consistency.judge_model, "rules": first.consistency.document["rules"],
+            "min_rendered": CONSISTENCY_MIN_RENDERED, "threshold": CONSISTENCY_REPORTABLE_PERCENT / 100}
 
 
 def _config_order(config: str) -> tuple[int, str]:
@@ -333,6 +453,8 @@ def _metrics(config: str, runs: Sequence[Run], common: dict[str, list[int]]) -> 
     if config == KB_CONFIG:
         metrics["curator"] = _curator(rows)
         metrics["kb_reach"] = _kb_reach(runs, wanted)
+    if all(r.consistency is not None for r in runs):  # all or none, which build_report has checked
+        metrics["consistency"] = _consistency(runs, wanted)
     return metrics
 
 
@@ -360,6 +482,37 @@ def _term_set(entries: Sequence[tuple[bool, int, int]]) -> dict:
         "hits": hits,
         "accuracy": hits / occurrences if occurrences else None,
         "mean_over_entries": sum(accuracies) / len(accuracies) if accuracies else None,
+    }
+
+
+def _consistency(runs: Sequence[Run], wanted: dict[str, set[int]]) -> dict:
+    """Term consistency over the common pages, pooled as eval/consistency.py pools one book: per entry and text, the
+    most common rendering's count over the rendered occurrences; the entries with CONSISTENCY_MIN_RENDERED or more
+    rendered occurrences are summed, over every book of `runs`. An entry's renderings are counted within its book."""
+    texts = {which: {"entries": 0, "rendered": 0, "most_common_count": 0} for which in CONSISTENCY_TEXTS}
+    statuses = {which: dict.fromkeys(CONSISTENCY_STATUSES, 0) for which in CONSISTENCY_TEXTS}
+    checked = correct = 0
+    for run in runs:
+        for _, occurrences in run.consistency.entries:
+            kept = [o for o in occurrences if o.page_index in wanted[run.book]]
+            for which in CONSISTENCY_TEXTS:
+                for o in kept:
+                    statuses[which][o.statuses[which]] += 1
+                renderings = Counter(o.renderings[which] for o in kept if o.statuses[which] == "rendered")
+                rendered = sum(renderings.values())
+                if rendered >= CONSISTENCY_MIN_RENDERED:
+                    texts[which]["entries"] += 1
+                    texts[which]["rendered"] += rendered
+                    texts[which]["most_common_count"] += max(renderings.values())
+            checked += sum(o.checked for o in kept)
+            correct += sum(o.checked and o.correct for o in kept)
+    for score in texts.values():
+        score["consistency"] = score["most_common_count"] / score["rendered"] if score["rendered"] else None
+    return {
+        **texts,
+        "statuses": statuses,
+        "extractor": {"checked": checked, "correct": correct, "accuracy": correct / checked if checked else None,
+                      "reportable": checked > 0 and correct * 100 >= checked * CONSISTENCY_REPORTABLE_PERCENT},
     }
 
 
@@ -437,6 +590,11 @@ def _wall_seconds(manifest: dict) -> float | None:
 
 def _provenance(run: Run) -> dict:
     m = run.manifest
+    consistency = {} if run.consistency is None else {"consistency": {
+        "file": run.consistency.name,
+        **{key: run.consistency.document.get(key) for key in ("rules", "glossary_sha256", "segments_sha256")},
+        **{key: run.consistency.document["judge"].get(key) for key in ("prefix", "model", "response_model")},
+        "usage": run.consistency.document.get("usage")}}
     return {
         "directory": str(run.directory),
         "eval_id": run.eval_id,
@@ -454,6 +612,7 @@ def _provenance(run: Run) -> dict:
                   for status in ("scored", "failed", "skipped", "pending")},
         "comet": {key: run.comet.get(key) for key in ("model", "model_revision", "versions", "device")},
         "terms": {key: run.terms.get(key) for key in ("rules", "glossary_sha256")},
+        **consistency,
     }
 
 
@@ -479,6 +638,11 @@ def _warnings(runs: Sequence[Run]) -> list[str]:
     if len({run.comet.get("model_revision") for run in runs}) > 1:
         warnings.append("the COMET scores come from different checkpoint revisions (or some do not say): " + ", ".join(
             f"{run.eval_id} {run.comet.get('model_revision')}" for run in runs))
+    responses = [(run, json.dumps(run.consistency.document["judge"].get("response_model")))
+                 for run in runs if run.consistency is not None]
+    if len({response for _, response in responses}) > 1:
+        warnings.append("the consistency files' judge responses came from different models (or some do not say): "
+                        + ", ".join(f"{run.eval_id} {response}" for run, response in responses))
     return warnings
 
 
@@ -488,11 +652,12 @@ def build_report(directories: Sequence[Path], glossary_dir: Path) -> dict:
     """The report of the eval runs in `directories` (what report.json holds). Raises `Refused`, having written nothing."""
     runs = [load_run(Path(d), glossary_dir) for d in directories]
     _check_set(runs)
+    consistency = _check_consistency(runs)
     runs.sort(key=lambda r: (_config_order(r.config), _book_order(r.book)))
     configs = list(dict.fromkeys(r.config for r in runs))
     common = _common_pages(runs)
     by_config = {config: [r for r in runs if r.config == config] for config in configs}
-    return {
+    report = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "configs": configs,
         "books": list(common),
@@ -505,6 +670,10 @@ def build_report(directories: Sequence[Path], glossary_dir: Path) -> dict:
         "runs": [_provenance(r) for r in runs],
         "warnings": _warnings(runs),
     }
+    if consistency is not None:  # without consistency files the report is what it was before
+        report["consistency"] = consistency
+        report["kb_ablation"] = dict(KB_ABLATION)
+    return report
 
 
 def write_report(report: dict, out_root: Path) -> Path:
@@ -576,6 +745,29 @@ def _cost_cell(cost: dict) -> str:
     return _usd(cost["per_page_usd"]) + unknown
 
 
+def _ratio_cell(score: dict) -> str:
+    return f"{_pct(score['consistency'])} ({score['most_common_count']}/{score['rendered']})"
+
+
+def _consistency_heading(report: dict) -> str:
+    c = report["consistency"]
+    return (f"term consistency, the KB ablation's secondary metric (term accuracy is its primary one); renderings by "
+            f"{c['judge_model']}, entries with {c['min_rendered']}+ rendered occurrences, reportable when the "
+            f"extractor is right on {c['threshold']:.0%} or more:")
+
+
+def _consistency_line(config: str, pooled: dict, by_book: dict[str, dict]) -> str:
+    """One config's consistency on one line: pooled and per book, the reference's, the extractor and the statuses."""
+    books = ", ".join(f"{book} {_ratio_cell(c['translation'])}" for book, c in by_book.items())
+    extractor = pooled["extractor"]
+    verdict = "reportable" if extractor["reportable"] else "for reference only"
+    statuses = "; ".join(f"{which} " + " ".join(f"{s} {n}" for s, n in pooled["statuses"][which].items())
+                         for which in CONSISTENCY_TEXTS)
+    return (f"  {config}: {_ratio_cell(pooled['translation'])} [{books}]; reference {_ratio_cell(pooled['reference'])};"
+            f" extractor {_pct(extractor['accuracy'])} ({extractor['correct']}/{extractor['checked']}), {verdict};"
+            f" {statuses}")
+
+
 def render(report: dict) -> str:
     configs, pooled = report["configs"], report["pooled"]
     common = report["common_pages"]
@@ -623,6 +815,11 @@ def render(report: dict) -> str:
     spend = report["spend"]
     lines.append(_row("spend, all runs", [_usd(spend[c]["total_usd"]) for c in configs]))
     lines.append(_row("  runs (failed)", [f"{spend[c]['runs']} ({spend[c]['failed_runs']})" for c in configs]))
+    if "consistency" in report:
+        lines += ["", _consistency_heading(report)]
+        lines += [_consistency_line(config, pooled[config]["consistency"],
+                                    {book: report["by_book"][book][config]["consistency"] for book in report["books"]})
+                  for config in configs]
 
     for book, by_config in report["by_book"].items():
         lines += ["", f"{book}  ({len(common[book])} common pages)", _row("", configs)]
