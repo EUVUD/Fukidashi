@@ -4,7 +4,7 @@
 
 多 agent 漫画翻译编辑器（日 → 简体中文）。在 [OpenMantra](https://github.com/mantra-inc/open-mantra-dataset) 数据集上，用标准的 MT evaluation framework 和单次调用的 baseline 做对比。
 
-> **现状（2026-10-28）：** M0、M1 和 M2 已完成。vertical slice 已经跑通：导入 OpenMantra，对一页做一次模型调用完成翻译，在浏览器里逐句对照图上的 box 检查译文。M2 新增了用 chrF / BLEU 给各个 config 打分的 eval harness；第一版 Translator Agent（即 `translator` config），它跑在调用工具的 agent loop 上，底下是带计量的 client；还有可选的 tracing，trace 发到本机的 Arize Phoenix（[记录](docs/m2.md)）。M3 加上了多 agent 系统（[记录](docs/m3.md)）：Reviewer Agent、把页面退回修改的 Orchestrator、每本书一个的 Knowledge Base（Curator Agent 是它唯一的写者）、`full` 和 `full_no_kb` 两个 config，以及两部 dev 作品的 gold glossary。下一步是 M4：在两部 dev 作品上给三个 config 打分。
+> **现状（2026-10-28）：** M0 到 M3 已完成。vertical slice 已经跑通：导入 OpenMantra，对一页做一次模型调用完成翻译，在浏览器里逐句对照图上的 box 检查译文。M2 新增了用 chrF / BLEU 给各个 config 打分的 eval harness；第一版 Translator Agent（即 `translator` config），它跑在调用工具的 agent loop 上，底下是带计量的 client；还有可选的 tracing，trace 发到本机的 Arize Phoenix（[记录](docs/m2.md)）。M3 加上了多 agent 系统（[记录](docs/m3.md)）：Reviewer Agent、把页面退回修改的 Orchestrator、每本书一个的 Knowledge Base（Curator Agent 是它唯一的写者）、`full` 和 `full_no_kb` 两个 config，以及两部 dev 作品的 gold glossary。M4 已经加上了按整本书跑的 eval、COMET 打分脚本、对照 gold glossary 的 term accuracy、KB 触达各页次数的统计，以及 GitHub Actions 上的 CI。下一步是第一次 dev 运行：在两部 dev 作品上跑三个 config。
 
 ## 它做什么
 
@@ -19,7 +19,7 @@
 Fukidashi 按产品评测，不做研究型对照实验（细节见 [OUTLINE.md 第 4 节](OUTLINE.md#4-evaluation)）：
 
 - **主对比：** full system vs `baseline`（每页一次调用）。**KB ablation：** full system 开 / 关 Knowledge Base。
-- **Metric：** chrF / BLEU（sacreBLEU，附 signature）、COMET / xCOMET、GEMBA-MQM（LLM-as-judge，先在约 30 个人工标注的 segment 上检查一致性）、对照 gold glossary 的 term accuracy、每页成本和 latency。
+- **Metric：** chrF / BLEU（sacreBLEU，附 signature）、COMET（`wmt22-comet-da`）、GEMBA-MQM（LLM-as-judge，先在约 30 个人工标注的 segment 上检查一致性）、对照 gold glossary 的 term accuracy、每页成本和 latency。
 - **严谨性：** 按作品划分（2 部 dev、3 部 test），冻结前写好 eval protocol，test split 只跑一次，按页 paired bootstrap 95% CI。
 
 ## 工程上的几点
@@ -58,7 +58,16 @@ uv run python eval/run.py --config full_no_kb --book tojime_no_siora --pages 2,3
 uv run python eval/run.py --config full --book tojime_no_siora --pages 2,3,4         # 再加上 Knowledge Base 和 Curator
 ```
 
-Eval harness（评测执行器）走和编辑器相同的代码路径翻译这几页（每页在 SQLite 里留下一个 Run），用 OpenCC（`t2s`）把 zh-Hant 参考译文转成 zh-Hans，然后打印 chrF 和 BLEU 及其 sacreBLEU 签名，以及每页成本和延迟；跑 agent config 时还会统计回退到 `baseline` 的页数，跑 `full_no_kb` 和 `full` 时还会统计 Reviewer 退回了几次、循环为什么停下。`full` 每次 eval 都从一个新的空 Knowledge Base 开始，按页序依次传给各页，最后报告 Curator 的决定和 KB 里留下了什么。运行清单（Manifest）、逐 Segment 的输出和分数写入 `runs/eval/<id>/`，每跑完一页就更新一次，所以中途被打断的 eval 会保留已经跑完的页。不写 `--pages` 就按页序跑整本书（整本书会产生很多次真实调用）。有页面失败或 harness 无法启动时，退出码非零。
+Eval harness（评测执行器）走和编辑器相同的代码路径翻译这几页（每页在 SQLite 里留下一个 Run），用 OpenCC（`t2s`）把 zh-Hant 参考译文转成 zh-Hans，然后打印 chrF 和 BLEU 及其 sacreBLEU 签名，以及每页成本和延迟；跑 agent config 时还会统计回退到 `baseline` 的页数，跑 `full_no_kb` 和 `full` 时还会统计 Reviewer 退回了几次、循环为什么停下。`full` 每次 eval 都从一个新的空 Knowledge Base 开始，按页序依次传给各页，最后报告 Curator 的决定、KB 触达了多少页，以及 KB 里留下了什么。运行清单（Manifest）、逐 Segment 的输出和分数写入 `runs/eval/<id>/`，每跑完一页就更新一次，所以中途被打断的 eval 会保留已经跑完的页。不写 `--pages` 就按页序跑整本书（整本书会产生很多次真实调用）。有页面失败或 harness 无法启动时，退出码非零。
+
+下面两个打分脚本读取一次已经跑完的 eval，把结果写在它的输出旁边。两者都不调用模型 provider：
+
+```bash
+uv run python eval/terms.py runs/eval/<id>   # 对照 gold glossary 的 term accuracy
+uv run eval/comet.py runs/eval/<id>          # COMET，在单独的环境里运行
+```
+
+`eval/comet.py` 自己声明依赖（PyTorch 和 `unbabel-comet`），不进项目的环境。第一次运行时会从 Hugging Face 下载这些依赖和 `Unbabel/wmt22-comet-da` checkpoint（约 2.3 GB）。用 CPU 就够了。
 
 可选的 tracing：每翻译一页就生成一条 trace（包含每次模型调用、每个 agent 步骤和每次工具调用），发到你本机运行的 [Arize Phoenix](https://github.com/Arize-ai/phoenix)。在另一个终端启动 Phoenix，设置 `FUKIDASHI_TRACING=phoenix`（在 shell 或 `.env` 里都可以），然后打开 http://localhost:6006：
 
@@ -70,7 +79,7 @@ FUKIDASHI_TRACING=phoenix uv run python eval/run.py --config translator --book t
 Tracing 默认关闭，出错也不会让翻译失败。每个 span 里的页面图片和 API key 都会被去掉，endpoint 必须在本机。即使你的 shell 设置了 HTTP 代理，span 也会直接发到这个 endpoint。eval 输出会记录每一页的 trace ID。
 
 ```bash
-uv run pytest                                       # 不联网，不发真实 LLM 请求
+uv run pytest                                       # 不联网，不发真实 LLM 请求；CI 在每个 pull request 上运行它
 uv run python scripts/m0_first_call.py --dry-run    # 打印 M0 的请求内容，不发送
 uv run python eval/glossary.py check                # 对照数据集检查 gold glossary；不调用模型
 ```
