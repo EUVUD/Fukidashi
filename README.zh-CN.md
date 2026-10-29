@@ -111,3 +111,5 @@ OpenMantra 来自 Hinami et al., *Towards Fully Automated Manga Translation*（A
 ## 许可
 
 本仓库的代码以 [MIT License](LICENSE) 发布。该许可不覆盖 OpenMantra：数据集本身不在本仓库里分发，文档中引用的原文和 `eval/gold_glossary/` 里的术语仍适用 CC BY-NC 4.0，使用数据集须遵守该许可。
+
+另有三个文件也不适用 MIT License。它们含有复制或改编自 [GEMBA](https://github.com/MicrosoftTranslator/GEMBA)（Microsoft Translator：Tom Kocmi、Christian Federmann）提交 `a7a7eff8e46998447c6cbf09d06affc8f1b99ab4` 的内容：GEMBA-MQM 的提示模板及其三个示例、答案解析器和严重程度权重，或据此改编的文字。GEMBA 以 [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/) 发布，这些文件也以 CC BY-SA 4.0 发布：`backend/fukidashi/evaluation/mqm.py`、`backend/tests/test_mqm.py` 和 `docs/mqm-annotation.md`。[LICENSE](LICENSE) 列出了这些文件，每个文件的开头也有同样的说明。

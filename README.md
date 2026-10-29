@@ -111,3 +111,5 @@ OpenMantra is by Hinami et al., *Towards Fully Automated Manga Translation* (AAA
 ## License
 
 The code in this repository is released under the [MIT License](LICENSE). The license does not cover OpenMantra: the dataset is not distributed here, and the lines of its text quoted in the docs and the terms in `eval/gold_glossary/` remain under CC BY-NC 4.0, so any use of the dataset must follow that license.
+
+Three files are not under the MIT License either. They hold material copied or adapted from [GEMBA](https://github.com/MicrosoftTranslator/GEMBA) (Microsoft Translator: Tom Kocmi, Christian Federmann) at commit `a7a7eff8e46998447c6cbf09d06affc8f1b99ab4`: the GEMBA-MQM prompt template with its three examples, its answer parser and its severity weights, or text adapted from them. GEMBA is licensed under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/), and so are these files: `backend/fukidashi/evaluation/mqm.py`, `backend/tests/test_mqm.py` and `docs/mqm-annotation.md`. [LICENSE](LICENSE) lists them, and each says so at its top.

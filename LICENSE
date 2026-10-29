@@ -19,3 +19,22 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+-------------------------------------------------------------------------------
+
+Third-party material: GEMBA (CC BY-SA 4.0)
+
+The MIT License above does not apply to the files listed below. They hold
+material copied or adapted from GEMBA, https://github.com/MicrosoftTranslator/GEMBA
+(Microsoft Translator: Tom Kocmi, Christian Federmann), at commit
+a7a7eff8e46998447c6cbf09d06affc8f1b99ab4, file gemba/gemba_mqm_utils.py: the
+GEMBA-MQM prompt template, its three few-shot examples, its answer parser and
+its severity weights, or text adapted from them. GEMBA is licensed under the
+Creative Commons Attribution-ShareAlike 4.0 International License (CC BY-SA
+4.0), https://creativecommons.org/licenses/by-sa/4.0/, and so are these files.
+Each of them says so at its top, and its changes from GEMBA are described there
+or in backend/fukidashi/evaluation/mqm.py.
+
+- backend/fukidashi/evaluation/mqm.py
+- backend/tests/test_mqm.py
+- docs/mqm-annotation.md
