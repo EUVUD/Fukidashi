@@ -10,7 +10,7 @@ Fukidashi is a web editor that translates Japanese manga into Simplified Chinese
 - `SCOPE.md`: what is in and out of scope, and the cut order. `IDEAS.md`: where ideas outside a checkpoint go.
 - `docs/design.md`: domain model, system sequence diagram, object interaction diagram, object model. `docs/m0.md` to `docs/m5.md`: milestone records. `eval/PROTOCOL.md`: the eval protocol.
 
-M0 to M5 are done, except the freeze tag `exp-frozen`, which only the author places. The vertical slice (page → `baseline` → browser) works. M2 added the eval harness v0 (`eval/run.py`: `baseline` and `translator`, chrF / BLEU, manifest), the tool-calling loop (`agents/loop.py`: `run_agent` on LangChain's `create_agent`), the Translator Agent (`agents/translator.py`: config `translator`, M2's smoke config, with one tool, `get_previous_context`) and tracing (`tracing/`: one trace per page in a local Arize Phoenix, off by default). M3 added:
+M0 to M5 are done, and the author placed the freeze tag `exp-frozen` at `0c1fe05` (2026-10-30). The vertical slice (page → `baseline` → browser) works. M2 added the eval harness v0 (`eval/run.py`: `baseline` and `translator`, chrF / BLEU, manifest), the tool-calling loop (`agents/loop.py`: `run_agent` on LangChain's `create_agent`), the Translator Agent (`agents/translator.py`: config `translator`, M2's smoke config, with one tool, `get_previous_context`) and tracing (`tracing/`: one trace per page in a local Arize Phoenix, off by default). M3 added:
 - the gold glossary for the dev split (`eval/gold_glossary/`, checked by `eval/glossary.py`);
 - the Translator's `flag_uncertain`;
 - the Reviewer Agent (`agents/reviewer.py`);
@@ -36,7 +36,7 @@ M5 added (record: `docs/m5.md`):
 
 Say these accurately. **Neither judge passed the agreement check** (the labels are Claude's, an LLM's, and mark one error in 30 items), so MQM is for reference only: never call it validated. The tuned dev numbers are on the books the prompts were tuned on, one run each: they are not held-out estimates.
 
-These do not exist yet (M6 onward), so do not describe them as implemented: the test-split runs, paired bootstrap CIs (M8), and any agent config in the editor (the API runs `baseline` only). xCOMET is not reported: it does not fit the available GPU (OUTLINE §8). The test books are untouched: nothing translates, scores or judges them before the author places `exp-frozen`.
+These do not exist yet (M6 onward), so do not describe them as implemented: the test-split runs, the paired bootstrap (its code comes in M6, before the test runs; the CIs are computed in M8), and any agent config in the editor (the API runs `baseline` only). xCOMET is not reported: it does not fit the available GPU (OUTLINE §8). The test books are untouched: they are translated, scored and judged only by M6's test-run task, once, from a worktree of the tag (`eval/PROTOCOL.md`, OUTLINE §7, §8), and nothing is tried on them first.
 
 Docs are written in English. The README also exists in Simplified Chinese (`README.zh-CN.md`): change both together. Use the §0 terms verbatim and add any new term to that table. The repository is public: write docs for outside readers.
 
