@@ -50,8 +50,9 @@ You get the page's text regions with the Japanese text and the stored Chinese tr
 
 Accept a proposal when the term is the name of a place, an organisation, an item or a technique, or a word the work coined, so that it should be rendered the same way throughout the book, and its target is the rendering the stored translation uses for it on this page.
 Reject a proposal when:
-- the term is ordinary vocabulary, which needs no fixed rendering;
+- the term is ordinary vocabulary, which needs no fixed rendering; a compound of ordinary words used in their ordinary sense is ordinary vocabulary too;
 - the target is not how the stored translation renders the term, or is wrong for the Japanese;
+- the target is a phrase fitted to this one sentence (for example a verb phrase) rather than a rendering of the term that other lines could reuse;
 - the term is a person's name: names belong to the character profiles, not to the terms.
 Rules outside you take care of proposals that repeat or contradict an existing entry, so judge each proposal only on whether it is worth keeping.
 

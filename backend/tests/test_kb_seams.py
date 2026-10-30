@@ -1,15 +1,15 @@
 """The KB seams hardened before the Curator writes (task 015), on a scripted provider and in fresh interpreters: no network.
 
-What changed and what must not have: the agents' import graph holds no database, the KB tool code both agents share has
-one home, the lookup tools describe `approved` and `pending` as the system prompts do, the payload kept for one proposal
-id comes from the first call in the order of the calls and not from the first to arrive, and every request the agents
-send is what `origin/main` sent, except those two descriptions.
+What must hold: the agents' import graph holds no database, the KB tool code both agents share has one home, the lookup
+tools describe `approved` and `pending` as the system prompts do, the payload kept for one proposal id comes from the
+first call in the order of the calls and not from the first to arrive, and every request the agents send over the
+scenarios of `request_scenarios.py` is pinned to the byte, so that no prompt, tool schema or request layout changes
+unnoticed.
 """
 
 from __future__ import annotations
 
 import ast
-import copy
 import hashlib
 import json
 import subprocess
@@ -143,52 +143,36 @@ def test_only_the_loader_and_the_curator_import_the_store_in_the_kb_package():
     assert "load_snapshot" not in kb_package.__all__ and not hasattr(kb_package, "load_snapshot")
 
 
-# --- AC3: the requests are what origin/main sent -----------------------------------------------------------------
+# --- AC3: every request the agents send is pinned to the byte ------------------------------------------------------
 
-# What the two lookup tools said on origin/main (d263297). The only text of any request that task 015 changes.
-OLD_DESCRIPTIONS = {
-    "lookup_term": "Look up one Japanese term in the knowledge base of this book. Returns its Chinese rendering and "
-                   "whether a person has confirmed it (approved) or not yet (pending), or says there is none.",
-    "lookup_character": "Look up a character in the knowledge base of this book by their name or by another name they "
-                        "are called by. Returns the Chinese name, the other names, notes on their speech style and "
-                        "whether a person has confirmed the profile (approved) or not yet (pending), or says there "
-                        "is none.",
-}
-NEW_DESCRIPTIONS = {
-    "lookup_term": "Look up one Japanese term in the knowledge base of this book. Returns its Chinese rendering and its "
-                   "status: approved (in the knowledge base) or pending (proposed on an earlier page, not yet "
-                   "confirmed by a person), or says there is none.",
-    "lookup_character": "Look up a character in the knowledge base of this book by their name or by another name they "
-                        "are called by. Returns the Chinese name, the other names, notes on their speech style and the "
-                        "profile's status: approved (in the knowledge base) or pending (proposed on an earlier page, "
-                        "not yet confirmed by a person), or says there is none.",
-}
+LOOKUPS = ("lookup_term", "lookup_character")
 
 # sha256 of the request bodies (json.dumps with sort_keys and ensure_ascii=False) of each scenario in
-# request_scenarios.py, run on origin/main at d263297, with the two lookup descriptions as they were there.
-ORIGIN_DIGESTS = {
-    "off/orchestrator-approve": "9651c0e5050b48ad1c0464cda76779c5adb7c7a042a2dda1deac6b17d2cb3eea",
-    "off/orchestrator-fallback": "531775e54adb4b9f7cd98cec7fc066999e96f1c454cc5b428cd90ffdfd19ad67",
-    "off/orchestrator-one-send-back": "fe3d1e610f8352312eb090fa0fcb7c35fea9e0b31feec6bc086aa50f9fcc4c9d",
-    "off/orchestrator-two-send-backs": "b70db375b35cb7579e5f3d3ee8e67ac38fa26e28698abd75390f147c6406bd19",
-    "off/review": "74c1260ff401a5ccd6f0274dd58efafccd734024401e183d6a8d12cecdd6a761",
-    "off/review-and-repair": "99a6f9f3832570286b65316e9f9e28d01e8576d87eb8ac220c36989cf3b85c1b",
-    "off/revision": "23347d51bdef4e382266efd37d91c74dd8607467c8fee881cee3e4d355f95787",
+# request_scenarios.py, taken with the prompts and tool descriptions of the M5 tuning. A change to a prompt, a tool
+# schema or the request layout changes them; an intended change re-baselines them in the same change.
+DIGESTS = {
+    "off/orchestrator-approve": "66545fea4dad5006a1c9d2058d1d932b81ecb05d563ee95e3b638d6f0f01d7c3",
+    "off/orchestrator-fallback": "845bbceddafdb3c729dc1af4a1686794c857da5d48b5f50b4f16f3481470da7a",
+    "off/orchestrator-one-send-back": "363a353548116ce6bcbc5c3c8438ee531d5ac23d2402a2732a1450c8993d80c4",
+    "off/orchestrator-two-send-backs": "5a1a5365097e7031c6e2ad531a310d7df476e61c831db61778b46695f35a4202",
+    "off/review": "68a7e328d7761eb7808a33c1c043e12d13e446fec3952d583b55066e42daea09",
+    "off/review-and-repair": "95401449b95d2d9f882bd98aede0e83715fc7eae45a9b0e10f16ec66a7785169",
+    "off/revision": "2678bd6365450e4b7e9f2c7a35a017d1fb2467804bc6b5f0be6b41e4949d7b06",
     "off/translator": "209fb74cb33062fc9441507bd7c9c2c5faae630e77a6e4a7bcc291871d9eb290",
-    "off/translator-flagging-and-repair": "df18a7e63ff6938a0946602da5606670c61d6a6fd0c6a14d977ce86da3e65e56",
-    "on/orchestrator-approve": "80a776d3e764f7a87fefdbeea8bd1d97fb66a6ee94b16d24532e99b79dec0ec7",
-    "on/orchestrator-fallback": "54bef87bef2ec05ad4311ef22b8afe4d7b98d0f64638aa618d03d05ddbccd3b1",
-    "on/orchestrator-one-send-back": "906e46be8c87e7d915514f69d249e517db2e73058f0554183f8ec6e39d9ce271",
-    "on/orchestrator-two-send-backs": "54b564a19aee05372d15567d95e3cf993180b5ce120c6a97bf39f0b02b669938",
-    "on/review": "3d6e21108391b9130a11f61188ffb49fe3715f79d23903bbd95067a7978f8272",
-    "on/revision": "72d7b1c8b290fcfef2f8f3feb73b541222482712cdc3cac1eb637ea4ef25ce5b",
-    "on/translator": "3c78af6d1e4e7cf97ec8320427ecd6a30551c54e35b23b298665036159ad8cd8",
+    "off/translator-flagging-and-repair": "4043d0fc671efa771a28daf9a39dabc2cd0429a51676fa3d8becc9a05955b38b",
+    "on/orchestrator-approve": "37061efc1851ad496a49b6aa04698eeeb8ba067b1a150c8b6b5667e70f2fc2e6",
+    "on/orchestrator-fallback": "d867d3a10474c22dae551ca1341a5dacdcc14a7f5326f1ba2441ea754efffe93",
+    "on/orchestrator-one-send-back": "1d025cd5503dcb7ad987e86418a20d4ee2f505360d6230520242de6fcdf97b09",
+    "on/orchestrator-two-send-backs": "86a8d2dca29872422f619d489a81321c1a459719b12fbf69111ddde18be4b449",
+    "on/review": "d0025d46f481d0078d41e5cf5f0a1728e0b7bb64b45d82c875d4483a9fb9992f",
+    "on/revision": "64944a2faeeb52b9782e9bb641132f8d1942ecce8500160f05a4eadc0eb75cf8",
+    "on/translator": "de8f0efe6eece4b52b359eb4177d9b21e5b89df990581d837195725417399b2e",
 }
 
 
-def lookup_descriptions(bodies: list[dict]) -> list[dict]:
+def lookup_functions(bodies: list[dict]) -> list[dict]:
     """The `function` entries of the two lookup tools in every request that has them."""
-    return [t["function"] for body in bodies for t in body.get("tools", []) if t["function"]["name"] in OLD_DESCRIPTIONS]
+    return [t["function"] for body in bodies for t in body.get("tools") or [] if t["function"]["name"] in LOOKUPS]
 
 
 def digest(bodies: list[dict]) -> str:
@@ -207,26 +191,17 @@ def scenarios(tmp_path_factory):
     return request_scenarios.collect(get_page("book_a", 1, root))
 
 
-def test_every_request_over_the_task_014_scenarios_is_what_origin_main_sent_but_for_the_two_lookup_descriptions(
-        scenarios):
-    assert set(scenarios) == set(ORIGIN_DIGESTS)
-    swapped, bodies_by_scenario = {}, copy.deepcopy(scenarios)
-    for name, bodies in bodies_by_scenario.items():
-        found = lookup_descriptions(bodies)
-        swapped[name] = len(found)
-        for function in found:   # the one allowed change: put what origin/main said back
-            assert function["description"] == NEW_DESCRIPTIONS[function["name"]]
-            function["description"] = OLD_DESCRIPTIONS[function["name"]]
-
-    assert {n: digest(bodies) for n, bodies in bodies_by_scenario.items()} == ORIGIN_DIGESTS
-    assert all(count == 0 for name, count in swapped.items() if name.startswith("off/"))   # the KB off: no lookups
-    assert all(count > 0 for name, count in swapped.items() if name.startswith("on/"))     # the KB on: the check bites
+def test_every_request_over_the_scenarios_is_the_pinned_one(scenarios):
+    assert {name: digest(bodies) for name, bodies in scenarios.items()} == DIGESTS
+    lookups = {name: len(lookup_functions(bodies)) for name, bodies in scenarios.items()}
+    assert all(count == 0 for name, count in lookups.items() if name.startswith("off/"))   # the KB off: no lookups
+    assert all(count > 0 for name, count in lookups.items() if name.startswith("on/"))     # the KB on: they are sent
 
 
 def test_the_lookup_tools_describe_the_two_states_as_the_prompts_do():
     tools = {t.name: t for t in kb_tools.lookup_tools(snapshot())}
 
-    assert {name: tool.description for name, tool in tools.items()} == NEW_DESCRIPTIONS
+    assert set(tools) == set(LOOKUPS)
     for tool in tools.values():
         assert "approved (in the knowledge base)" in tool.description
         assert "pending (proposed on an earlier page, not yet confirmed by a person)" in tool.description
