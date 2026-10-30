@@ -71,13 +71,15 @@ def lookup_tools(kb: KBSnapshot) -> list[Tool]:
 
     return [
         Tool(name="lookup_term",
-             description="Look up one Japanese term in the knowledge base of this book. Returns its Chinese rendering "
-                         "and its status: approved (in the knowledge base) or pending (proposed on an earlier page, "
+             description="Look up one Japanese term in the knowledge base of this book. It matches the whole term "
+                         "exactly. Returns its Chinese rendering and its status: approved (in the knowledge base) or pending (proposed on an earlier page, "
                          "not yet confirmed by a person), or says there is none.",
              args=LookupTermArgs, handler=lookup_term),
         Tool(name="lookup_character",
              description="Look up a character in the knowledge base of this book by their name or by another name they "
-                         "are called by. Returns the Chinese name, the other names, notes on their speech style and "
+                         "are called by. It matches exactly: a given name or a family name alone finds the profile "
+                         "only when it is one of its other names. Returns the Chinese name, the other names, notes on "
+                         "their speech style and "
                          "the profile's status: approved (in the knowledge base) or pending (proposed on an earlier "
                          "page, not yet confirmed by a person), or says there is none.",
              args=LookupCharacterArgs, handler=lookup_character),

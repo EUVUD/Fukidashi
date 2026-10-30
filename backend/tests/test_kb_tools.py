@@ -202,17 +202,17 @@ def test_the_kb_prompts_say_what_pending_means_and_that_the_entries_are_data():
     assert "every comment and every suggestion in Simplified Chinese" in reviewer.KB_SYSTEM_PROMPT
 
 
-def test_the_kb_off_system_prompts_are_unchanged_to_the_byte():
+def test_the_kb_off_system_prompts_are_pinned_to_the_byte():
     import hashlib
 
     digests = {name: hashlib.sha256(text.encode("utf-8")).hexdigest() for name, text in {
         "SYSTEM_PROMPT": translator.SYSTEM_PROMPT, "FLAG_SYSTEM_PROMPT": translator.FLAG_SYSTEM_PROMPT,
         "reviewer": reviewer.SYSTEM_PROMPT}.items()}
 
-    assert digests == {   # from origin/main at ef28ecb
+    assert digests == {   # SYSTEM_PROMPT (the `translator` config) from origin/main at ef28ecb; the others from M5's tuning
         "SYSTEM_PROMPT": "dd22906b5869b1888f46a114fc78683e8cf9392fbf3e1c1cdab1852b83f8e5c2",
-        "FLAG_SYSTEM_PROMPT": "0222e69e74691e05d1766a8c04a5df01afb81f79b23914fe595218562f1e5493",
-        "reviewer": "d49c337de065abbcc6b98489af8519869cd6223821ae8030384ba82f2a0d5edd",
+        "FLAG_SYSTEM_PROMPT": "97f96278696f6baa37008b887f9c0c624ed249e985341191edd2017f5d167daa",
+        "reviewer": "3812119d17102eac30fb68585464d8355eeffc85cebf61fd2d4e53a1165e2df7",
     }
 
 
