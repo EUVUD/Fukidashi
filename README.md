@@ -4,7 +4,7 @@ English | [简体中文](README.zh-CN.md)
 
 A multi-agent manga translation editor (Japanese → Simplified Chinese), evaluated on the [OpenMantra](https://github.com/mantra-inc/open-mantra-dataset) dataset against a single-call baseline with a standard MT evaluation framework.
 
-> **Status (2026-10-29):** M0 to M4 are done. The vertical slice works end to end: import OpenMantra, translate a page with one model call, and check every line against its box in the browser. M2 added an eval harness that scores configs with chrF / BLEU, a first Translator Agent (the `translator` config) on a tool-calling loop over our metered client, and optional tracing in a local Arize Phoenix ([record](docs/m2.md)). M3 added the multi-agent system ([record](docs/m3.md)): a Reviewer Agent, an Orchestrator that sends pages back for revision, a per-book Knowledge Base with a Curator Agent as its only writer, the `full` and `full_no_kb` configs, and a gold glossary for the two dev books. M4 added whole-book evals, a COMET scorer, term accuracy against the gold glossary, a count of how often the KB reaches a page, a report that pools eval runs, and CI on GitHub Actions, then ran each config once on the two dev books ([record](docs/m4.md)). On the dev split the full system scored no higher than one call per page (COMET 0.8235 against 0.8257) at about 9.5 times the cost; that is one run of each config, without confidence intervals yet. Next is M5: the eval protocol, GEMBA-MQM and term consistency, then the freeze.
+> **Status (2026-10-30):** M0 to M5 are done, except the freeze tag. The vertical slice works end to end: import OpenMantra, translate a page with one model call, and check every line against its box in the browser. M2 added an eval harness that scores configs with chrF / BLEU, a first Translator Agent (the `translator` config) on a tool-calling loop over our metered client, and optional tracing in a local Arize Phoenix ([record](docs/m2.md)). M3 added the multi-agent system ([record](docs/m3.md)): a Reviewer Agent, an Orchestrator that sends pages back for revision, a per-book Knowledge Base with a Curator Agent as its only writer, the `full` and `full_no_kb` configs, and a gold glossary for the two dev books. M4 added whole-book evals, a COMET scorer, term accuracy against the gold glossary, a count of how often the KB reaches a page, a report that pools eval runs, and CI on GitHub Actions, then ran each config once on the two dev books ([record](docs/m4.md)). M5 added a judge model (GPT-4o mini, metered apart from the translation model) with the GEMBA-MQM scorer, term consistency, the test books' gold glossaries, one round of prompt tuning on the dev books, and the one-page eval protocol ([record](docs/m5.md)). In the check against 30 labelled segments neither GPT-4o mini nor the fallback judge agreed with the labels (which an LLM made), so MQM is reported for reference only. After the tuning, on the two dev books (one run of each config, no confidence intervals yet, and the books the prompts were tuned on), the full system still scored no higher than one call per page on COMET (0.8254 against 0.8257) at about 9.5 times the cost; its term accuracy on the glossary's names and coined terms was 62% against 52%, and its term consistency 83% against 69%. Next is the freeze tag, which the author places, and then M6, the test runs.
 
 ## What it does
 
@@ -19,12 +19,13 @@ A multi-agent manga translation editor (Japanese → Simplified Chinese), evalua
 Fukidashi is evaluated as a product, not as a research experiment (details in [OUTLINE.md §4](OUTLINE.md#4-evaluation)):
 
 - **Main comparison:** the full system vs `baseline` (one call per page). **KB ablation:** the full system with and without the Knowledge Base.
-- **Metrics:** chrF / BLEU (sacreBLEU, with signature), COMET (`wmt22-comet-da`), GEMBA-MQM (LLM-as-judge with GPT-4o mini, checked against about 30 human-annotated segments first), term accuracy and term consistency against a gold glossary, cost per page and latency.
-- **Rigor:** split by book (2 dev, 3 test), an eval protocol written before the freeze, the test split run once, paired bootstrap 95% CIs by page.
+- **Metrics:** chrF / BLEU (sacreBLEU, with signature), COMET (`wmt22-comet-da`), GEMBA-MQM (LLM-as-judge with GPT-4o mini; it failed the check against 30 labelled segments, so it is reported for reference only), term accuracy and term consistency against a gold glossary, cost per page and latency.
+- **Rigor:** split by book (2 dev, 3 test), an eval protocol written before the freeze ([eval/PROTOCOL.md](eval/PROTOCOL.md)), the test split run once, paired bootstrap 95% CIs by page.
 
 ## Engineering notes
 
 - **One metered client.** Every model call goes through `LLMClient`, which enforces a per-page token budget and logs each call to a cost ledger. Usage the provider does not report is recorded as unknown, never as 0.
+- **A judge metered apart.** The judge model for GEMBA-MQM and term consistency goes through a second `LLMClient` with its own configuration and ledger, so the evaluation's cost never mixes with the system's.
 - **No reference leakage.** Prompts contain only the Japanese text and boxes; the reference translations stored next to them never reach a prompt, and a test checks it.
 - **Runs are recorded, not overwritten.** A Run is inserted as `running` and finished as `succeeded` or `failed`; a failed Run keeps the raw responses, and the page keeps showing the last good translation.
 - **An agent loop that keeps the metering.** Tool calls run on LangChain's `create_agent`, but its model is a thin adapter over `LLMClient`, so every agent call is metered like any other and DeepSeek's reasoning is passed back as its API requires. Guardrails: a step limit, the token budget, duplicate-call detection, and a truncated reply is never taken as an answer.
@@ -70,6 +71,15 @@ uv run python eval/report.py runs/eval/<id> runs/eval/<id> ...   # one report pe
 
 `eval/comet.py` declares its own dependencies (PyTorch and `unbabel-comet`), so they stay out of the project's environment. Its first run downloads them and the `Unbabel/wmt22-comet-da` checkpoint (about 2.3 GB) from Hugging Face. A CPU is enough. The report compares the configs on the pages that every config scored, recomputes chrF and BLEU over the pooled segments, and refuses files that do not belong together; it writes `runs/report/<time>-report/report.json` and prints a summary.
 
+Two more scorers call a judge model, configured by the `JUDGE_*` variables in `.env`; their calls go to a ledger of their own. Drawing the human sample and checking it against a judge call no model:
+
+```bash
+uv run python eval/mqm.py runs/eval/<id>           # GEMBA-MQM: real judge calls, one per segment
+uv run python eval/consistency.py runs/eval/<id>   # term consistency: real judge calls
+uv run python eval/mqm_agreement.py runs/mqm-human/<time>-sample --expected-sha256 <hash> <mqm file> ...   # labels against a judge
+uv run python eval/report.py runs/eval/<id> ... --mqm-judge <model> --mqm-agreement <file>   # pool them with the rest
+```
+
 Optional tracing: one trace per translated page (every model call, agent step and tool call) in an [Arize Phoenix](https://github.com/Arize-ai/phoenix) running on your machine. Start Phoenix in another terminal, set `FUKIDASHI_TRACING=phoenix` (in the shell or `.env`), and open http://localhost:6006:
 
 ```bash
@@ -94,7 +104,7 @@ uv run python eval/glossary.py check                # check the gold glossaries 
 | M2 Agent layer & eval harness | 11/1 | Done ([record](docs/m2.md)) |
 | M3 Knowledge Base & Reviewer | 11/8 | Done ([record](docs/m3.md)) |
 | M4 Dev evaluation | 11/15 | Done ([record](docs/m4.md)) |
-| M5 Eval protocol & freeze | 11/22 | Planned |
+| M5 Eval protocol & freeze | 11/22 | Done, except the freeze tag ([record](docs/m5.md)) |
 | M6–M8 Test run, editor productization, analysis | 1/3 | Planned |
 | M9 Report & release | 1/17 | Planned |
 

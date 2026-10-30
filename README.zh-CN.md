@@ -4,7 +4,7 @@
 
 多 agent 漫画翻译编辑器（日 → 简体中文）。在 [OpenMantra](https://github.com/mantra-inc/open-mantra-dataset) 数据集上，用标准的 MT evaluation framework 和单次调用的 baseline 做对比。
 
-> **现状（2026-10-29）：** M0 到 M4 已完成。vertical slice 已经跑通：导入 OpenMantra，对一页做一次模型调用完成翻译，在浏览器里逐句对照图上的 box 检查译文。M2 新增了用 chrF / BLEU 给各个 config 打分的 eval harness；第一版 Translator Agent（即 `translator` config），它跑在调用工具的 agent loop 上，底下是带计量的 client；还有可选的 tracing，trace 发到本机的 Arize Phoenix（[记录](docs/m2.md)）。M3 加上了多 agent 系统（[记录](docs/m3.md)）：Reviewer Agent、把页面退回修改的 Orchestrator、每本书一个的 Knowledge Base（Curator Agent 是它唯一的写者）、`full` 和 `full_no_kb` 两个 config，以及两部 dev 作品的 gold glossary。M4 加上了按整本书跑的 eval、COMET 打分脚本、对照 gold glossary 的 term accuracy、KB 触达各页次数的统计、汇总多次 eval 的报告，以及 GitHub Actions 上的 CI，然后在两部 dev 作品上把每个 config 各跑了一遍（[记录](docs/m4.md)）。在 dev split 上，full system 的分数并不比每页一次调用高（COMET 0.8235 对 0.8257），成本却是它的约 9.5 倍；这是每个 config 只跑一次的结果，还没有置信区间。下一步是 M5：eval protocol、GEMBA-MQM 和 term consistency，然后冻结。
+> **现状（2026-10-30）：** M0 到 M5 已完成，只差冻结标签。vertical slice 已经跑通：导入 OpenMantra，对一页做一次模型调用完成翻译，在浏览器里逐句对照图上的 box 检查译文。M2 新增了用 chrF / BLEU 给各个 config 打分的 eval harness；第一版 Translator Agent（即 `translator` config），它跑在调用工具的 agent loop 上，底下是带计量的 client；还有可选的 tracing，trace 发到本机的 Arize Phoenix（[记录](docs/m2.md)）。M3 加上了多 agent 系统（[记录](docs/m3.md)）：Reviewer Agent、把页面退回修改的 Orchestrator、每本书一个的 Knowledge Base（Curator Agent 是它唯一的写者）、`full` 和 `full_no_kb` 两个 config，以及两部 dev 作品的 gold glossary。M4 加上了按整本书跑的 eval、COMET 打分脚本、对照 gold glossary 的 term accuracy、KB 触达各页次数的统计、汇总多次 eval 的报告，以及 GitHub Actions 上的 CI，然后在两部 dev 作品上把每个 config 各跑了一遍（[记录](docs/m4.md)）。M5 加上了 judge 模型（GPT-4o mini，计量和翻译模型分开）和 GEMBA-MQM 打分脚本、term consistency、三部 test 作品的 gold glossary、在 dev 作品上调了一轮 prompt，以及一页的 eval protocol（[记录](docs/m5.md)）。在约 30 个标注 segment 上做一致性检查时，GPT-4o mini 和备用的 judge 都没有和标注对上（标注是 LLM 做的），所以 MQM 只作参考报告。调完之后，在两部 dev 作品上（每个 config 只跑一次，还没有置信区间，而且 prompt 就是照这两部调的），full system 的 COMET 仍然不比每页一次调用高（0.8254 对 0.8257），成本约为它的 9.5 倍；它在 glossary 的人名和自造词上的 term accuracy 是 62%，对 52%，term consistency 是 83%，对 69%。下一步是冻结标签，由作者来打，然后是 M6，也就是 test 运行。
 
 ## 它做什么
 
@@ -19,12 +19,13 @@
 Fukidashi 按产品评测，不做研究型对照实验（细节见 [OUTLINE.md 第 4 节](OUTLINE.md#4-evaluation)）：
 
 - **主对比：** full system vs `baseline`（每页一次调用）。**KB ablation：** full system 开 / 关 Knowledge Base。
-- **Metric：** chrF / BLEU（sacreBLEU，附 signature）、COMET（`wmt22-comet-da`）、GEMBA-MQM（LLM-as-judge，judge 是 GPT-4o mini，先在约 30 个人工标注的 segment 上检查一致性）、对照 gold glossary 的 term accuracy 和 term consistency、每页成本和 latency。
-- **严谨性：** 按作品划分（2 部 dev、3 部 test），冻结前写好 eval protocol，test split 只跑一次，按页 paired bootstrap 95% CI。
+- **Metric：** chrF / BLEU（sacreBLEU，附 signature）、COMET（`wmt22-comet-da`）、GEMBA-MQM（LLM-as-judge，judge 是 GPT-4o mini；它没有通过 30 个标注 segment 的一致性检查，所以只作参考报告）、对照 gold glossary 的 term accuracy 和 term consistency、每页成本和 latency。
+- **严谨性：** 按作品划分（2 部 dev、3 部 test），冻结前写好 eval protocol（[eval/PROTOCOL.md](eval/PROTOCOL.md)），test split 只跑一次，按页 paired bootstrap 95% CI。
 
 ## 工程上的几点
 
 - **只有一个带计量的 client。** 所有模型调用都经过 `LLMClient`：它限制每页的 token budget，并把每次调用记进费用账本。provider 没返回的 usage 记为 unknown，不记成 0。
+- **Judge 的计量单独记。** GEMBA-MQM 和 term consistency 用的 judge 模型走第二个 `LLMClient`，有自己的配置和账本，所以评测的成本不会和系统的成本混在一起。
 - **参考译文不会泄漏进 prompt。** prompt 里只有日文和 box；和它们存在一起的参考译文不会进 prompt，有测试检查。
 - **Run 只追加，不覆盖。** Run 先以 `running` 插入，再标成 `succeeded` 或 `failed`；失败的 Run 保留原始响应，页面继续显示上一次成功的译文。
 - **Agent loop 不绕过计量。** 工具调用跑在 LangChain 的 `create_agent` 上，但它的模型是包在 `LLMClient` 外面的一层薄适配，所以每次 agent 调用都和其他调用一样计量，DeepSeek 的推理内容也按它 API 的要求传回。保护措施：步数上限、token budget、重复调用检测，被截断的回复不会被当成答案。
@@ -70,6 +71,15 @@ uv run python eval/report.py runs/eval/<id> runs/eval/<id> ...   # 每个 config
 
 `eval/comet.py` 自己声明依赖（PyTorch 和 `unbabel-comet`），不进项目的环境。第一次运行时会从 Hugging Face 下载这些依赖和 `Unbabel/wmt22-comet-da` checkpoint（约 2.3 GB）。用 CPU 就够了。汇总报告只在每个 config 都打了分的页上比较各 config，chrF 和 BLEU 用合并后的全部 segment 重新计算，文件之间对不上时拒绝生成；结果写进 `runs/report/<time>-report/report.json`，并打印一份摘要。
 
+另有两个打分脚本会调用 judge 模型，由 `.env` 里的 `JUDGE_*` 变量配置，调用记在它们自己的账本里。抽取人工标注样本、把标注和 judge 对照这两步不调用模型：
+
+```bash
+uv run python eval/mqm.py runs/eval/<id>           # GEMBA-MQM：真实的 judge 调用，每个 segment 一次
+uv run python eval/consistency.py runs/eval/<id>   # term consistency：真实的 judge 调用
+uv run python eval/mqm_agreement.py runs/mqm-human/<time>-sample --expected-sha256 <hash> <mqm 文件> ...   # 标注和 judge 对照
+uv run python eval/report.py runs/eval/<id> ... --mqm-judge <model> --mqm-agreement <文件>   # 和其余结果汇总
+```
+
 可选的 tracing：每翻译一页就生成一条 trace（包含每次模型调用、每个 agent 步骤和每次工具调用），发到你本机运行的 [Arize Phoenix](https://github.com/Arize-ai/phoenix)。在另一个终端启动 Phoenix，设置 `FUKIDASHI_TRACING=phoenix`（在 shell 或 `.env` 里都可以），然后打开 http://localhost:6006：
 
 ```bash
@@ -94,7 +104,7 @@ uv run python eval/glossary.py check                # 对照数据集检查 gold
 | M2 Agent layer 与 eval harness | 11/1 | 完成（[记录](docs/m2.md)） |
 | M3 Knowledge Base 与 Reviewer | 11/8 | 完成（[记录](docs/m3.md)） |
 | M4 Dev 评测 | 11/15 | 完成（[记录](docs/m4.md)） |
-| M5 Eval protocol 与冻结 | 11/22 | 计划中 |
+| M5 Eval protocol 与冻结 | 11/22 | 完成，只差冻结标签（[记录](docs/m5.md)） |
 | M6–M8 Test 运行、编辑器产品化、分析 | 1/3 | 计划中 |
 | M9 报告与发布 | 1/17 | 计划中 |
 

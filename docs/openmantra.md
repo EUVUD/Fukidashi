@@ -37,9 +37,11 @@
 
 1. **`text_zh` is Traditional Chinese.** Counting 16 common Traditional / Simplified character pairs gives 849 Traditional occurrences and 1 Simplified. Simplified output compared directly against these references would lose chrF / BLEU to script differences alone. M0 decision: the system outputs Simplified Chinese, and OpenCC converts the references to Simplified before evaluation (OUTLINE §8).
 2. `text_en` casing is inconsistent (for example "bound eye siora", "i don't owe you!").
-3. 5 pages have no segments; the eval protocol's exclusion rules must say how they are handled.
+3. 5 pages have no segments; the eval protocol skips them (`eval/PROTOCOL.md`).
 4. Every box lies inside its image; 4 `text_ja` values contain a newline.
 5. Whether the order of segments in the JSON is the reading order: **not checked**.
+6. **References that do not line up with their segment** (found while building the test glossaries, M5). On some pages two neighbouring segments carry each other's reference, or the references are shifted by one. Checked against the Japanese: `balloon_dream` page 4 (segments 6 and 7) and page 5 (6 and 7), `rasetugari` page 5 (5 and 6) and page 14 (1 and 2) are swapped pairs; `tencho_isoro` page 30 (segments 1 to 3) is shifted. Page numbers are `page_index`. Nobody has checked every page, so more may exist. A reference-based score on such a segment compares the translation with another bubble's text; it adds noise to every config alike, and term accuracy skips a segment whose reference does not use the term.
+7. **Typos in `text_ja`.** `rasetugari` writes 璋気 (pages 4, 10 and 29) and 境気 (page 46) where 瘴気 is meant, and 証めるな (page 45, segment 2) where 舐めるな is meant. The system sees the text as written.
 
 ## Split
 
