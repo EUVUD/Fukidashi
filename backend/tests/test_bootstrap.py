@@ -288,6 +288,38 @@ def test_on_the_full_sample_every_configs_value_of_every_metric_is_the_reports_p
     assert seen == 16  # six metrics and two metrics, two configs each
 
 
+def test_an_entry_id_used_in_two_books_is_two_entries_each_counting_its_own_books_renderings(tmp_path, monkeypatch):
+    """The report counts an entry's renderings within its book (`report._consistency`: one item per run and entry) and the
+    bootstrap must too (`build_material`). Here book B has an entry `ryu` as well, which every config renders 飞龙 twice. Within
+    the books it is an entry of its own; merged with book A's `ryu` by the id it would be one entry with another most common
+    rendering."""
+    for name in CONFIGS:
+        monkeypatch.setitem(RENDERED[name][B], "ryu", [(1, 0, "飞龙"), (2, 0, "飞龙")])
+    dirs, glossary_dir = three_by_two(tmp_path)
+    pooled = report.build_report(list(dirs.values()), glossary_dir)["pooled"]
+
+    result = comparisons(build(dirs, glossary_dir))
+
+    # (entries, rendered occurrences, the most common renderings' counts), worked out from RENDERED. baseline, within the books:
+    #   A ryu 龙 x2 + 飞龙 + 龙王 (4 rendered, most common 2), B shiora 希奥拉 + 西奥拉 (2, 1), B ryu 飞龙 x2 (2, 2)  ->  (3, 8, 5)
+    # merged by the id: ryu 龙 x2 + 飞龙 x3 + 龙王 (6, 3) and shiora (2, 1)  ->  (2, 8, 4)  (A's ghost and B's kururu have only
+    # one rendered occurrence, so they count in neither)
+    within_books = {"baseline": (3, 8, 5), "full_no_kb": (4, 10, 9), "full": (3, 8, 7)}
+    merged_by_id = {"baseline": (2, 8, 4), "full_no_kb": (3, 10, 7), "full": (2, 8, 5)}
+    seen = 0
+    for comparison in result.values():
+        metric = comparison["metrics"]["term_consistency"]
+        for name, value in metric["values"].items():
+            entries, rendered, most_common = within_books[name]
+            assert metric["support"][name] == {"entries": entries, "rendered": rendered, "most_common_count": most_common}
+            assert metric["support"][name] == reports_support(pooled[name], "term_consistency"), (comparison["name"], name)
+            assert value == pytest.approx(reports_value(pooled[name], "term_consistency"), abs=1e-9), (comparison["name"], name)
+            assert value == pytest.approx(most_common / rendered)
+            assert value != pytest.approx(merged_by_id[name][2] / merged_by_id[name][1])  # merging would have changed it
+            seen += 1
+    assert seen == 4  # two configs in each of the two comparisons
+
+
 def test_chrf_and_bleu_on_the_full_sample_are_score_corpus_bit_for_bit_and_the_signatures_are_its(tmp_path):
     dirs, glossary_dir = three_by_two(tmp_path)
 
@@ -584,6 +616,34 @@ def test_a_run_with_no_page_in_a_comparison_does_not_decide_its_label(tmp_path):
         label = comparison["metrics"]["term_consistency"]["label"]
         assert label["use"] == "result"
         assert {row["book"] for row in label["extractor"]} == {B}
+
+
+def test_a_runs_extractor_checks_are_counted_over_the_comparisons_pages_not_over_the_whole_run(tmp_path):
+    """`full_no_kb` failed page A3, so A3 is a page of `full vs baseline` and not of `full vs full_no_kb`. The extractor's check
+    of `full`'s one occurrence on A3 (ryu) is wrong. Counted, `full` on A has 4 of 5 checked occurrences right (80%, under the
+    threshold): that is the case in the first comparison; in the second, whose pages leave A3 out, it has 4 of 4."""
+    dirs, glossary_dir = three_by_two(tmp_path, failed={("full_no_kb", A, 3)}, incorrect={("full", A, "ryu", 3, 0)})
+
+    result = comparisons(build(dirs, glossary_dir))
+
+    def label_and_rows(comparison):
+        label = result[comparison]["metrics"]["term_consistency"]["label"]
+        return label, {(row["config"], row["book"]): (row["checked"], row["correct"], row["accuracy"], row["reportable"])
+                       for row in label["extractor"]}
+
+    label, rows = label_and_rows("full vs baseline")
+    assert rows == {("baseline", A): (6, 6, 1.0, True), ("baseline", B): (4, 4, 1.0, True),
+                    ("full", A): (5, 4, 0.8, False), ("full", B): (3, 3, 1.0, True)}
+    assert label["use"] == "for reference only" and f"full on {A}" in label["why"]
+    label, rows = label_and_rows("full vs full_no_kb")
+    assert rows == {("full_no_kb", A): (4, 4, 1.0, True), ("full_no_kb", B): (4, 4, 1.0, True),
+                    ("full", A): (4, 4, 1.0, True), ("full", B): (3, 3, 1.0, True)}
+    assert label["use"] == "result" and label["why"] is None
+    # this comparison's pages are the report's common pages, and the report counts the extractor's checks on them
+    by_book = report.build_report(list(dirs.values()), glossary_dir)["by_book"]
+    for (name, book), (checked, correct, _, _) in rows.items():
+        extractor = by_book[book][name]["consistency"]["extractor"]
+        assert (checked, correct) == (extractor["checked"], extractor["correct"]), (name, book)
 
 
 # --- what the output records ----------------------------------------------------------------------------------------------------
