@@ -4,7 +4,7 @@
 
 多 agent 漫画翻译编辑器（日 → 简体中文）。在 [OpenMantra](https://github.com/mantra-inc/open-mantra-dataset) 数据集上，用标准的 MT evaluation framework 和单次调用的 baseline 做对比。
 
-> **现状（2026-10-31）：** M0 到 M6 已完成，eval 代码已冻结在标签 `exp-frozen` 上。vertical slice 已经跑通：导入 OpenMantra，对一页做一次模型调用完成翻译，在浏览器里逐句对照图上的 box 检查译文。M2 新增了用 chrF / BLEU 给各个 config 打分的 eval harness；第一版 Translator Agent（即 `translator` config），它跑在调用工具的 agent loop 上，底下是带计量的 client；还有可选的 tracing，trace 发到本机的 Arize Phoenix（[记录](docs/m2.md)）。M3 加上了多 agent 系统（[记录](docs/m3.md)）：Reviewer Agent、把页面退回修改的 Orchestrator、每本书一个的 Knowledge Base（Curator Agent 是它唯一的写者）、`full` 和 `full_no_kb` 两个 config，以及两部 dev 作品的 gold glossary。M4 加上了按整本书跑的 eval、COMET 打分脚本、对照 gold glossary 的 term accuracy、KB 触达各页次数的统计、汇总多次 eval 的报告，以及 GitHub Actions 上的 CI，然后在两部 dev 作品上把每个 config 各跑了一遍（[记录](docs/m4.md)）。M5 加上了 judge 模型（GPT-4o mini，计量和翻译模型分开）和 GEMBA-MQM 打分脚本、term consistency、三部 test 作品的 gold glossary、在 dev 作品上调了一轮 prompt，以及一页的 eval protocol（[记录](docs/m5.md)）。在约 30 个标注 segment 上做一致性检查时，GPT-4o mini 和备用的 judge 都没有和标注对上（标注是 LLM 做的），所以 MQM 只作参考报告。M6 先写好 paired bootstrap，在翻译任何 test 页之前合并，然后从这个标签出发，在三部 test 作品上把每个 config 各跑一次并打分（[记录](docs/m6.md)）。在这些运行上算出的 95% 置信区间只反映抽到哪些页带来的不确定性，不包括重跑带来的波动，因为每个 config 只跑了一次。和每页一次调用相比，full system 的 COMET 没有提升（−0.0028，区间 −0.0068 到 +0.0014），chrF（−1.2，区间 −2.3 到 −0.1）和 BLEU（−2.1，区间 −3.5 到 −0.8）更低，成本约为它的 8 倍。它在 glossary 的人名和自造词上的 term accuracy 和每页一次调用分不出高低（+2.1 个百分点，区间 −2.7 到 +6.8），Knowledge Base 也没有让它提高（+0.0 个百分点，区间 −5.1 到 +5.0）。它的 term consistency 比每页一次调用高 4.5 个百分点（区间 +0.8 到 +6.7），但在 dev 作品上把每页一次调用重跑一遍，consistency 就变了 7.0 个百分点，所以这个提升和重跑本身的波动分不开。下一步：分析的其余部分（MQM 错误分布、成本和延迟小结、图表），然后是编辑器（M7）。
+> **现状（2026-11-02）：** M0 到 M6 已完成，eval 代码已冻结在标签 `exp-frozen` 上。vertical slice 已经跑通：导入 OpenMantra，对一页做一次模型调用完成翻译，在浏览器里逐句对照图上的 box 检查译文。M2 新增了用 chrF / BLEU 给各个 config 打分的 eval harness；第一版 Translator Agent（即 `translator` config），它跑在调用工具的 agent loop 上，底下是带计量的 client；还有可选的 tracing，trace 发到本机的 Arize Phoenix（[记录](docs/m2.md)）。M3 加上了多 agent 系统（[记录](docs/m3.md)）：Reviewer Agent、把页面退回修改的 Orchestrator、每本书一个的 Knowledge Base（Curator Agent 是它唯一的写者）、`full` 和 `full_no_kb` 两个 config，以及两部 dev 作品的 gold glossary。M4 加上了按整本书跑的 eval、COMET 打分脚本、对照 gold glossary 的 term accuracy、KB 触达各页次数的统计、汇总多次 eval 的报告，以及 GitHub Actions 上的 CI，然后在两部 dev 作品上把每个 config 各跑了一遍（[记录](docs/m4.md)）。M5 加上了 judge 模型（GPT-4o mini，计量和翻译模型分开）和 GEMBA-MQM 打分脚本、term consistency、三部 test 作品的 gold glossary、在 dev 作品上调了一轮 prompt，以及一页的 eval protocol（[记录](docs/m5.md)）。在约 30 个标注 segment 上做一致性检查时，GPT-4o mini 和备用的 judge 都没有和标注对上（标注是 LLM 做的），所以 MQM 只作参考报告。M6 先写好 paired bootstrap，在翻译任何 test 页之前合并，然后从这个标签出发，在三部 test 作品上把每个 config 各跑一次并打分（[记录](docs/m6.md)）。在这些运行上算出的 95% 置信区间只反映抽到哪些页带来的不确定性，不包括重跑带来的波动，因为每个 config 只跑了一次。和每页一次调用相比，full system 的 COMET 没有提升（−0.0028，区间 −0.0068 到 +0.0014），chrF（−1.2，区间 −2.3 到 −0.1）和 BLEU（−2.1，区间 −3.5 到 −0.8）更低，每页成本是它的 5.0 到 7.9 倍（是一个范围，因为账本看不出缓存输入实际按什么价格计费）。它在 glossary 的人名和自造词上的 term accuracy 和每页一次调用分不出高低（+2.1 个百分点，区间 −2.7 到 +6.8），Knowledge Base 也没有让它提高（+0.0 个百分点，区间 −5.1 到 +5.0）。它的 term consistency 比每页一次调用高 4.5 个百分点（区间 +0.8 到 +6.7），但在 dev 作品上把每页一次调用重跑一遍，consistency 就变了 7.0 个百分点，所以这个提升和重跑本身的波动分不开。下一步：图表和这部分分析的记录，然后是编辑器（M7）。
 
 ## 它做什么
 
@@ -79,9 +79,12 @@ uv run python eval/consistency.py runs/eval/<id>   # term consistency：真实�
 uv run python eval/mqm_agreement.py runs/mqm-human/<time>-sample --expected-sha256 <hash> <mqm 文件> ...   # 标注和 judge 对照
 uv run python eval/report.py runs/eval/<id> ... --mqm-judge <model> --mqm-agreement <文件>   # 和其余结果汇总
 uv run python eval/bootstrap.py runs/eval/<id> ... --mqm-judge <model>   # 按页 paired bootstrap 95% CI
+uv run python eval/costs.py runs/eval/<id> ... --ledger-range <eval id>=<first>-<last> ...   # 从账本算成本和延迟
 ```
 
 paired bootstrap 读的是和报告相同的 eval runs（三个 config 都要有，每个都带 consistency 和 MQM 文件），不调用模型，把两组对比中每个质量指标的 95% 置信区间写到 `runs/bootstrap/<time>-bootstrap/bootstrap.json`。
+
+成本小结读的是同样的 eval runs，以及每个 run 写进 `runs/usage.jsonl` 的那些行；这些行要由你指定，因为账本里没有 run id。它不调用模型，结果写到 `runs/analysis/<time>-costs/costs.json`：每页的调用次数、token 数和延迟，以及每页成本的范围，下限把缓存输入算作 $0，上限是账本记的成本。
 
 可选的 tracing：每翻译一页就生成一条 trace（包含每次模型调用、每个 agent 步骤和每次工具调用），发到你本机运行的 [Arize Phoenix](https://github.com/Arize-ai/phoenix)。在另一个终端启动 Phoenix，设置 `FUKIDASHI_TRACING=phoenix`（在 shell 或 `.env` 里都可以），然后打开 http://localhost:6006：
 
@@ -109,7 +112,7 @@ uv run python eval/glossary.py check                # 对照数据集检查 gold
 | M4 Dev 评测 | 11/15 | 完成（[记录](docs/m4.md)） |
 | M5 Eval protocol 与冻结 | 11/22 | 完成（[记录](docs/m5.md)） |
 | M6 Test 运行 | 12/13 | 完成（[记录](docs/m6.md)） |
-| M7–M8 编辑器产品化、分析 | 1/3 | 进行中（置信区间已完成） |
+| M7–M8 编辑器产品化、分析 | 1/3 | 进行中（置信区间和成本、延迟小结已完成） |
 | M9 报告与发布 | 1/17 | 计划中 |
 
 完整计划：[OUTLINE.md](OUTLINE.md)（设计、milestones、决定、风险）和 [SCOPE.md](SCOPE.md)（范围和 cut order），均为英文。
