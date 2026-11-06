@@ -1,7 +1,7 @@
 """Translate one page and record the Run. Knows nothing about HTTP.
 
 The API calls this with `baseline`; the eval harness calls the same function with any config (OUTLINE 1.3, Same code
-path).
+path). `edit_translation` records a person's edit of one Translation, as a Run of config `human` (OUTLINE §8).
 """
 
 from __future__ import annotations
@@ -33,6 +33,8 @@ FULL = orchestrator.KB_CONFIG_NAME  # `full_no_kb` with the Knowledge Base and t
 CONFIGS = (baseline.CONFIG_NAME, translator.CONFIG_NAME, orchestrator.CONFIG_NAME, FULL)
 # the configs whose Translator has earlier pages, each read from the Runs of its own config
 AGENT_CONFIGS = (translator.CONFIG_NAME, orchestrator.CONFIG_NAME, FULL)
+# a person's edit (OUTLINE §0, Human edit) is a Run too, but not one `translate_page` makes, so it is not in CONFIGS
+HUMAN = store.HUMAN
 
 
 class TranslateError(Exception):
@@ -48,6 +50,22 @@ class NothingToTranslate(TranslateError):
 
 
 class ImageMissing(TranslateError):
+    pass
+
+
+class EditError(Exception):
+    """A Translation cannot be edited; no Run was recorded. (An unknown page is a `PageNotFound`.)"""
+
+
+class SegmentNotFound(EditError):
+    pass
+
+
+class NothingToEdit(EditError):
+    """The page has no succeeded Run, so it has no Translation to edit."""
+
+
+class EmptyTranslation(EditError):
     pass
 
 
@@ -385,3 +403,43 @@ def _describe_run(
                      **{f"proposals_{r}": n for r, n in outcome_counts(finalize["outcomes"]).items()})
     if error is not None:
         span.fail(error)
+
+
+def edit_translation(conn: sqlite3.Connection, book_title: str, page_index: int, idx: int, text: str) -> int | None:
+    """A person's edit of one Segment's Translation (OUTLINE §8, "How a human edit is stored"): records a Run of config
+    `human` and returns its id, or returns None, with no Run, when `text` already is the Segment's Translation.
+
+    The base is the page's latest succeeded Run, of any config. The new Run's Translations are the base's, with the
+    Segment `idx` replaced by `text`, stored exactly as sent. Its `attempts_json` is
+      {"config": "human", "base_run_id": <the base Run's id>, "edits": [{"idx", "before", "after"}]}
+    (`edits` is a list because a rename will edit several Segments in one Run). It makes no model call, so the Run has no
+    calls and costs 0.0. Reading the base and writing the Run are one transaction: the base cannot change in between, and a
+    failure leaves no Run and no Translations. The page shows its latest succeeded Run, so a newer Run of any config
+    supersedes the edit, which stays stored.
+
+    Raises `EmptyTranslation` (`text` is empty or only whitespace), `PageNotFound`, `SegmentNotFound` (no Segment `idx` on
+    the page) or `NothingToEdit` (the page has no succeeded Run), each with no Run recorded. Call it with no transaction
+    open (`store.transaction` takes the write lock at once).
+    """
+    if not text.strip():
+        raise EmptyTranslation("a translation cannot be empty")
+    page_row = store.find_page(conn, book_title, page_index)
+    if page_row is None:
+        raise PageNotFound(f"no page {book_title}/{page_index}")
+    with store.transaction(conn):
+        base = store.latest_succeeded_run(conn, page_row["id"])
+        rows = store.segments_with_translations(conn, page_row["id"], base["id"] if base else None)
+        segment = next((r for r in rows if r["idx"] == idx), None)
+        if segment is None:
+            raise SegmentNotFound(f"no segment {idx} on {book_title}/{page_index}")
+        if base is None:
+            raise NothingToEdit(f"{book_title}/{page_index} has no translation to edit yet")
+        if segment["text_zh_hans"] == text:
+            return None
+        translations = {r["id"]: r["text_zh_hans"] for r in rows if r["text_zh_hans"] is not None}
+        translations[segment["id"]] = text
+        edit = {"idx": idx, "before": segment["text_zh_hans"], "after": text}
+        return store.insert_human_run(
+            conn, page_id=page_row["id"], translations=translations,
+            attempts={"config": HUMAN, "base_run_id": base["id"], "edits": [edit]},
+        )

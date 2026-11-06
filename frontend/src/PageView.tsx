@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
-import { fetchPage, translatePage, type PageDetail, type PageSummary, type Run } from './api'
+import { editTranslation, fetchPage, translatePage, type PageDetail, type PageSummary, type Run, type Segment } from './api'
 import { Link } from './Link'
 import { routePath } from './route'
+import { TranslationEditor } from './TranslationEditor'
 
 interface Props {
   book: string
@@ -14,7 +15,18 @@ interface Props {
 // One hue per segment, shared by its box on the image and its row in the list.
 const hue = (index: number) => `hsl(${(index * 67) % 360} 70% 48%)`
 
+// The row being edited: the text typed so far, and why the last save failed.
+interface Editing {
+  index: number
+  draft: string
+  error: string | null
+}
+
+const when = (iso: string) => new Date(iso).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'medium' })
+
 function runSummary(run: Run): string {
+  // A person's edit is a run with no call: no tokens and no cost to show.
+  if (run.config === 'human') return `human edit · ${when(run.finished_at ?? run.started_at)}`
   const parts = [run.config, run.response_model ?? run.model]
   parts.push(
     run.input_tokens === null || run.output_tokens === null
@@ -35,6 +47,8 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
   const [translateError, setTranslateError] = useState<string | null>(null)
   const [natural, setNatural] = useState<{ w: number; h: number } | null>(null)
   const [active, setActive] = useState<number | null>(null)
+  const [editing, setEditing] = useState<Editing | null>(null) // one row at a time
+  const [saving, setSaving] = useState(false)
 
   // The parent keys this component by page, so every page starts from fresh state.
   useEffect(() => {
@@ -58,6 +72,23 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
     }
   }
 
+  const startEdit = (s: Segment) => setEditing({ index: s.index, draft: s.text_zh_hans ?? '', error: null })
+
+  const onSave = async () => {
+    if (!editing || saving) return
+    const { index, draft } = editing
+    setSaving(true)
+    setEditing({ ...editing, error: null })
+    try {
+      setDetail(await editTranslation(book, pageIndex, index, draft))
+      setEditing(null)
+    } catch (e) {
+      setEditing((current) => current && { ...current, error: (e as Error).message }) // the draft stays
+    } finally {
+      setSaving(false)
+    }
+  }
+
   const siblings = pages.filter((p) => p.book_title === book)
   const at = siblings.findIndex((p) => p.page_index === pageIndex)
   const prev = at > 0 ? siblings[at - 1] : null
@@ -74,7 +105,7 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
           {prev && <Link to={routePath(book, prev.page_index)} navigate={navigate}>← {prev.page_index}</Link>}
           {next && <Link to={routePath(book, next.page_index)} navigate={navigate}>{next.page_index} →</Link>}
         </div>
-        <button onClick={onTranslate} disabled={translating || !detail || segments.length === 0}>
+        <button onClick={onTranslate} disabled={translating || saving || !detail || segments.length === 0}>
           {translating ? 'Translating…' : detail?.run ? 'Translate again' : 'Translate'}
         </button>
       </header>
@@ -126,9 +157,35 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
                 <span className="badge">{s.index}</span>
                 <div className="texts">
                   <p className="ja" lang="ja">{s.text_ja}</p>
-                  <p className={s.text_zh_hans ? 'out' : 'out empty'} lang="zh-Hans">
-                    {s.text_zh_hans ?? (translating ? '…' : 'not translated yet')}
-                  </p>
+                  {editing?.index === s.index ? (
+                    <TranslationEditor
+                      index={s.index}
+                      draft={editing.draft}
+                      error={editing.error}
+                      saving={saving}
+                      disabled={translating}
+                      onChange={(draft) => setEditing((current) => current && { ...current, draft })}
+                      onSave={onSave}
+                      onCancel={() => setEditing(null)}
+                    />
+                  ) : (
+                    <div className="out-line">
+                      <p className={s.text_zh_hans ? 'out' : 'out empty'} lang="zh-Hans">
+                        {s.text_zh_hans ?? (translating ? '…' : 'not translated yet')}
+                      </p>
+                      {s.text_zh_hans !== null && (
+                        <button
+                          type="button"
+                          className="secondary"
+                          onClick={() => startEdit(s)}
+                          disabled={translating || saving || editing !== null}
+                          aria-label={`Edit the translation of region ${s.index}`}
+                        >
+                          Edit
+                        </button>
+                      )}
+                    </div>
+                  )}
                   <p className="ref" lang="zh-Hant">
                     <span className="tag">zh-Hant reference</span> {s.text_zh_hant}
                   </p>

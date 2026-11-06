@@ -105,6 +105,29 @@ def finish_run(
         )
 
 
+# The config and the model of a person's edit (OUTLINE §0, Human edit): the person is the "model", and nothing is called.
+HUMAN = "human"
+
+
+def insert_human_run(conn: sqlite3.Connection, *, page_id: int, attempts: dict, translations: dict[int, str]) -> int:
+    """A `human` Run, finished as it is written, with its Translations (segment row id -> zh-Hans): succeeded, with no model
+    call (0 calls, none with unknown usage, tokens NULL, cost 0.0, no response model) and the same `started_at` and
+    `finished_at`. Unlike `start_run` and `finish_run` it does not commit: the caller's `transaction` owns all-or-nothing,
+    so a failure leaves no Run row, no `running` row and no Translations."""
+    now = _now()
+    run_id = conn.execute(
+        """INSERT INTO runs (page_id, config, config_json, model, status, calls, unknown_usage_calls, cost_usd,
+                             attempts_json, started_at, finished_at)
+           VALUES (?, ?, '{}', ?, 'succeeded', 0, 0, 0.0, ?, ?, ?)""",
+        (page_id, HUMAN, HUMAN, json.dumps(attempts, ensure_ascii=False), now, now),
+    ).lastrowid
+    conn.executemany(
+        "INSERT INTO translations (run_id, segment_id, text_zh_hans) VALUES (?, ?, ?)",
+        [(run_id, seg_id, text) for seg_id, text in translations.items()],
+    )
+    return run_id
+
+
 # --- Knowledge Base (OUTLINE 3.3) ---
 # Reads are open to everyone. The functions named in KB_WRITES write entries, profiles and proposals, and only
 # kb/curator.py calls them (a test scans the code for any other caller). They do not commit: the Curator's `apply`
