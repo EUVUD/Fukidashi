@@ -534,4 +534,11 @@ classDiagram
 - **M3 (done):** `Orchestrator`, `Reviewer` and `Curator` sit between `Runs` and `AgentLoop`, and the KB modules sit beside `Store`. `Runs.translate_page` gained the configs `full_no_kb` and `full`; for `full` it also loads the snapshot and runs finalize. Nothing in `LLMClient`, `AgentLoop` or the API changed shape: the editor still runs `baseline`.
 - **M4 (done):** term accuracy went into `evaluation/` (#42); COMET became a standalone script in `eval/` (#41) instead, so its dependencies stay out of the project. Both read a finished eval run's outputs (`segments.jsonl`). `EvalHarness` reports how often the KB reaches a page (#40), and `PooledReport` pools the scored eval runs of both dev books (#44). Nothing in the translation path changed shape.
 - **M5 (done):** the judge model (GPT-4o mini) is a second `LLMClient`, with a configuration, a `Meter` and a ledger of its own; GEMBA-MQM, the agreement check and term consistency went into `evaluation/` and score a finished eval run's outputs, like term accuracy (#48, #49, #52). The Curator gained rule 6, which merges a character into an existing profile (#47). The tuning changed the agents' prompts and tool descriptions and re-baselined the pinned request digests (#53). Nothing in the translation path changed shape.
-- **M7:** the frontend adds a canvas and editing to `PageView`, plus SSE, which adds an event subscription to the `api` module.
+- **M6 (done):** the paired bootstrap went into `evaluation/` (#58). It reads finished eval runs through the pooled report's own code. The test runs changed no file. Nothing in the translation path changed shape.
+- **M8 (done):** the cost / latency summary went into `evaluation/` (#63) and reads each eval run's lines of the ledger by range. The charts became a standalone script in `eval/` (#65), like COMET, and read only the report's, the intervals' and the cost summary's files. No model was called, and nothing in the translation path changed.
+- **M7 (planned, OUTLINE §8):**
+  - `Runs.translate_page` takes an optional event sink, which the Orchestrator, the agents and `AgentLoop` call.
+  - The API runs pages in the background and streams their Live trace events over SSE from a `run_events` table.
+  - A human edit is a Run of config `human`.
+  - A person's KB decisions go through `kb/curator.py`.
+  - The frontend adds a canvas and editing to `PageView`, plus SSE, which adds an event subscription to the `api` module.
