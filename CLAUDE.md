@@ -8,9 +8,9 @@ Fukidashi is a web editor that translates Japanese manga into Simplified Chinese
 
 - `OUTLINE.md`: design, milestones (§7), decisions (§8), pivot rules (§9). Its §0 Terminology table is canonical.
 - `SCOPE.md`: what is in and out of scope, and the cut order. `IDEAS.md`: where ideas outside a checkpoint go.
-- `docs/design.md`: domain model, system sequence diagram, object interaction diagram, object model. `docs/m0.md` to `docs/m6.md`: milestone records. `eval/PROTOCOL.md`: the eval protocol.
+- `docs/design.md`: domain model, system sequence diagram, object interaction diagram, object model. `docs/m0.md` to `docs/m6.md` and `docs/m8.md`: milestone records (M7 has none yet). `eval/PROTOCOL.md`: the eval protocol.
 
-M0 to M6 are done, and the author placed the freeze tag `exp-frozen` at `0c1fe05` (2026-10-30). The vertical slice (page → `baseline` → browser) works. M2 added the eval harness v0 (`eval/run.py`: `baseline` and `translator`, chrF / BLEU, manifest), the tool-calling loop (`agents/loop.py`: `run_agent` on LangChain's `create_agent`), the Translator Agent (`agents/translator.py`: config `translator`, M2's smoke config, with one tool, `get_previous_context`) and tracing (`tracing/`: one trace per page in a local Arize Phoenix, off by default). M3 added:
+M0 to M6 and M8 are done (M7, the editor, has not started), and the author placed the freeze tag `exp-frozen` at `0c1fe05` (2026-10-30). The vertical slice (page → `baseline` → browser) works. M2 added the eval harness v0 (`eval/run.py`: `baseline` and `translator`, chrF / BLEU, manifest), the tool-calling loop (`agents/loop.py`: `run_agent` on LangChain's `create_agent`), the Translator Agent (`agents/translator.py`: config `translator`, M2's smoke config, with one tool, `get_previous_context`) and tracing (`tracing/`: one trace per page in a local Arize Phoenix, off by default). M3 added:
 - the gold glossary for the dev split (`eval/gold_glossary/`, checked by `eval/glossary.py`);
 - the Translator's `flag_uncertain`;
 - the Reviewer Agent (`agents/reviewer.py`);
@@ -38,11 +38,16 @@ M6 added (record: `docs/m6.md`):
 - the paired bootstrap by page (`evaluation/bootstrap.py`, `eval/bootstrap.py`, #58), merged before the first test page, with the consistency interval's label decided per run (#59);
 - the test runs: each config once on each of the three test books, from a worktree of the tag, every run scored by every scorer, and the pooled report over the nine. They changed no file of the repository, so they have no PR; the eval outputs are under `runs/` (gitignored).
 
-M8 has begun: the paired bootstrap's intervals on the test runs, computed once (#61, `runs/bootstrap/20261101T023151Z-bootstrap/bootstrap.json`), after two tests pinned details of the consistency label, and the cost / latency summary (`evaluation/costs.py`, `eval/costs.py`, #63, `runs/analysis/20261101T035019Z-costs/costs.json`). The MQM error breakdown needed no tool of its own: the pooled report has held it since #52 (`pooled[config].mqm.breakdown`, `by_book[book][config].mqm.breakdown`).
+M8 added (record: `docs/m8.md`), with no model call:
+- the paired bootstrap's intervals on the test runs, computed once (#61, `runs/bootstrap/20261101T023151Z-bootstrap/bootstrap.json`), after two tests pinned details of the consistency label;
+- the cost / latency summary (`evaluation/costs.py`, `eval/costs.py`, #63, `runs/analysis/20261101T035019Z-costs/costs.json`), with cost per page as a range;
+- the charts (`eval/charts.py`, #65, `runs/analysis/20261104T204927Z-charts/`), whose five SVGs are in `docs/figures/`.
 
-Say these accurately. **Neither judge passed the agreement check** (the labels are Claude's, an LLM's, and mark one error in 30 items), so MQM is for reference only: never call it validated. The tuned dev numbers are on the books the prompts were tuned on, one run each: they are not held-out estimates. The test numbers are held out and one run per config, and their intervals cover only which pages were drawn (OUTLINE §8, "Reading the intervals next to the run-to-run spread"): neither primary metric shows a gain, `full` is lower than `baseline` on chrF and BLEU, and `full`'s term consistency gain over `baseline` is not separated from run-to-run variation, so never call it a demonstrated gain. Six test pages failed, all in `balloon_dream`: two when the Mac slept, four when the provider account ran dry (HTTP 402). The stop rule fired on that `full` run, and the author waived it before any scoring (OUTLINE §8), so the report covers all three books. Cost per page is a range, from cached input at $0 up to the ledger's cost, and it is arithmetic on the ledger, not the invoice (OUTLINE §8, "Cost per page with cached input"): on the common pages `full` costs 5.0 to 7.9 times `baseline` and 1.2 to 1.5 times `full_no_kb`.
+The MQM error breakdown needed no tool of its own: the pooled report has held it since #52 (`pooled[config].mqm.breakdown`, `by_book[book][config].mqm.breakdown`).
 
-These do not exist yet, so do not describe them as implemented: the charts and M8's record, the report (M9), and any agent config in the editor (the API runs `baseline` only). xCOMET is not reported: it does not fit the available GPU (OUTLINE §8). The test runs are final: each config ran once on each test book (`eval/PROTOCOL.md`), and nothing reruns or continues them, redoes a failed page, or adds a config on the test books.
+Say these accurately. **Neither judge passed the agreement check** (the labels are Claude's, an LLM's, and mark one error in 30 items), so MQM is for reference only: never call it validated. The tuned dev numbers are on the books the prompts were tuned on, one run each: they are not held-out estimates. The test numbers are held out and one run per config, and their intervals cover only which pages were drawn (OUTLINE §8, "Reading the intervals next to the run-to-run spread"): neither primary metric shows a gain, `full` is lower than `baseline` on chrF and BLEU, and `full`'s term consistency gain over `baseline` is not separated from run-to-run variation, so never call it a demonstrated gain. Six test pages failed, all in `balloon_dream`: two when the Mac slept, four when the provider account ran dry (HTTP 402). The stop rule fired on that `full` run, and the author waived it before any scoring (OUTLINE §8), so the report covers all three books. Cost per page is a range, from cached input at $0 up to the ledger's cost, and it is arithmetic on the ledger, not the invoice (OUTLINE §8, "Cost per page with cached input"): on the common pages `full` costs 5.0 to 7.9 times `baseline` and 1.2 to 1.5 times `full_no_kb`. The entry-by-entry account of term accuracy in `docs/m8.md` rests on one run per config: it describes, it does not test.
+
+These do not exist yet, so do not describe them as implemented: M7's editor features (OUTLINE §7), the report (M9), and any agent config in the editor (the API runs `baseline` only). xCOMET is not reported: it does not fit the available GPU (OUTLINE §8). The test runs are final: each config ran once on each test book (`eval/PROTOCOL.md`), and nothing reruns or continues them, redoes a failed page, or adds a config on the test books.
 
 Docs are written in English. The README also exists in Simplified Chinese (`README.zh-CN.md`): change both together. Use the §0 terms verbatim and add any new term to that table. The repository is public: write docs for outside readers.
 
@@ -93,6 +98,9 @@ uv run python eval/bootstrap.py runs/eval/<id> ... --mqm-judge <model>   # the p
 uv run python eval/costs.py runs/eval/<id> ... --ledger-range <eval id>=<first>-<last> ...   # cost and latency of the eval
                                                # runs the report pools, from each run's lines of runs/usage.jsonl:
                                                # runs/analysis/<time>-costs/costs.json; reads files only
+uv run eval/charts.py --report <report.json> --bootstrap <bootstrap.json> --costs <costs.json>   # M8's five charts
+                                               # (SVG, PNG) and charts.json in runs/analysis/<time>-charts/; its own
+                                               # PEP 723 environment (matplotlib), like eval/comet.py; reads files only
 uv run python eval/mqm.py runs/eval/<id>       # GEMBA-MQM of a finished eval run: REAL judge calls (JUDGE_*), mqm-<model>.json;
                                                # --judge-prefix JUDGE2 for the fallback judge
 uv run python eval/mqm.py --reparse runs/eval/<id>/mqm-<model>.json --dry-run   # read stored answers again with the
@@ -139,8 +147,9 @@ evaluation/         eval library: harness, OpenCC references, sacreBLEU metrics,
                     consistency.py (term consistency; its judge calls come from the CLI eval/consistency.py),
                     bootstrap.py (the paired bootstrap; CLI eval/bootstrap.py) and costs.py (cost and latency
                     from the ledger; CLI eval/costs.py)
-eval/comet.py       COMET, the one entry point whose logic is not in evaluation/: a PEP 723 script with its own
-                    environment (unbabel-comet 2.2.7, Python below 3.14) that imports nothing from fukidashi
+eval/comet.py       COMET, and eval/charts.py, M8's charts: the two entry points whose logic is not in evaluation/.
+eval/charts.py      Each is a PEP 723 script with its own environment (COMET: unbabel-comet 2.2.7, Python below
+                    3.14; charts: matplotlib 3.11.2) that imports nothing from fukidashi
 tracing/            setup(): OpenTelemetry + OpenInference instrumentors; page_span(): each page's root span;
                     backends.py: the backend (Phoenix) is one function; redact.py strips images and the key
 ```
@@ -213,6 +222,13 @@ Invariants that span several files:
   - **Figures.** For each config, pooled and per book, on the common pages and on the attempted pages: calls per page; tokens per page (uncached input, cached input, output); the cached share of input; cost per page as a range (lower: cached input at $0; upper: the ledger's cost; `--cached-input-price-per-m` adds a value at that price); latency p50, p95 and mean.
   - **Unknown is not 0.** A failed page's calls count in the attempted pages. A figure with a line without usage or cost in its scope is null, never a partial sum, so `n/a` is what the attempted view shows for the cells with failures; `runs[]` keeps the sums over the lines that have them. These figures are not billed amounts.
   - **Output.** `runs/analysis/<UTC time>-costs/costs.json`, through a temporary file, and a printed table. The official output on the test runs is `runs/analysis/20261101T035019Z-costs/costs.json` (#63): a check of it goes to a scratch `--out-root`, never to `runs/analysis/`.
+- The charts (`eval/charts.py`, OUTLINE §8) read only the report's, the intervals' and the cost summary's JSON files.
+  - **Environment.** Like `eval/comet.py`, a PEP 723 script: `matplotlib` is pinned in its inline metadata and imported only inside `render`, and nothing comes from `fukidashi`, so `pyproject.toml` and `uv.lock` never gain `matplotlib`. `build_charts` is pure, and `backend/tests/test_charts_script.py` tests it without `matplotlib`.
+  - **Refusals.** Exit 2, with nothing written, when the three files do not name the same eval runs or the same common pages, or when a number the charts need is absent.
+  - **Readings.** The script applies OUTLINE §8's reading to each interval (OUTLINE §0, Reading), with M5's six spreads as constants. `test_the_spreads_are_the_ones_the_outline_row_states` reads the OUTLINE §8 row "Reading the intervals next to the run-to-run spread", so a PR that rewords that row changes the test too.
+  - **Numbers.** Every number on a chart is in `charts.json` with its source file and JSON Pointer. A null is listed under `missing`, never drawn as 0. `charts.json` records the script's sha256, not a commit.
+  - **Bytes.** The same inputs give the same SVG, PNG and `charts.json` bytes on one machine; the dependencies other than `matplotlib` float.
+  - **Output.** `runs/analysis/<UTC time>-charts/`, written through a temporary directory. The official output is `runs/analysis/20261104T204927Z-charts/` (#65), and its five SVGs are copied to `docs/figures/` for the docs. A check of it goes to a scratch `--out-root`, never to `runs/analysis/`.
 - `fukidashi.config.ROOT` comes from `__file__`, so the package must stay an editable install (`uv sync`).
 - The frontend positions boxes in percent of the image's natural size. `frontend/src/api.ts` mirrors the pydantic models in `api/pages.py` by hand; change both together.
 
