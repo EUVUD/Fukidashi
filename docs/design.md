@@ -493,6 +493,7 @@ classDiagram
     class PageView {
         detail
         translating
+        editing
         error
     }
     class api {
@@ -500,6 +501,7 @@ classDiagram
         fetchPages()
         fetchPage()
         translatePage()
+        editTranslation()
     }
     class FastAPI {
         <<backend /api>>
@@ -508,7 +510,7 @@ classDiagram
     App *-- PageList
     App *-- PageView
     App ..> api : fetchPages
-    PageView ..> api : fetchPage, translatePage
+    PageView ..> api : fetchPage, translatePage, editTranslation
     api ..> FastAPI : HTTP
 ```
 
@@ -519,7 +521,7 @@ classDiagram
 | Book | `books` | `book_title` (string) | `PageSummary.book_title` |
 | Page | `pages` | `Page` | `PageSummary`, `PageDetail` |
 | Segment | `segments` | `Segment` | `SegmentOut` / `Segment` |
-| Run | `runs` | No class of its own: `Runs.translate_page` writes the row through `Store.start_run` / `finish_run`, using `Meter.summary()` and `BaselineResult` | `RunOut` / `Run` |
+| Run | `runs` | No class of its own: `Runs.translate_page` writes the row through `Store.start_run` / `finish_run`, using `Meter.summary()` and `BaselineResult`; a human edit's Run is written by `Runs.edit_translation` through `Store.insert_human_run` | `RunOut` / `Run` |
 | Translation | `translations` | `BaselineResult.translations` or `TranslatorResult.translations` | `Segment.text_zh_hans` |
 | Manifest | none (`runs/eval/<id>/manifest.json`) | written by `run_eval` | none |
 | Knowledge Base | `kbs` | `kb_id`; `KBSnapshot` (`load_snapshot`) to read it; one per `full` eval run | none yet |
@@ -536,9 +538,9 @@ classDiagram
 - **M5 (done):** the judge model (GPT-4o mini) is a second `LLMClient`, with a configuration, a `Meter` and a ledger of its own; GEMBA-MQM, the agreement check and term consistency went into `evaluation/` and score a finished eval run's outputs, like term accuracy (#48, #49, #52). The Curator gained rule 6, which merges a character into an existing profile (#47). The tuning changed the agents' prompts and tool descriptions and re-baselined the pinned request digests (#53). Nothing in the translation path changed shape.
 - **M6 (done):** the paired bootstrap went into `evaluation/` (#58). It reads finished eval runs through the pooled report's own code. The test runs changed no file. Nothing in the translation path changed shape.
 - **M8 (done):** the cost / latency summary went into `evaluation/` (#63) and reads each eval run's lines of the ledger by range. The charts became a standalone script in `eval/` (#65), like COMET, and read only the report's, the intervals' and the cost summary's files. No model was called, and nothing in the translation path changed.
-- **M7 (planned, OUTLINE §8):**
+- **M7 (in progress, OUTLINE §8):**
   - `Runs.translate_page` takes an optional event sink, which the Orchestrator, the agents and `AgentLoop` call.
   - The API runs pages in the background and streams their Live trace events over SSE from a `run_events` table.
-  - A human edit is a Run of config `human`.
+  - A human edit is a Run of config `human`, written by `Runs.edit_translation` through `Store.insert_human_run` (built, #68).
   - A person's KB decisions go through `kb/curator.py`.
-  - The frontend adds a canvas and editing to `PageView`, plus SSE, which adds an event subscription to the `api` module.
+  - The frontend adds a canvas to `PageView` (editing is built: `TranslationEditor`, #68), plus SSE, which adds an event subscription to the `api` module.
