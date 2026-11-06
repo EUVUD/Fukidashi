@@ -1,7 +1,7 @@
-"""REST endpoints for pages: list, detail (segments + latest translation), image, translate.
+"""REST endpoints for pages: list, detail (segments + latest translation), image, translate, edit a translation.
 
 This layer parses requests, maps errors to status codes and shapes responses. The work itself lives in
-fukidashi.runs (translate and record a Run) and fukidashi.store (SQL).
+fukidashi.runs (translate or edit, and record a Run) and fukidashi.store (SQL).
 """
 
 from __future__ import annotations
@@ -61,6 +61,10 @@ class PageDetail(BaseModel):
     image_url: str
     segments: list[SegmentOut]
     run: RunOut | None  # latest succeeded run; None until the page has been translated
+
+
+class TranslationEdit(BaseModel):
+    text_zh_hans: str  # stored exactly as sent; empty or only whitespace is refused
 
 
 def _page_or_404(conn: sqlite3.Connection, book_title: str, page_index: int) -> sqlite3.Row:
@@ -132,4 +136,23 @@ def translate_page(
         raise HTTPException(status_code=503, detail=str(e)) from e
     if not outcome.result.ok:
         raise HTTPException(status_code=502, detail=outcome.result.error)
+    return _page_detail(conn, _page_or_404(conn, book_title, page_index))
+
+
+@router.put("/pages/{book_title}/{page_index}/segments/{idx}/translation", response_model=PageDetail)
+def edit_translation(
+    book_title: str,
+    page_index: int,
+    idx: int,
+    edit: TranslationEdit,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> PageDetail:
+    try:
+        runs.edit_translation(conn, book_title, page_index, idx, edit.text_zh_hans)
+    except (runs.PageNotFound, runs.SegmentNotFound) as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except runs.NothingToEdit as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except runs.EmptyTranslation as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
     return _page_detail(conn, _page_or_404(conn, book_title, page_index))

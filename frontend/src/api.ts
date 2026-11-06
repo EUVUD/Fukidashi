@@ -70,3 +70,10 @@ export const fetchPage = (book: string, index: number, signal?: AbortSignal) =>
   request<PageDetail>(pagePath(book, index), { signal })
 export const translatePage = (book: string, index: number) =>
   request<PageDetail>(`${pagePath(book, index)}/translate`, { method: 'POST' })
+// A person's edit of one segment's translation: the page, with the edit as its latest run.
+export const editTranslation = (book: string, index: number, segment: number, text: string) =>
+  request<PageDetail>(`${pagePath(book, index)}/segments/${segment}/translation`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text_zh_hans: text }),
+  })

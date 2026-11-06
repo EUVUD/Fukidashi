@@ -63,6 +63,8 @@ button {
   background: var(--accent); color: var(--accent-text);
 }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
+button.secondary { padding: 1px 10px; font-size: 13px; background: transparent; color: var(--accent); border: 1px solid var(--border); }
+button.secondary:hover:not(:disabled) { border-color: var(--accent); }
 .run-info { font-size: 13px; margin: 4px 0 12px; }
 
 .columns { display: grid; grid-template-columns: minmax(300px, 520px) minmax(320px, 1fr); gap: 24px; align-items: start; margin-top: 12px; }
@@ -93,5 +95,16 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .ja { color: var(--muted); font-size: 13px; }
 .out { font-size: 17px; font-weight: 500; margin: 2px 0 !important; }
 .out.empty { color: var(--muted); font-weight: 400; font-size: 14px; font-style: italic; }
+.out-line { display: flex; align-items: baseline; gap: 8px; }
+.out-line .out { flex: 1; min-width: 0; }
+.editor { margin: 2px 0; }
+.edit-text {
+  display: block; width: 100%; padding: 6px 8px; font: inherit; font-size: 17px; font-weight: 500; resize: vertical;
+  color: var(--text); background: var(--bg); border: 1px solid var(--accent); border-radius: 6px;
+}
+.edit-text:disabled { opacity: 0.6; }
+.editor .error { margin: 6px 0 0; font-size: 13px; }
+.editor-actions { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+.editor-actions .hint { font-size: 12px; }
 .ref { font-size: 13px; color: var(--muted); }
 .tag { font-size: 11px; border: 1px solid var(--border); border-radius: 3px; padding: 0 4px; margin-right: 4px; }
