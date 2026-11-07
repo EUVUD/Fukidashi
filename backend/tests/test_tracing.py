@@ -13,7 +13,7 @@ import types
 import httpx
 import pytest
 import requests
-from conftest import FakeClient, completion, mock_llm_client
+from conftest import FakeClient, completion, mock_llm_client, post_translate
 from fastapi.testclient import TestClient
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.trace import TracerProvider
@@ -634,24 +634,24 @@ def test_the_api_without_the_variable_starts_with_tracing_off(monkeypatch, tmp_p
         assert tracing.describe() == {"enabled": False}
 
 
-def test_an_api_request_leaves_one_trace(api, traced):
+def test_an_api_request_leaves_one_trace(api, background, traced):
     client, use_replies = api
     use_replies(json.dumps({"translations": [{"id": 0, "zh": "你好"}, {"id": 1, "zh": "再见"}]}))
 
-    response = client.post("/api/pages/book_a/1/translate")
+    response = post_translate(client, background)
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     (top,) = traced.spans()
     assert top.name == "translate_page book_a/1" and top.attributes["fukidashi.config"] == "baseline"
     assert top.attributes["fukidashi.run_status"] == "succeeded"
 
 
 @pytest.mark.parametrize("page, status", [(99, 404), (2, 422), (1, 503)])
-def test_the_api_keeps_its_status_codes_for_early_failures_with_tracing_on(api, traced, conn, page, status):
+def test_the_api_keeps_its_status_codes_for_early_failures_with_tracing_on(api, background, traced, conn, page, status):
     client, _ = api
     main.app.dependency_overrides[get_client_factory] = lambda: not_configured  # only page 1 gets as far as the client
 
-    response = client.post(f"/api/pages/book_a/{page}/translate")
+    response = post_translate(client, background, page=page)
 
     assert response.status_code == status
     if status == 503:

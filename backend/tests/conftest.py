@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass, field
 
 import httpx
@@ -11,7 +12,8 @@ from fastapi.testclient import TestClient
 
 from fukidashi import tracing
 from fukidashi.agents.loop import TRACING_VARIABLES
-from fukidashi.api.deps import get_client_factory, get_dataset_root, get_db
+from fukidashi.api.deps import get_background_runs, get_client_factory, get_dataset_root, get_db, get_db_path
+from fukidashi.background import BackgroundRuns
 from fukidashi.datasets.importer import import_openmantra
 from fukidashi.db import connect, init_db
 from fukidashi.llm.client import LLMClient, LLMConfig, LLMResult
@@ -97,6 +99,31 @@ class UsageClient(FakeClient):
         return LLMResult(text=self.replies.pop(0), finish_reason="stop", record=rec)
 
 
+class Hold:
+    """A gate in front of a provider, for a Run in a background thread that the test wants to see while it is running: the
+    Run's thread calls `wait()` and stays there until the test sets `release`; `entered` is set once a Run has got there."""
+
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def wait(self) -> None:
+        self.entered.set()
+        if not self.release.wait(30):
+            raise TimeoutError("the test never released the provider")
+
+
+@dataclass
+class GatedClient(FakeClient):
+    """Like FakeClient, but each call waits at `hold` first."""
+
+    hold: Hold = field(default_factory=Hold)
+
+    def chat(self, messages, *, budget, max_tokens=4096, json_output=False) -> LLMResult:
+        self.hold.wait()
+        return super().chat(messages, budget=budget, max_tokens=max_tokens, json_output=json_output)
+
+
 class CrashAfterCallClient(FakeClient):
     """Makes one priced call, then raises: a crash that happens after money was spent."""
 
@@ -129,9 +156,47 @@ def mock_llm_client(handler, *, meter: Meter | None = None, api_key: str = "test
 
 
 @pytest.fixture
-def api(dataset, db_path, conn):
+def new_hold():
+    """`new_hold()` makes a `Hold`; every one is released when the test ends, so a failing test cannot leave a Run's thread
+    waiting at the provider."""
+    made: list[Hold] = []
+
+    def make() -> Hold:
+        made.append(Hold())
+        return made[-1]
+
+    make.made = made  # type: ignore[attr-defined]
+    return make
+
+
+@pytest.fixture
+def background(new_hold):
+    """The registry of background Runs the API uses in a test: a fresh one, and every Run it started has ended when the
+    test does (a Run's thread must not outlive the test's database)."""
+    runs = BackgroundRuns()
+    yield runs
+    for hold in new_hold.made:
+        hold.release.set()
+    assert runs.wait_idle(30), "a background Run is still going at the end of the test"
+
+
+@pytest.fixture
+def clients():
+    """The clients the API's factory hands out: a Run takes the last one added when its thread calls the factory."""
+    return []
+
+
+def post_translate(client, background, book="book_a", page=1, **json_body):
+    """POST Translate and, when the Run was started, wait until its thread has ended: the response, with the Run over.
+    (A POST that was refused starts no thread, so the wait returns at once.)"""
+    resp = client.post(f"/api/pages/{book}/{page}/translate", json=json_body or None)
+    assert background.wait_idle(30)
+    return resp
+
+
+@pytest.fixture
+def api(dataset, db_path, conn, clients, background):
     import_openmantra(conn, dataset)
-    clients: list[FakeClient] = []
 
     def use_replies(*replies: str) -> FakeClient:
         client = FakeClient(list(replies))
@@ -146,7 +211,9 @@ def api(dataset, db_path, conn):
             c.close()
 
     app.dependency_overrides[get_db] = override_db
+    app.dependency_overrides[get_db_path] = lambda: db_path
     app.dependency_overrides[get_dataset_root] = lambda: dataset
     app.dependency_overrides[get_client_factory] = lambda: lambda: clients[-1]
+    app.dependency_overrides[get_background_runs] = lambda: background
     yield TestClient(app), use_replies
     app.dependency_overrides.clear()

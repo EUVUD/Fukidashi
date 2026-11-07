@@ -1,5 +1,17 @@
-import { useEffect, useState } from 'react'
-import { editTranslation, fetchPage, translatePage, type PageDetail, type PageSummary, type Run, type Segment } from './api'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import {
+  ApiError,
+  editTranslation,
+  fetchPage,
+  translatePage,
+  watchRun,
+  type PageDetail,
+  type PageSummary,
+  type Run,
+  type RunEnd,
+  type Segment,
+  type TranslateConfig,
+} from './api'
 import { Link } from './Link'
 import { routePath } from './route'
 import { TranslationEditor } from './TranslationEditor'
@@ -43,32 +55,75 @@ function runSummary(run: Run): string {
 export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Props) {
   const [detail, setDetail] = useState<PageDetail | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
-  const [translating, setTranslating] = useState(false)
+  const [translating, setTranslating] = useState(false) // a run of this page is being watched, started here or found on load
   const [translateError, setTranslateError] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
+  const [config, setConfig] = useState<TranslateConfig>('baseline')
+  const stopWatching = useRef<(() => void) | null>(null)
   const [natural, setNatural] = useState<{ w: number; h: number } | null>(null)
   const [active, setActive] = useState<number | null>(null)
   const [editing, setEditing] = useState<Editing | null>(null) // one row at a time
   const [saving, setSaving] = useState(false)
 
+  // Watch a run until its `run_end`, then show what it left on the page. The run goes on in the backend if this view goes away.
+  const watch = useCallback(
+    (runId: number) => {
+      stopWatching.current?.()
+      setTranslating(true)
+      stopWatching.current = watchRun(runId, async (end: RunEnd | null) => {
+        stopWatching.current = null
+        try {
+          const page = await fetchPage(book, pageIndex)
+          setDetail(page)
+          if (page.run) onTranslated(book, pageIndex)
+          if (end?.status === 'failed') setTranslateError(end.error ?? 'the run failed')
+        } catch (e) {
+          setTranslateError((e as Error).message)
+        } finally {
+          setTranslating(false)
+        }
+      })
+    },
+    [book, pageIndex, onTranslated],
+  )
+
   // The parent keys this component by page, so every page starts from fresh state.
   useEffect(() => {
     const ctrl = new AbortController()
-    fetchPage(book, pageIndex, ctrl.signal).then(setDetail, (e: Error) => {
-      if (!ctrl.signal.aborted) setLoadError(e.message)
-    })
-    return () => ctrl.abort()
-  }, [book, pageIndex])
+    fetchPage(book, pageIndex, ctrl.signal).then(
+      (page) => {
+        if (ctrl.signal.aborted) return
+        setDetail(page)
+        if (page.running_run_id !== null) watch(page.running_run_id) // a reload: the page goes on waiting for its run
+      },
+      (e: Error) => {
+        if (!ctrl.signal.aborted) setLoadError(e.message)
+      },
+    )
+    return () => {
+      ctrl.abort()
+      stopWatching.current?.()
+      stopWatching.current = null
+    }
+  }, [book, pageIndex, watch])
 
   const onTranslate = async () => {
     setTranslating(true)
     setTranslateError(null)
+    setNotice(null)
     try {
-      setDetail(await translatePage(book, pageIndex))
-      onTranslated(book, pageIndex)
+      watch((await translatePage(book, pageIndex, config)).run_id)
     } catch (e) {
-      setTranslateError((e as Error).message)
-    } finally {
       setTranslating(false)
+      if (e instanceof ApiError && e.status === 409) {
+        setNotice('This page is already being translated.')
+        fetchPage(book, pageIndex).then((page) => {
+          setDetail(page)
+          if (page.running_run_id !== null) watch(page.running_run_id)
+        }, () => {})
+      } else {
+        setTranslateError((e as Error).message)
+      }
     }
   }
 
@@ -105,6 +160,15 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
           {prev && <Link to={routePath(book, prev.page_index)} navigate={navigate}>← {prev.page_index}</Link>}
           {next && <Link to={routePath(book, next.page_index)} navigate={navigate}>{next.page_index} →</Link>}
         </div>
+        <select
+          value={config}
+          onChange={(e) => setConfig(e.target.value as TranslateConfig)}
+          disabled={translating}
+          aria-label="Configuration to translate with"
+        >
+          <option value="baseline">baseline</option>
+          <option value="full">full</option>
+        </select>
         <button onClick={onTranslate} disabled={translating || saving || !detail || segments.length === 0}>
           {translating ? 'Translating…' : detail?.run ? 'Translate again' : 'Translate'}
         </button>
@@ -112,7 +176,8 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
 
       {loadError && <p className="error">{loadError}</p>}
       {translateError && <p className="error" role="alert">Translation failed: {translateError}</p>}
-      {translating && <p className="muted">Waiting for the model. This usually takes a few seconds.</p>}
+      {notice && <p className="muted" role="status">{notice}</p>}
+      {translating && <p className="muted">Waiting for the model. The page updates when the run ends.</p>}
       {detail && segments.length === 0 && <p className="muted">This page has no text regions.</p>}
       {detail?.run && <p className="muted run-info">{runSummary(detail.run)}</p>}
       {!detail && !loadError && <p className="muted">Loading…</p>}

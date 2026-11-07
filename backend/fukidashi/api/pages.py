@@ -1,7 +1,8 @@
 """REST endpoints for pages: list, detail (segments + latest translation), image, translate, edit a translation.
 
 This layer parses requests, maps errors to status codes and shapes responses. The work itself lives in
-fukidashi.runs (translate or edit, and record a Run) and fukidashi.store (SQL).
+fukidashi.runs (translate or edit, and record a Run), fukidashi.background (a translate runs in the background) and
+fukidashi.store (SQL).
 """
 
 from __future__ import annotations
@@ -9,14 +10,16 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Callable
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from .. import runs, store
+from ..background import BackgroundRuns, RunInProgress
 from ..llm.client import LLMClient, LLMNotConfigured
-from .deps import get_client_factory, get_dataset_root, get_db
+from .deps import get_background_runs, get_client_factory, get_dataset_root, get_db, get_db_path
 
 router = APIRouter(prefix="/api")
 
@@ -61,6 +64,18 @@ class PageDetail(BaseModel):
     image_url: str
     segments: list[SegmentOut]
     run: RunOut | None  # latest succeeded run; None until the page has been translated
+    running_run_id: int | None  # the id of the page's `running` Run, or None: a reload finds the Run to watch
+
+
+class TranslateRequest(BaseModel):
+    """The optional body of Translate. The editor runs `baseline` or `full` (OUTLINE §8)."""
+
+    model_config = ConfigDict(extra="forbid")  # a misspelt key is a 422, not a quiet `baseline`
+    config: Literal["baseline", "full"] = "baseline"
+
+
+class RunStarted(BaseModel):
+    run_id: int
 
 
 class TranslationEdit(BaseModel):
@@ -88,6 +103,7 @@ def _page_detail(conn: sqlite3.Connection, page_row: sqlite3.Row) -> PageDetail:
             for s in segments
         ],
         run=RunOut(**{k: run[k] for k in RunOut.model_fields}) if run else None,
+        running_run_id=store.running_run_id(conn, page_row["id"]),
     )
 
 
@@ -114,18 +130,26 @@ def get_page_image(
     return FileResponse(path)
 
 
-@router.post("/pages/{book_title}/{page_index}/translate", response_model=PageDetail)
+@router.post("/pages/{book_title}/{page_index}/translate", response_model=RunStarted, status_code=202)
 def translate_page(
     book_title: str,
     page_index: int,
+    body: TranslateRequest | None = None,
     conn: sqlite3.Connection = Depends(get_db),
     dataset_root: Path = Depends(get_dataset_root),
     make_client: Callable[[], LLMClient] = Depends(get_client_factory),
-) -> PageDetail:
+    background: BackgroundRuns = Depends(get_background_runs),
+    db_path: Path = Depends(get_db_path),
+) -> RunStarted:
+    """Start the page in the background and answer once its Run exists. The Run's end, and a failure, are reported by its
+    events (`GET /api/runs/{run_id}/events`) and by the page, not by this response."""
     try:
-        outcome = runs.translate_page(
-            conn, book_title, page_index, make_client=make_client, dataset_root=dataset_root
+        run_id = background.start(
+            conn, book_title, page_index, config=(body or TranslateRequest()).config, make_client=make_client,
+            dataset_root=dataset_root, db_path=db_path,
         )
+    except RunInProgress as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except runs.PageNotFound as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     except runs.ImageMissing as e:
@@ -134,9 +158,7 @@ def translate_page(
         raise HTTPException(status_code=422, detail=str(e)) from e
     except LLMNotConfigured as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
-    if not outcome.result.ok:
-        raise HTTPException(status_code=502, detail=outcome.result.error)
-    return _page_detail(conn, _page_or_404(conn, book_title, page_index))
+    return RunStarted(run_id=run_id)
 
 
 @router.put("/pages/{book_title}/{page_index}/segments/{idx}/translation", response_model=PageDetail)
