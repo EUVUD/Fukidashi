@@ -8,6 +8,8 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
+from .live_trace import RunEvent
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -126,6 +128,27 @@ def insert_human_run(conn: sqlite3.Connection, *, page_id: int, attempts: dict, 
         [(run_id, seg_id, text) for seg_id, text in translations.items()],
     )
     return run_id
+
+
+def add_run_event(conn: sqlite3.Connection, event: RunEvent) -> None:
+    """Store one live trace event of a Run (OUTLINE §8), committed at once so that another connection reads it while the
+    Run is still `running`. Raises `RuntimeError` when a transaction is open: the commit would end another write
+    halfway. A (run, seq) stored twice raises `sqlite3.IntegrityError`."""
+    if conn.in_transaction:
+        raise RuntimeError("add_run_event commits at once, so it cannot run inside another write's transaction")
+    with conn:
+        conn.execute(
+            "INSERT INTO run_events (run_id, seq, kind, data_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            (event.run_id, event.seq, event.kind, json.dumps(event.data, ensure_ascii=False, allow_nan=False), _now()),
+        )
+
+
+def run_events(conn: sqlite3.Connection, run_id: int, after_seq: int = 0) -> list[RunEvent]:
+    """The stored events of the Run with `seq` greater than `after_seq`, in `seq` order: all of them by default, and
+    with the `seq` a client saw last, the ones it missed."""
+    return [RunEvent(r["run_id"], r["seq"], r["kind"], json.loads(r["data_json"])) for r in conn.execute(
+        "SELECT run_id, seq, kind, data_json FROM run_events WHERE run_id = ? AND seq > ? ORDER BY seq",
+        (run_id, after_seq))]
 
 
 # --- Knowledge Base (OUTLINE 3.3) ---

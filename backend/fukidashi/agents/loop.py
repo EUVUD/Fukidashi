@@ -26,6 +26,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, ValidationError
 
+from ..live_trace import MODEL_CALL, TOOL_RESULT, Emit
 from ..llm.client import LLMClient
 from ..llm.errors import ProviderError
 from ..llm.metering import BudgetExceeded, PageBudget
@@ -85,8 +86,13 @@ def run_agent(
     max_tokens: int = DEFAULT_MAX_TOKENS,
     json_output: bool = False,
     max_steps: int = DEFAULT_MAX_STEPS,
+    emit: Emit | None = None,
 ) -> AgentResult:
     """Run the model through tool calls to a final answer. Provider failures and spent budgets end up in the result.
+
+    With an `emit` (live_trace.py), each model call and each tool result is reported as it happens, in the calling
+    thread: a `model_call` for every call that returned or failed, a `tool_result` for every tool message. Nothing
+    else about the run changes, and without one it takes the path it always took.
 
     Raises `TracingEnabled`, before any request, when LangSmith tracing is switched on in the environment.
     """
@@ -111,9 +117,11 @@ def run_agent(
     config = {"recursion_limit": 6 * max_steps + 10}
     state: dict = {"messages": [HumanMessage(content=user_message)]}
     failed_step: dict | None = None
+    report = _Report(emit) if emit is not None else None
     try:
         for state in agent.stream(state, config, stream_mode="values"):
-            pass
+            if report is not None:
+                report.new_messages(state["messages"])
     except ModelCallLimitExceededError as e:
         stop_reason, error = STEP_LIMIT, str(e)
     except BudgetExceeded as e:
@@ -122,6 +130,8 @@ def run_agent(
         stop_reason, error = PROVIDER_ERROR, e.description
         failed_step = {"record": asdict(e.record) if e.record is not None else None, "finish_reason": None,
                        "text": "", "reasoning_chars": None, "tool_calls": [], "error": e.description}
+        if report is not None:
+            report.model_call(failed_step)
     else:
         reason = _finish_reason(state["messages"][-1])
         if reason in ANSWER_FINISH_REASONS:
@@ -263,23 +273,67 @@ def _steps(messages: list[BaseMessage]) -> list[dict]:
         if not isinstance(m, AIMessage):
             continue
         raw = raw_arguments(m)
-        calls = []
-        for c in m.tool_calls:
-            r = replies.get(c["id"])
-            calls.append({
-                "id": c["id"], "name": c["name"], "arguments": raw.get(c["id"]),
-                "result": r.content if r is not None and r.status != "error" else None,
-                "error": r.content if r is not None and r.status == "error" else None,
-                "duplicate": bool(r is not None and r.additional_kwargs.get("duplicate")),
-                "ran": bool(r is not None and r.additional_kwargs.get("ran")),
-            })
-        steps.append({
-            "record": m.response_metadata.get("record"),
-            "finish_reason": _finish_reason(m),
-            "text": m.content,
-            "reasoning_chars": len(reasoning) if (reasoning := m.additional_kwargs.get("reasoning_content")) is not None
-                               else None,  # None: the response had no reasoning_content
-            "tool_calls": calls,
-            "error": None,
-        })
+        calls = [{**_asked(c, raw), **_tool_outcome(replies.get(c["id"]))} for c in m.tool_calls]
+        steps.append({**_reply_fields(m), "tool_calls": calls, "error": None})
     return steps
+
+
+def _asked(call: dict, raw: dict) -> dict:
+    """A tool call as the model asked for it; `raw` is the arguments as received, by call id."""
+    return {"id": call["id"], "name": call["name"], "arguments": raw.get(call["id"])}
+
+
+def _reply_fields(m: AIMessage) -> dict:
+    """What a model call's step records of the reply itself."""
+    return {
+        "record": m.response_metadata.get("record"),
+        "finish_reason": _finish_reason(m),
+        "text": m.content,
+        "reasoning_chars": len(reasoning) if (reasoning := m.additional_kwargs.get("reasoning_content")) is not None
+                           else None,  # None: the response had no reasoning_content
+    }
+
+
+def _tool_outcome(reply: ToolMessage | None) -> dict:
+    """What became of a tool call, read from its tool message; None is a call with no reply."""
+    return {
+        "result": reply.content if reply is not None and reply.status != "error" else None,
+        "error": reply.content if reply is not None and reply.status == "error" else None,
+        "duplicate": bool(reply is not None and reply.additional_kwargs.get("duplicate")),
+        "ran": bool(reply is not None and reply.additional_kwargs.get("ran")),
+    }
+
+
+class _Report:
+    """Reports the messages that are new in each state `agent.stream` yields: a model call when the reply is an
+    `AIMessage`, a tool result for each `ToolMessage`. Other messages (the user's, with the page image) are never
+    reported. Runs in the thread that iterates the stream, not in the tools' worker threads.
+
+    The tool messages of one reply arrive together, in the order they finished; they are reported in the order of the
+    calls the model made, so what a person sees does not depend on thread timing.
+    """
+
+    def __init__(self, emit: Emit):
+        self._emit = emit
+        self._seen = 0  # messages of the conversation that were looked at
+        self._calls = 0  # model calls reported
+        self._call_order: dict[str, int] = {}  # tool call id -> its position in the latest reply
+
+    def new_messages(self, messages: list[BaseMessage]) -> None:
+        fresh, self._seen = messages[self._seen:], len(messages)
+        results = []
+        for m in fresh:
+            if isinstance(m, AIMessage):
+                self._call_order = {c["id"]: n for n, c in enumerate(m.tool_calls)}
+                raw = raw_arguments(m)
+                asked = [_asked(c, raw) for c in m.tool_calls]
+                self.model_call({**_reply_fields(m), "tool_calls": asked, "error": None})
+            elif isinstance(m, ToolMessage):
+                results.append(m)
+        for m in sorted(results, key=lambda m: self._call_order.get(m.tool_call_id, len(self._call_order))):
+            self._emit(TOOL_RESULT, {"tool_call_id": m.tool_call_id, "name": m.name, **_tool_outcome(m)})
+
+    def model_call(self, step: dict) -> None:
+        """Report one model call: `step` as an entry of the steps has it, but its tool calls without their outcomes."""
+        self._calls += 1
+        self._emit(MODEL_CALL, {"step": self._calls, **step})
