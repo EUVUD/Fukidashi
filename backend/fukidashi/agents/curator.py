@@ -29,6 +29,7 @@ from dataclasses import asdict, dataclass
 from ..datasets.openmantra import Page
 from ..kb.entities import TERM, Proposal
 from ..kb.snapshot import KBSnapshot
+from ..live_trace import REPAIR, Emit
 from ..llm.client import LLMClient
 from ..llm.errors import ProviderError
 from ..llm.metering import BudgetExceeded, PageBudget
@@ -92,6 +93,7 @@ def run_curator(
     curator_budget: int = DEFAULT_CURATOR_BUDGET,
     max_tokens: int = baseline.DEFAULT_MAX_TOKENS,
     max_steps: int = DEFAULT_MAX_STEPS,
+    emit: Emit | None = None,
 ) -> CuratorResult:
     """Judge the term proposals of one page. Never raises for provider errors or bad output: they end up in the result.
 
@@ -106,6 +108,9 @@ def run_curator(
       {"agent": null | {"stop_reason", "error", "steps", "answer_parse_error"},
        "repair": null | {"error", "record", "raw", "parse_error"}}
     (the agent is null when the run was skipped). The agent and its repair share one budget of `curator_budget` tokens.
+
+    With an `emit` (live_trace.py) the agent's model call is reported by `run_agent`, and a `repair` event follows the
+    repair call. It changes nothing else; a skipped run sends nothing and reports nothing.
     """
     ids = [s.index for s in page.segments]
     if set(translations) != set(ids):
@@ -124,7 +129,7 @@ def run_curator(
     budget = PageBudget(page.page_id, curator_budget)
     agent = run_agent(
         client, budget, system_prompt=SYSTEM_PROMPT, user_message=build_user_message(page, translations, asked, kb),
-        tools=[], max_tokens=max_tokens, json_output=True, max_steps=max_steps,
+        tools=[], max_tokens=max_tokens, json_output=True, max_steps=max_steps, emit=emit,
     )
     record: dict = {
         "agent": {"stop_reason": agent.stop_reason, "error": agent.error, "steps": agent.steps,
@@ -151,8 +156,12 @@ def run_curator(
     except ProviderError as e:
         record["repair"] = {"error": e.description, "record": asdict(e.record) if e.record is not None else None,
                             "raw": None, "parse_error": None}
+        if emit is not None:
+            emit(REPAIR, {"record": record["repair"]["record"], "error": e.description, "parse_error": answer_error})
         return CuratorResult(FAILED, [], record, e.description, asked_ids)
     record["repair"] = {"error": None, "record": asdict(reply.record), "raw": reply.text, "parse_error": None}
+    if emit is not None:
+        emit(REPAIR, {"record": record["repair"]["record"], "error": None, "parse_error": answer_error})
     try:
         return CuratorResult(OK, parse_decisions(reply.text, asked_ids), record, proposal_ids=asked_ids)
     except ValueError as e:

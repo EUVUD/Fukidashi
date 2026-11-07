@@ -25,6 +25,7 @@ from dataclasses import asdict, dataclass
 
 from ..datasets.openmantra import Page
 from ..kb.snapshot import KBSnapshot
+from ..live_trace import REPAIR, Emit
 from ..llm.client import LLMClient
 from ..llm.errors import ProviderError
 from ..llm.metering import BudgetExceeded, PageBudget
@@ -113,6 +114,7 @@ def run_reviewer(
     max_tokens: int = baseline.DEFAULT_MAX_TOKENS,
     max_steps: int = DEFAULT_MAX_STEPS,
     kb: KBSnapshot | None = None,
+    emit: Emit | None = None,
 ) -> ReviewResult:
     """Review the translations of one page. Never raises for provider errors or bad output: they end up in the result.
 
@@ -126,6 +128,9 @@ def run_reviewer(
     The attempts record: {"agent": {"stop_reason", "error", "steps", "answer_parse_error"},
                           "repair": null | {"error", "record", "raw", "parse_error"}}
     The agent and its repair share one budget of `review_budget` tokens, the Reviewer's own.
+
+    With an `emit` (live_trace.py) the agent's model calls and tool results are reported by `run_agent`, and a `repair`
+    event follows the repair call. It changes nothing else.
     """
     ids = [s.index for s in page.segments]
     if set(translations) != set(ids):
@@ -139,7 +144,7 @@ def run_reviewer(
         system_prompt=SYSTEM_PROMPT if kb is None else KB_SYSTEM_PROMPT,
         user_message=build_user_message(page, translations, flags, kb),
         tools=[] if kb is None else lookup_tools(kb),
-        max_tokens=max_tokens, json_output=True, max_steps=max_steps,
+        max_tokens=max_tokens, json_output=True, max_steps=max_steps, emit=emit,
     )
     record: dict = {
         "agent": {"stop_reason": agent.stop_reason, "error": agent.error, "steps": agent.steps,
@@ -167,8 +172,12 @@ def run_reviewer(
     except ProviderError as e:
         record["repair"] = {"error": e.description, "record": asdict(e.record) if e.record is not None else None,
                             "raw": None, "parse_error": None}
+        if emit is not None:
+            emit(REPAIR, {"record": record["repair"]["record"], "error": e.description, "parse_error": answer_error})
         return ReviewResult(None, [], FAILED, record, e.description)
     record["repair"] = {"error": None, "record": asdict(reply.record), "raw": reply.text, "parse_error": None}
+    if emit is not None:
+        emit(REPAIR, {"record": record["repair"]["record"], "error": None, "parse_error": answer_error})
     try:
         verdict, issues = parse_verdict(reply.text, ids)
         return ReviewResult(verdict, issues, OK, record)

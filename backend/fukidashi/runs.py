@@ -6,6 +6,8 @@ path). `edit_translation` records a person's edit of one Translation, as a Run o
 
 from __future__ import annotations
 
+import json
+import logging
 import sqlite3
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
@@ -23,11 +25,14 @@ from .kb import curator as curator_rules
 from .kb.entities import APPROVED, CHARACTER, KEY_FIELDS, TERM, GlossaryEntry
 from .kb.loader import load_snapshot
 from .kb.snapshot import KBSnapshot
+from .live_trace import FINALIZE, RUN_END, RUN_START, STAGE_END, STAGE_START, Emit, RunEvent
 from .llm.client import LLMClient
 from .llm.metering import PageBudget
 from .orchestrator import OrchestratorResult
 from .pipeline import baseline
 from .pipeline.baseline import BaselineResult
+
+logger = logging.getLogger(__name__)
 
 FULL = orchestrator.KB_CONFIG_NAME  # `full_no_kb` with the Knowledge Base and the Curator (OUTLINE §4.2)
 CONFIGS = (baseline.CONFIG_NAME, translator.CONFIG_NAME, orchestrator.CONFIG_NAME, FULL)
@@ -183,6 +188,7 @@ def translate_page(
     curator_budget: int = curator_agent.DEFAULT_CURATOR_BUDGET,
     max_steps: int = DEFAULT_MAX_STEPS,
     kb_id: int | None = None,
+    on_event: Callable[[RunEvent], None] | None = None,
 ) -> Outcome:
     """Run `config` (`baseline`, `translator`, `full_no_kb` or `full`) on one page and store the Run (and its
     Translations when it succeeds).
@@ -219,6 +225,15 @@ def translate_page(
     database that fails the write marking it failed too: `RunCrashed` is still raised, with the `run_id`
     and a message that says the Run was not marked.
 
+    With an `on_event` (the live trace, live_trace.py) every step of the Run is reported to it as it happens: the Run's
+    start, each stage and model call and tool result, finalize, and the Run's end, as `RunEvent`s with the Run's id and
+    a `seq` that rises by 1 from 1. It is called only in the thread that called `translate_page`, and only once the Run
+    row exists (a page refused before that emits nothing); `run_end` comes last, after the Run is finished, and a
+    crashed Run ends with a failed `run_end` too (none when marking it failed fails as well). A sink only observes: the
+    requests, the stored Run and its cost are what they are without one. A sink that raises never fails the Run: the
+    exception is logged once, naming the Run, and the sink is not called again for it. `store_events` is the sink that
+    stores them.
+
     With tracing on, the whole call is one trace (`tracing.page_span`); `Outcome.trace_id` and `RunCrashed.trace_id`
     name it. So does every other exception that leaves the call (a `TranslateError`, `LLMNotConfigured`, a failing
     `start_run`): it keeps its type and gains a `trace_id` attribute, None when tracing is off.
@@ -232,6 +247,7 @@ def translate_page(
                 conn, book_title, page_index, span, make_client=make_client, dataset_root=dataset_root, config=config,
                 page_budget=page_budget, max_tokens=max_tokens, agent_budget=agent_budget,
                 review_budget=review_budget, curator_budget=curator_budget, max_steps=max_steps, kb_id=kb_id,
+                on_event=on_event,
             )
         except Exception as e:
             try:
@@ -257,6 +273,7 @@ def _translate_page(
     curator_budget: int,
     max_steps: int,
     kb_id: int | None,
+    on_event: Callable[[RunEvent], None] | None,
 ) -> Outcome:
     trace_id = None if span is None else span.trace_id
     valid = validate_page(conn, book_title, page_index, dataset_root)
@@ -278,6 +295,9 @@ def _translate_page(
     )
     if span is not None:
         span.set(run_id=run_id)
+    emit = _run_emitter(run_id, on_event)
+    if emit is not None:
+        emit(RUN_START, {"run_id": run_id, "config": config, "model": client.config.model})
 
     def finish(translations: dict[int, str] | None, error: str | None, attempts: list[dict] | dict) -> None:
         store.finish_run(
@@ -290,18 +310,18 @@ def _translate_page(
         if config == translator.CONFIG_NAME:
             result = translator.run_translator(
                 page, client, previous=previous, agent_budget=agent_budget, fallback_budget=page_budget,
-                max_tokens=max_tokens, max_steps=max_steps,
+                max_tokens=max_tokens, max_steps=max_steps, emit=emit,
             )
         elif config in (orchestrator.CONFIG_NAME, FULL):
             result = orchestrator.run_orchestrator(
                 page, client, previous=previous, agent_budget=agent_budget, review_budget=review_budget,
-                fallback_budget=page_budget, max_tokens=max_tokens, max_steps=max_steps, kb=kb,
+                fallback_budget=page_budget, max_tokens=max_tokens, max_steps=max_steps, kb=kb, emit=emit,
             )
             if kb is not None:
                 result.attempts["kb_snippets"] = _shown_snippets(page, kb)
                 result.attempts["finalize"] = None if not result.ok else _finalize(
                     conn, page, kb, run_id, result, client, curator_budget=curator_budget, max_tokens=max_tokens,
-                    max_steps=max_steps,
+                    max_steps=max_steps, emit=emit,
                 )
         else:
             result = baseline.run_baseline(
@@ -321,9 +341,69 @@ def _translate_page(
                 trace_id,
             ) from e
         _describe_run(span, client, "failed", error)
+        _emit_run_end(conn, run_id, emit)
         raise RunCrashed(run_id, error, trace_id) from e
     _describe_run(span, client, "succeeded" if result.ok else "failed", result.error, result)
+    _emit_run_end(conn, run_id, emit, result)
     return Outcome(run_id, result, trace_id)
+
+
+def store_events(conn: sqlite3.Connection) -> Callable[[RunEvent], None]:
+    """The sink that stores every event of a Run in `run_events` through `conn`, each committed at once, so that another
+    connection reads the Run's events while it is still `running`. `conn` must have no transaction open when an event
+    arrives: `translate_page` calls its sink outside the writes it makes itself, but not inside one of the caller's."""
+    def sink(event: RunEvent) -> None:
+        store.add_run_event(conn, event)
+
+    return sink
+
+
+def _run_emitter(run_id: int, on_event: Callable[[RunEvent], None] | None) -> Emit | None:
+    """The `Emit` that code inside Run `run_id` calls, or None without a sink. Each call becomes a `RunEvent` (the Run's
+    id, the next `seq`, the data copied through JSON, so the sink gets plain values that nothing else holds) for
+    `on_event`. A sink that raises never fails the Run: the first exception is logged, naming the Run, and the sink is
+    not called again for it. Meant for one thread, the caller's of `translate_page`."""
+    if on_event is None:
+        return None
+    seq = 0
+    stopped = False
+
+    def emit(kind: str, data: dict) -> None:
+        nonlocal seq, stopped
+        if stopped:
+            return
+        seq += 1
+        try:
+            on_event(RunEvent(run_id, seq, kind, json.loads(json.dumps(data, ensure_ascii=False, allow_nan=False))))
+        except Exception as e:
+            stopped = True
+            logger.warning("the live trace sink raised on event %d (%s) of Run %d: %s: %s; the Run goes on and its "
+                           "later events are not sent", seq, kind, run_id, type(e).__name__, e)
+
+    return emit
+
+
+def _emit_run_end(
+    conn: sqlite3.Connection, run_id: int, emit: Emit | None,
+    result: BaselineResult | TranslatorResult | OrchestratorResult | None = None,
+) -> None:
+    """The last event of a Run that was finished: its status, error, calls, tokens and cost as the row has them, and for
+    the Orchestrator's configs how the page was sent back and why the loop stopped. Never raises: when the row cannot be
+    read the Run is stored all the same, and only its last event is missing."""
+    if emit is None:
+        return
+    try:
+        row = store.get_run(conn, run_id)
+        data = {"status": row["status"], "error": row["error"], "calls": row["calls"],
+                "unknown_usage_calls": row["unknown_usage_calls"], "input_tokens": row["input_tokens"],
+                "output_tokens": row["output_tokens"], "cost_usd": row["cost_usd"]}
+    except Exception as e:
+        logger.warning("the live trace could not read Run %d for its end event: %s: %s", run_id, type(e).__name__, e)
+        return
+    if isinstance(result, OrchestratorResult):
+        data.update(send_backs=result.send_backs, final_stop=result.final_stop,
+                    final_reviewed=result.attempts["final"]["reviewed"])
+    emit(RUN_END, data)
 
 
 def _shown_snippets(page: Page, kb: KBSnapshot) -> list[dict]:
@@ -355,15 +435,20 @@ def _check_kb(conn: sqlite3.Connection, book_title: str, config: str, kb_id: int
 
 def _finalize(
     conn: sqlite3.Connection, page: Page, kb: KBSnapshot, run_id: int, result: OrchestratorResult, client: LLMClient, *,
-    curator_budget: int, max_tokens: int, max_steps: int,
+    curator_budget: int, max_tokens: int, max_steps: int, emit: Emit | None = None,
 ) -> dict:
     """The page's finalize, in this order: the Curator Agent's one call on the Run's client, then `curator.apply` in its
     own transaction (none is open here), which is the only write to the KB. Returns the `finalize` part of the record
     (see `translate_page`). A Curator that gave no decisions is not an error: `apply` runs without them. An exception
-    from either step propagates, and the caller fails the Run."""
+    from either step propagates, and the caller fails the Run.
+
+    With an `emit`, finalize is a stage of the live trace: `stage_start` before the Curator's call and `stage_end` after
+    `apply` returned, so no event is emitted inside `apply`'s transaction, and none when either step raised."""
+    if emit is not None:
+        emit(STAGE_START, {"stage": FINALIZE, "index": None})
     curated = curator_agent.run_curator(
         page, result.translations, result.proposals, client, kb=kb, curator_budget=curator_budget,
-        max_tokens=max_tokens, max_steps=max_steps,
+        max_tokens=max_tokens, max_steps=max_steps, emit=emit,
     )
     decisions = {d["id"]: curator_rules.Decision(d["accept"], d["reason"]) for d in curated.decisions}
     outcomes = ([] if not result.proposals else
@@ -375,6 +460,9 @@ def _finalize(
         source, target = (proposal.payload[field] for field in KEY_FIELDS[proposal.kind])
         records.append({"proposal_id": outcome.proposal_id, "kind": proposal.kind, "source": source, "target": target,
                         "result": outcome.result})
+    if emit is not None:
+        emit(STAGE_END, {"stage": FINALIZE, "index": None, "status": curated.status, "error": curated.error,
+                         "results": outcome_counts(records)})
     return {
         "kb_id": kb.kb_id,
         "curator": {"status": curated.status, "error": curated.error, "asked": list(curated.proposal_ids),

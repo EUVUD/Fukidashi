@@ -33,6 +33,7 @@ from ..datasets.openmantra import Page
 from ..kb.collector import ProposalCollector
 from ..kb.entities import Proposal
 from ..kb.snapshot import KBSnapshot
+from ..live_trace import STAGE_END, STAGE_START, Emit
 from ..llm.client import LLMClient
 from ..pipeline import baseline
 
@@ -57,6 +58,9 @@ REVIEW_UNUSABLE = "review_unusable"
 REVISION_UNUSABLE = "revision_unusable"
 SEND_BACK_LIMIT = "send_back_limit"
 FINAL_STOPS = (APPROVED, REVIEW_UNUSABLE, REVISION_UNUSABLE, SEND_BACK_LIMIT)
+
+# What a stage's `stage_end` event carries of the stored stage, besides its kind and index (live_trace.py).
+_REPORTED = ("status", "error", "flags", "verdict", "issues")
 
 
 @dataclass
@@ -96,6 +100,7 @@ def run_orchestrator(
     max_tokens: int = baseline.DEFAULT_MAX_TOKENS,
     max_steps: int = DEFAULT_MAX_STEPS,
     kb: KBSnapshot | None = None,
+    emit: Emit | None = None,
 ) -> OrchestratorResult:
     """Run one page through translate → review → revise. Never raises for provider errors or bad output.
 
@@ -124,10 +129,25 @@ def run_orchestrator(
                 "reviewed": <whether a review gave a verdict on the stored translation>,
                 "stop": "approved" | "review_unusable" | "revision_unusable" | "send_back_limit" | "failed"}}
     When the Run failed, the failed stage is the last one and `final` has no stage (`stage`, `kind` null).
+
+    With an `emit` (live_trace.py) each stage reports a `stage_start` before it runs and a `stage_end` with the stored
+    stage's status, error, flags or verdict and issues when it is done, and every agent gets the `emit` too. It changes
+    nothing else: the stages, the requests and the result are what they are without one.
     """
     stages: list[dict] = []
     collector = ProposalCollector(kb.kb_id, page.page_index) if kb is not None else None
     made: list[Sequence[Proposal]] = []  # the proposals of each Translator run, in the order the runs happened
+
+    def begin(kind: str) -> None:
+        if emit is not None:
+            emit(STAGE_START, {"stage": kind, "index": len(stages)})
+
+    def add(stage: dict) -> None:
+        """Keep a finished stage in the record, and report it."""
+        stages.append(stage)
+        if emit is not None:
+            emit(STAGE_END, {"stage": stage["kind"], "index": len(stages) - 1,
+                             **{field: stage[field] for field in _REPORTED if field in stage}})
 
     def finish(stop: str, *, translations: dict[int, str] | None = None, produced_by: int | None = None,
                reviewed: bool = False, error: str | None = None) -> OrchestratorResult:
@@ -139,23 +159,25 @@ def run_orchestrator(
         return OrchestratorResult(translations, attempts, error,
                                   merge_proposals(*made) if translations is not None else ())
 
+    begin(TRANSLATE)
     first = translator.run_translator(
         page, client, previous=previous, agent_budget=agent_budget, fallback_budget=fallback_budget,
-        max_tokens=max_tokens, max_steps=max_steps, flagging=True, kb=kb, collector=collector,
+        max_tokens=max_tokens, max_steps=max_steps, flagging=True, kb=kb, collector=collector, emit=emit,
     )
-    stages.append(_translator_stage(TRANSLATE, first))
+    add(_translator_stage(TRANSLATE, first))
     made.append(first.proposals)
     if not first.ok:  # a provider error or a spent budget, or the fallback failed too
         return finish(FAILED, error=first.error)
 
     current, flags, produced_by = first.translations, first.flags, len(stages) - 1
     while True:
+        begin(REVIEW)
         review = reviewer.run_reviewer(
             page, current, flags, client, review_budget=review_budget, max_tokens=max_tokens, max_steps=max_steps,
-            kb=kb,
+            kb=kb, emit=emit,
         )
-        stages.append({"kind": REVIEW, "status": review.status, "error": review.error, "verdict": review.verdict,
-                       "issues": review.issues, "attempts": review.attempts})
+        add({"kind": REVIEW, "status": review.status, "error": review.error, "verdict": review.verdict,
+             "issues": review.issues, "attempts": review.attempts})
         if review.failed:
             return finish(FAILED, error=review.error)
         if review.unusable:  # no verdict: the translation stands as it is
@@ -163,11 +185,13 @@ def run_orchestrator(
         if review.verdict == reviewer.APPROVE:
             return finish(APPROVED, translations=current, produced_by=produced_by, reviewed=True)
 
+        begin(REVISE)
         revision = translator.run_translator(
             page, client, previous=previous, agent_budget=agent_budget, max_tokens=max_tokens, max_steps=max_steps,
             flagging=True, revision=translator.Revision(current, review.issues), kb=kb, collector=collector,
+            emit=emit,
         )
-        stages.append(_translator_stage(REVISE, revision))
+        add(_translator_stage(REVISE, revision))
         made.append(revision.proposals)  # before anything else: an unusable revision's calls were made too
         if revision.unusable:  # the translation the Reviewer sent back stands
             return finish(REVISION_UNUSABLE, translations=current, produced_by=produced_by, reviewed=True)

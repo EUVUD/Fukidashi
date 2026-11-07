@@ -37,6 +37,7 @@ from ..datasets.openmantra import Page
 from ..kb.collector import DEFAULT_PROPOSER, ProposalCollector
 from ..kb.entities import KEY_FIELDS, KINDS, PAYLOADS, Proposal, make_proposal
 from ..kb.snapshot import KBSnapshot
+from ..live_trace import FALLBACK, REPAIR, Emit
 from ..llm.client import LLMClient
 from ..llm.errors import ProviderError
 from ..llm.metering import BudgetExceeded, PageBudget
@@ -326,6 +327,7 @@ def run_translator(
     revision: Revision | None = None,
     kb: KBSnapshot | None = None,
     collector: ProposalCollector | None = None,
+    emit: Emit | None = None,
 ) -> TranslatorResult:
     """Translate one page. Never raises for provider errors or bad output: they end up in `error`.
 
@@ -354,6 +356,9 @@ def run_translator(
     whatever became of the run. The KB goes with flagging (its prompt describes `flag_uncertain`), and `kb` and
     `collector` come together and must be the page's own: anything else is a `ValueError`, before any request. With no
     `kb`, which is the default, the requests are what they are without the KB, and `proposals` is empty.
+
+    With an `emit` (live_trace.py) the agent's model calls and tool results are reported by `run_agent`, a `repair`
+    event follows the repair call, and a `fallback` event comes before `baseline` is run. It changes nothing else.
     """
     ids = [s.index for s in page.segments]
     if revision is not None:
@@ -371,7 +376,7 @@ def run_translator(
         system_prompt=KB_SYSTEM_PROMPT if kb is not None else FLAG_SYSTEM_PROMPT if flagging else SYSTEM_PROMPT,
         user_message=_user_message(page, revision, kb),
         tools=tools,
-        max_tokens=max_tokens, json_output=True, max_steps=max_steps,
+        max_tokens=max_tokens, json_output=True, max_steps=max_steps, emit=emit,
     )
     record: dict = {
         "config": CONFIG_NAME,
@@ -403,8 +408,13 @@ def run_translator(
         except ProviderError as e:
             record["repair"] = {"error": e.description, "record": asdict(e.record) if e.record is not None else None,
                                 "raw": None, "parse_error": None}
+            if emit is not None:
+                emit(REPAIR, {"record": record["repair"]["record"], "error": e.description,
+                              "parse_error": answer_error})
             return TranslatorResult(None, record, e.description, proposals=made)
         record["repair"] = {"error": None, "record": asdict(reply.record), "raw": reply.text, "parse_error": None}
+        if emit is not None:
+            emit(REPAIR, {"record": record["repair"]["record"], "error": None, "parse_error": answer_error})
         try:
             return TranslatorResult(baseline.parse_translations(reply.text, ids), record,
                                     flags=flag_collector.flags if flag_collector is not None else [], proposals=made)
@@ -416,6 +426,8 @@ def run_translator(
 
     if revision is not None:  # no fallback: the translation the revision was meant to replace stands
         return TranslatorResult(None, record, reason, unusable=True, proposals=made)
+    if emit is not None:
+        emit(FALLBACK, {"reason": reason})
     fallback = baseline.run_baseline(page, client, PageBudget(page.page_id, fallback_budget), max_tokens=max_tokens)
     record["fallback"] = {"reason": reason, "attempts": fallback.attempts}
     return TranslatorResult(fallback.translations, record, fallback.error, proposals=made)

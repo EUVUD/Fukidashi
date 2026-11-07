@@ -55,6 +55,17 @@ CREATE TABLE IF NOT EXISTS translations (
     PRIMARY KEY (run_id, segment_id)
 );
 
+-- The live trace (OUTLINE §0, §8): what a Run reports as it goes, one row per event, written while the Run is running.
+-- `seq` is 1 for the Run's first event and rises by 1: a client that reconnects asks for what came after its last one.
+CREATE TABLE IF NOT EXISTS run_events (
+    run_id     INTEGER NOT NULL REFERENCES runs(id),
+    seq        INTEGER NOT NULL,
+    kind       TEXT    NOT NULL,
+    data_json  TEXT    NOT NULL,
+    created_at TEXT    NOT NULL,
+    PRIMARY KEY (run_id, seq)
+);
+
 -- The Knowledge Base (OUTLINE 3.3). One KB is one row: an eval run starts every book with a fresh one, the editor keeps
 -- one per book. Entries, profiles and proposals belong to exactly one KB, so two KBs never see each other.
 CREATE TABLE IF NOT EXISTS kbs (

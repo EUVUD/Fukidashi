@@ -57,8 +57,10 @@ def _first_pass_with_the_kb():
                                                                 "aliases": ["ゆき"], "notes": "说话轻声"}))
 
 
-def collect(page) -> dict[str, list[dict]]:
-    """Scenario name -> the request bodies the provider received, in order."""
+def collect(page, emit=None) -> dict[str, list[dict]]:
+    """Scenario name -> the request bodies the provider received, in order. With an `emit`, every call is given it
+    (task 035: a live trace sink must not change a request); without one the calls are what they were before it."""
+    hook = {} if emit is None else {"emit": emit}
     flags = [{"id": 1, "reason": "迷い"}]
     current = {0: "你好", 1: "再见"}
     kb = kb_snapshot()
@@ -70,20 +72,21 @@ def collect(page) -> dict[str, list[dict]]:
         collected[name] = provider.bodies
 
     revision = translator.Revision(current, [issue(0)])
-    run("off/translator", ask(_previous("g")), answer(ZH), do=lambda c: translator.run_translator(page, c))
+    run("off/translator", ask(_previous("g")), answer(ZH), do=lambda c: translator.run_translator(page, c, **hook))
     run("off/translator-flagging-and-repair", ask(_previous("g"), _flag("f", 1, "迷い")), answer("not json"), answer(ZH),
-        do=lambda c: translator.run_translator(page, c, flagging=True))
+        do=lambda c: translator.run_translator(page, c, flagging=True, **hook))
     run("off/revision", answer(ZH_REVISED),
-        do=lambda c: translator.run_translator(page, c, flagging=True, revision=revision))
-    run("off/review", answer(APPROVE), do=lambda c: reviewer.run_reviewer(page, current, flags, c))
+        do=lambda c: translator.run_translator(page, c, flagging=True, revision=revision, **hook))
+    run("off/review", answer(APPROVE), do=lambda c: reviewer.run_reviewer(page, current, flags, c, **hook))
     run("off/review-and-repair", answer("nope"), answer(APPROVE),
-        do=lambda c: reviewer.run_reviewer(page, current, flags, c))
+        do=lambda c: reviewer.run_reviewer(page, current, flags, c, **hook))
     run("on/translator", ask(_previous("g")), answer(ZH),
-        do=lambda c: translator.run_translator(page, c, flagging=True, kb=kb, collector=ProposalCollector(KB_ID, 1)))
+        do=lambda c: translator.run_translator(page, c, flagging=True, kb=kb, collector=ProposalCollector(KB_ID, 1),
+                                               **hook))
     run("on/revision", answer(ZH_REVISED), do=lambda c: translator.run_translator(
-        page, c, flagging=True, revision=revision, kb=kb, collector=ProposalCollector(KB_ID, 1)))
+        page, c, flagging=True, revision=revision, kb=kb, collector=ProposalCollector(KB_ID, 1), **hook))
     run("on/review", ask(_call("t", "lookup_term", source_term="こんにちは")), answer(APPROVE),
-        do=lambda c: reviewer.run_reviewer(page, current, flags, c, kb=kb))
+        do=lambda c: reviewer.run_reviewer(page, current, flags, c, kb=kb, **hook))
 
     for tag, with_kb in (("off", False), ("on", True)):
         first = _first_pass_with_the_kb() if with_kb else ask(_previous("g"), _flag("f", 1, "迷い"))
@@ -97,5 +100,6 @@ def collect(page) -> dict[str, list[dict]]:
             "two-send-backs": two_send_backs,
             "fallback": (ask(_previous("g")), answer("", finish_reason="length"), answer(ZH), answer(APPROVE)),
         }.items():
-            run(f"{tag}/orchestrator-{name}", *replies, do=lambda c: run_orchestrator(page, c, kb=kb if with_kb else None))
+            run(f"{tag}/orchestrator-{name}", *replies,
+                do=lambda c: run_orchestrator(page, c, kb=kb if with_kb else None, **hook))
     return collected
