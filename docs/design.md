@@ -293,6 +293,8 @@ classDiagram
     class Runs:::service {
         validate_page()
         translate_page()
+        edit_translation()
+        store_events()
     }
     class Baseline:::pipeline {
         run_baseline()
@@ -377,6 +379,9 @@ classDiagram
         get_run()
         start_run()
         finish_run()
+        insert_human_run()
+        add_run_event()
+        run_events()
         create_kb()
     }
     class SQLite:::data {
@@ -389,6 +394,7 @@ classDiagram
         glossary_entries
         character_profiles
         proposals
+        run_events
     }
     class Importer:::data {
         import_openmantra()
@@ -411,7 +417,7 @@ classDiagram
     Runs ..> Tracing : page_span
     Tracing ..> Backend : exporter
     Tracing ..> RedactingExporter : wraps the exporter
-    Runs ..> Store : Runs, Translations
+    Runs ..> Store : Runs, Translations, run events
     Runs ..> Baseline : config baseline
     Runs ..> Translator : config translator
     Runs ..> Orchestrator : config full_no_kb, full
@@ -539,8 +545,8 @@ classDiagram
 - **M6 (done):** the paired bootstrap went into `evaluation/` (#58). It reads finished eval runs through the pooled report's own code. The test runs changed no file. Nothing in the translation path changed shape.
 - **M8 (done):** the cost / latency summary went into `evaluation/` (#63) and reads each eval run's lines of the ledger by range. The charts became a standalone script in `eval/` (#65), like COMET, and read only the report's, the intervals' and the cost summary's files. No model was called, and nothing in the translation path changed.
 - **M7 (in progress, OUTLINE §8):**
-  - `Runs.translate_page` takes an optional event sink, which the Orchestrator, the agents and `AgentLoop` call.
-  - The API runs pages in the background and streams their Live trace events over SSE from a `run_events` table.
+  - `Runs.translate_page` takes an optional event sink, which the Orchestrator, the agents and `AgentLoop` call (built, #70: `live_trace.py` holds the contract, `Runs.store_events` stores the events through `Store.add_run_event`).
+  - The API runs pages in the background and streams their Live trace events over SSE from the `run_events` table (the table is built, #70).
   - A human edit is a Run of config `human`, written by `Runs.edit_translation` through `Store.insert_human_run` (built, #68).
   - A person's KB decisions go through `kb/curator.py`.
   - The frontend adds a canvas to `PageView` (editing is built: `TranslationEditor`, #68), plus SSE, which adds an event subscription to the `api` module.
