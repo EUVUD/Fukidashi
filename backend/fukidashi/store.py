@@ -60,6 +60,25 @@ def get_run(conn: sqlite3.Connection, run_id: int) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
 
 
+def running_run_id(conn: sqlite3.Connection, page_id: int) -> int | None:
+    """The id of the page's `running` Run (the latest, should a stopped process have left more than one), or None."""
+    row = conn.execute(
+        "SELECT id FROM runs WHERE page_id = ? AND status = 'running' ORDER BY id DESC LIMIT 1", (page_id,)
+    ).fetchone()
+    return None if row is None else row["id"]
+
+
+def fail_stale_runs(conn: sqlite3.Connection, error: str) -> int:
+    """Mark every Run that is `running` as `failed`, with `error` and `finished_at` set; returns how many. For the API's
+    start: a Run is only `running` between `start_run` and `finish_run`, so one found at start belongs to a process that
+    stopped. Its Translations are written by `finish_run` together with its status, so it has none, and a failed Run keeps
+    none. Its calls and cost stay as the row has them (0 calls, cost NULL: unknown)."""
+    with conn:
+        return conn.execute(
+            "UPDATE runs SET status = 'failed', error = ?, finished_at = ? WHERE status = 'running'", (error, _now())
+        ).rowcount
+
+
 def segments_with_translations(conn: sqlite3.Connection, page_id: int, run_id: int | None) -> list[sqlite3.Row]:
     """Every segment of the page, with its zh-Hans text from `run_id` (NULL when there is no run)."""
     return conn.execute(
@@ -193,6 +212,23 @@ def find_kb(conn: sqlite3.Connection, *, book_title: str, purpose: str, label: s
     return conn.execute(
         "SELECT * FROM kbs WHERE book_title = ? AND purpose = ? AND label = ?", (book_title, purpose, label)
     ).fetchone()
+
+
+# The one Editor KB of a book (OUTLINE §0, Editor KB): `UNIQUE (book_title, purpose, label)` makes a fixed label one row.
+EDITOR = "editor"
+EDITOR_KB_LABEL = "editor"
+
+
+def editor_kb(conn: sqlite3.Connection, book_title: str) -> int:
+    """The id of the book's Editor KB, made empty on first use. Safe for two connections asking at once for a book that
+    has none: the insert does nothing when the row exists, so both read the same one. Raises sqlite3.IntegrityError for a
+    book that is not in the database. Call it with no transaction open (it commits)."""
+    with conn:
+        conn.execute(
+            "INSERT INTO kbs (book_title, purpose, label, created_at) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT (book_title, purpose, label) DO NOTHING", (book_title, EDITOR, EDITOR_KB_LABEL, _now()),
+        )
+    return find_kb(conn, book_title=book_title, purpose=EDITOR, label=EDITOR_KB_LABEL)["id"]
 
 
 def get_kb(conn: sqlite3.Connection, kb_id: int) -> sqlite3.Row | None:

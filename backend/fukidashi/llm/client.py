@@ -87,13 +87,19 @@ class LLMResult:
 
 
 class LLMClient:
-    def __init__(self, config: LLMConfig, meter: Meter, *, http_client: httpx.Client | None = None):
+    def __init__(
+        self, config: LLMConfig, meter: Meter, *, http_client: httpx.Client | None = None, timeout: float | None = None
+    ):
+        """`timeout` (seconds) is the SDK's request timeout, passed only when set: a client without one is built exactly
+        as it always was and keeps the SDK's default (600 s; `IDEAS.md`). A request that times out is a failed call like
+        any other: recorded once, with `error`, and raised as `ProviderError`."""
         self.config = config
         self.meter = meter
         # max_retries=0: the SDK would resend a failed request up to twice, and the earlier attempts, which may
         # have been billed, would never reach the Meter. Every request sent is one call the Meter sees.
         self._client = openai.OpenAI(
-            base_url=config.base_url, api_key=config.api_key, max_retries=0, http_client=http_client
+            base_url=config.base_url, api_key=config.api_key, max_retries=0, http_client=http_client,
+            **({} if timeout is None else {"timeout": timeout}),
         )
 
     def chat(

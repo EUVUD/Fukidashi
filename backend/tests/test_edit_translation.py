@@ -6,7 +6,7 @@ import threading
 import time
 
 import pytest
-from conftest import FakeClient
+from conftest import FakeClient, post_translate
 
 from fukidashi import runs, store
 from fukidashi.datasets.importer import import_openmantra
@@ -15,7 +15,6 @@ from fukidashi.llm.metering import Meter
 
 GOOD = json.dumps({"translations": [{"id": 0, "zh": "你好"}, {"id": 1, "zh": "再见"}]}, ensure_ascii=False)
 OTHER = json.dumps({"translations": [{"id": 0, "zh": "您好"}, {"id": 1, "zh": "拜拜"}]}, ensure_ascii=False)
-TRANSLATE = "/api/pages/book_a/1/translate"
 
 
 @pytest.fixture
@@ -286,16 +285,16 @@ def run_count(conn) -> int:
     return conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
 
 
-def translated(api):
-    """The `api` fixture with book_a/1 translated by `baseline`."""
+def translated(api, background):
+    """The `api` fixture with book_a/1 translated by `baseline`, its Run over."""
     client, use_replies = api
     use_replies(GOOD)
-    assert client.post(TRANSLATE).status_code == 200
+    assert post_translate(client, background).status_code == 202
     return client, use_replies
 
 
-def test_put_edits_one_translation_and_it_survives_a_reload(api, conn):
-    client, _ = translated(api)
+def test_put_edits_one_translation_and_it_survives_a_reload(api, conn, background):
+    client, _ = translated(api, background)
 
     resp = edit(client, 1, "再会")
 
@@ -310,8 +309,8 @@ def test_put_edits_one_translation_and_it_survives_a_reload(api, conn):
     assert run_count(conn) == 2
 
 
-def test_two_edits_through_the_api_both_show(api, conn):
-    client, _ = translated(api)
+def test_two_edits_through_the_api_both_show(api, conn, background):
+    client, _ = translated(api, background)
 
     first = edit(client, 0, "喂").json()
     second = edit(client, 1, "再会")
@@ -320,8 +319,8 @@ def test_two_edits_through_the_api_both_show(api, conn):
     assert attempts_of(conn, second.json()["run"]["id"])["base_run_id"] == first["run"]["id"]
 
 
-def test_put_keeps_the_text_exactly_as_sent(api):
-    client, _ = translated(api)
+def test_put_keeps_the_text_exactly_as_sent(api, background):
+    client, _ = translated(api, background)
     text = " 再见，\n再会  "
 
     body = edit(client, 1, text).json()
@@ -330,8 +329,8 @@ def test_put_keeps_the_text_exactly_as_sent(api):
     assert client.get("/api/pages/book_a/1").json()["segments"][1]["text_zh_hans"] == text
 
 
-def test_put_with_the_current_text_answers_200_with_the_page_unchanged(api, conn):
-    client, _ = translated(api)
+def test_put_with_the_current_text_answers_200_with_the_page_unchanged(api, conn, background):
+    client, _ = translated(api, background)
     before = client.get("/api/pages/book_a/1").json()
 
     resp = edit(client, 1, "再见")
@@ -356,8 +355,8 @@ def test_put_with_the_current_text_answers_200_with_the_page_unchanged(api, conn
     ids=["unknown-page", "unknown-book", "unknown-idx", "page-without-segments", "empty", "whitespace",
          "no-field", "other-field", "null", "not-a-string", "not-an-object"],
 )
-def test_a_refused_edit_records_no_run(api, conn, path, body, status):
-    client, _ = translated(api)
+def test_a_refused_edit_records_no_run(api, conn, path, body, status, background):
+    client, _ = translated(api, background)
     before = client.get("/api/pages/book_a/1").json()
 
     resp = client.put(path, json=body)
@@ -369,8 +368,8 @@ def test_a_refused_edit_records_no_run(api, conn, path, body, status):
 
 @pytest.mark.parametrize("kwargs", [{}, {"content": b"{nope", "headers": {"content-type": "application/json"}}],
                          ids=["no-body", "not-json"])
-def test_a_body_that_is_missing_or_not_json_answers_422_and_records_no_run(api, conn, kwargs):
-    client, _ = translated(api)
+def test_a_body_that_is_missing_or_not_json_answers_422_and_records_no_run(api, conn, kwargs, background):
+    client, _ = translated(api, background)
 
     resp = client.put("/api/pages/book_a/1/segments/0/translation", **kwargs)
 
@@ -387,17 +386,16 @@ def test_a_page_without_a_succeeded_run_answers_409_and_records_no_run(api, conn
     assert run_count(conn) == 0
 
 
-def test_a_later_translate_supersedes_the_edit_and_the_human_run_stays(api, conn):
-    client, use_replies = translated(api)
+def test_a_later_translate_supersedes_the_edit_and_the_human_run_stays(api, conn, background):
+    client, use_replies = translated(api, background)
     edited = edit(client, 1, "再会").json()
 
     use_replies(OTHER)
-    resp = client.post(TRANSLATE)
+    assert post_translate(client, background).status_code == 202
+    page = client.get("/api/pages/book_a/1").json()
 
-    assert resp.status_code == 200
-    assert resp.json()["run"]["config"] == "baseline"
-    assert [s["text_zh_hans"] for s in resp.json()["segments"]] == ["您好", "拜拜"]
-    assert client.get("/api/pages/book_a/1").json() == resp.json()
+    assert page["run"]["config"] == "baseline"
+    assert [s["text_zh_hans"] for s in page["segments"]] == ["您好", "拜拜"]
     human = conn.execute("SELECT id, status FROM runs WHERE config = 'human'").fetchall()
     assert [(r["id"], r["status"]) for r in human] == [(edited["run"]["id"], "succeeded")]
     assert texts_of(conn, edited["run"]["id"]) == ["你好", "再会"]

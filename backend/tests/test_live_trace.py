@@ -26,12 +26,14 @@ from test_curator_agent import proposals as curator_proposals  # noqa: F401 (fix
 from test_full import NAME, SEEN_TERM, kb, proposals_reply, run_page, seed_entry, terms_of  # noqa: F401 (fixture: kb)
 from test_kb_seams import DIGESTS, database_loaded_by, digest
 from test_kb_tools import propose
-from test_reviewer import APPROVE, REVISE, issue
+from test_reviewer import APPROVE, REVISE, TRANSLATIONS, issue
+from test_reviewer import page as reviewer_page  # noqa: F401 (fixture)
 from test_translator import (  # noqa: F401 (fixtures)
     BOOK, attempts_of, imported, previous_context, root, translate, zh_json, zh_of,
 )
 
 from fukidashi import live_trace, runs, store
+from fukidashi.agents import reviewer
 from fukidashi.agents.loop import Tool
 from fukidashi.datasets.importer import import_openmantra
 from fukidashi.datasets.openmantra import get_page
@@ -267,6 +269,53 @@ def test_the_fallback_of_the_first_pass_ends_the_translate_stage(imported, root)
 
     assert sink.trail == ["run_start", "stage_start:translate", "model_call", "fallback", "stage_end:translate",
                           "stage_start:review", "model_call", "stage_end:review", "run_end"]
+
+
+def test_the_translators_fallback_event_arrives_before_the_baseline_request_is_sent(imported, root):
+    """The panel should show the fallback while baseline's request is in flight: `fallback` is emitted before it is sent. The
+    sink notes how many requests the provider has received when `fallback` arrives (`baseline` emits no event of its own,
+    so the order of the kinds alone could not tell)."""
+    provider = Provider(answer("", finish_reason="length"), answer(zh_json(3)))
+    received_at_fallback = []
+    recorder = Recorder()
+
+    def sink(event):
+        if event.kind == "fallback":
+            received_at_fallback.append(len(provider.bodies))
+        recorder(event)
+
+    outcome = translate(imported, root, mock_llm_client(provider), 3, on_event=sink)
+
+    assert outcome.result.fallback_reason is not None and recorder.kinds == ["run_start", "model_call", "fallback", "run_end"]
+    assert received_at_fallback == [1]  # the agent's one call had been sent; baseline's request had not
+    assert len(provider.bodies) == 2  # it was sent afterwards
+
+
+def test_the_reviewers_bad_verdict_and_its_repair_are_a_repair_event(reviewer_page):
+    sink = Recorder()
+    provider = Provider(answer("nope"), answer(APPROVE))
+
+    result = reviewer.run_reviewer(reviewer_page, TRANSLATIONS, [], mock_llm_client(provider), emit=sink.emit)
+
+    assert result.ok and len(provider.bodies) == 2
+    assert [kind for kind, _ in sink.emitted] == ["model_call", "repair"]
+    repair = sink.emitted[1][1]
+    assert repair["error"] is None and repair["record"]["requested_model"] == "mock-model"
+    assert repair["parse_error"] == result.attempts["agent"]["answer_parse_error"] != ""
+    assert sink.emitted[0][1]["text"] == "nope"  # the answer that was repaired
+
+
+def test_the_reviewers_repair_that_the_provider_refuses_is_a_repair_event_with_its_error(reviewer_page):
+    sink = Recorder()
+    provider = Provider(answer("nope"), upstream_500())
+
+    result = reviewer.run_reviewer(reviewer_page, TRANSLATIONS, [], mock_llm_client(provider), emit=sink.emit)
+
+    assert result.status == "failed"
+    assert [kind for kind, _ in sink.emitted] == ["model_call", "repair"]
+    repair = sink.emitted[1][1]
+    assert "upstream exploded" in repair["error"] and repair["record"]["error"] == repair["error"]
+    assert repair["parse_error"] == result.attempts["agent"]["answer_parse_error"] != ""
 
 
 def one_send_back(*, first=None):
