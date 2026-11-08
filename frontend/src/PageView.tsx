@@ -97,6 +97,7 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
       (page) => {
         if (ctrl.signal.aborted) return
         setDetail(page)
+        if (page.run) onTranslated(book, pageIndex) // a run that ended while this page was off screen still marks it
         if (page.running_run_id !== null) watch(page.running_run_id) // a reload: the page goes on waiting for its run
       },
       (e: Error) => {
@@ -108,7 +109,7 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
       stopWatching.current?.()
       stopWatching.current = null
     }
-  }, [book, pageIndex, watch])
+  }, [book, pageIndex, watch, onTranslated])
 
   const onTranslate = async () => {
     setTranslating(true)
