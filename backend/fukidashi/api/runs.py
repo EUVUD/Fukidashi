@@ -38,7 +38,8 @@ def parse_last_event_id(value: str | None) -> int:
         return 0
     if re.fullmatch(r"[0-9]+", value) is None:
         raise HTTPException(status_code=422, detail="Last-Event-ID must be a non-negative integer (the seq of the last event seen)")
-    return min(int(value), _MAX_SEQ)
+    digits = value.lstrip("0") or "0"
+    return _MAX_SEQ if len(digits) > len(str(_MAX_SEQ)) else min(int(digits), _MAX_SEQ)  # int() refuses over 4300 digits
 
 
 def _read(conn: sqlite3.Connection, run_id: int, after_seq: int) -> tuple[bool, list[RunEvent]]:
@@ -84,7 +85,7 @@ def requested_events(
     stream: a status cannot change once it has begun. The 204 is raised, because a path operation that yields cannot
     answer anything but a stream; `HTTPException` is what FastAPI answers with an empty 204."""
     after_seq = parse_last_event_id(last_event_id)
-    if store.get_run(conn, run_id) is None:
+    if run_id > _MAX_SEQ or store.get_run(conn, run_id) is None:  # an id SQLite cannot hold is an unknown Run, not a 500
         raise HTTPException(status_code=404, detail=f"no run {run_id}")
     running, events = _read(conn, run_id, after_seq)
     if not running and not events:

@@ -81,13 +81,14 @@ class BackgroundRuns:
             if page_row is not None and store.running_run_id(conn, page_row["id"]) is not None:
                 raise RunInProgress(f"{book_title}/{page_index} is already being translated")
             self._active[key] = token
-            self._threads = [t for t in self._threads if t.is_alive()]
-            self._threads.append(thread)
         try:
             thread.start()
         except BaseException:
             self._release(key, token)
             raise
+        with self._lock:  # listed once it is alive: another start's pruning of ended threads must not drop it unstarted
+            self._threads = [t for t in self._threads if t.is_alive()]
+            self._threads.append(thread)
         try:
             return started.result(timeout=START_TIMEOUT_S)
         except FutureTimeout as e:
@@ -138,6 +139,7 @@ class BackgroundRuns:
             )
         except BaseException as e:
             if not started.done():
+                self._release(key, token)  # free the page before the caller is told, so its retry is not refused as busy
                 started.set_exception(e)  # refused before its Run existed: the caller maps it
             else:
                 logger.warning("the Run of %s/%d ended with %s: %s", book_title, page_index, type(e).__name__, e)

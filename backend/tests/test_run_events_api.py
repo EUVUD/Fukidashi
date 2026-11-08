@@ -148,6 +148,13 @@ def test_an_unknown_run_is_a_404(api):
     assert resp.status_code == 404 and "no run 999" in resp.json()["detail"]
 
 
+@pytest.mark.parametrize("run_id", [0, -1, 2**63 - 1, 2**63, 10**30])
+def test_a_run_id_sqlite_cannot_hold_is_an_unknown_run_not_a_server_error(api, run_id):
+    client, _ = api
+
+    assert client.get(path(run_id)).status_code == 404
+
+
 def test_an_idle_stream_sends_a_comment_now_and_then_to_keep_the_connection_alive(api, clients, new_hold, monkeypatch):
     monkeypatch.setattr(fastapi_routing, "_PING_INTERVAL", 0.05)  # FastAPI's own keepalive for an SSE path operation
     client, _ = api
@@ -305,6 +312,15 @@ def test_the_header_parser_takes_ascii_digits_only_and_clamps_what_sqlite_cannot
     assert runs_api.parse_last_event_id(None) == 0
     assert runs_api.parse_last_event_id("0") == 0 and runs_api.parse_last_event_id("0042") == 42
     assert runs_api.parse_last_event_id(str(10**30)) == 2**63 - 1
+    assert runs_api.parse_last_event_id("9" * 5000) == 2**63 - 1  # more digits than int() will convert
+    assert runs_api.parse_last_event_id("0" * 5000 + "7") == 7  # leading zeros do not count
+    assert runs_api.parse_last_event_id("0" * 5000) == 0
+
+
+def test_a_last_event_id_of_thousands_of_digits_is_nothing_after_the_last_event_not_a_server_error(api, finished):
+    client, _ = api
+
+    assert client.get(path(finished), headers={"Last-Event-ID": "9" * 5000}).status_code == 204
 
 
 # --- AC7: running_run_id ----------------------------------------------------------------------------------------------
