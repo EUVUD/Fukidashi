@@ -82,7 +82,17 @@ def test_a_provider_that_never_answers_times_out_after_the_clients_timeout():
     server.bind(("127.0.0.1", 0))
     server.listen(1)
     held = []
-    threading.Thread(target=lambda: held.append(server.accept()), daemon=True).start()
+
+    def accept_then_hang_up_late():
+        try:
+            connection, _ = server.accept()
+            held.append(connection)
+            time.sleep(4)  # its own bound: were the client's timeout lost, it would see a hang-up here, not wait 600 s
+            connection.close()
+        except OSError:
+            pass
+
+    threading.Thread(target=accept_then_hang_up_late, daemon=True).start()
     meter = Meter()
     client = LLMClient(LLMConfig(f"http://127.0.0.1:{server.getsockname()[1]}/v1", "k", "m"), meter, timeout=0.3)
     try:
@@ -91,7 +101,7 @@ def test_a_provider_that_never_answers_times_out_after_the_clients_timeout():
             chat(client)
         elapsed = time.monotonic() - started
     finally:
-        for connection, _ in held:
+        for connection in held:
             connection.close()
         server.close()
 

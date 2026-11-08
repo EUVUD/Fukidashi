@@ -140,6 +140,43 @@ def test_a_run_end_stored_just_after_the_row_was_finished_is_still_sent(api, con
     assert [e["event"] for e in events] == ["run_start", "run_end"]
 
 
+def test_a_reconnect_is_not_answered_204_when_the_run_ends_between_the_status_and_the_events_being_read(
+        api, conn, monkeypatch):
+    """`_read` reads the status first. A Run that finishes (and stores the rest of its events) between the two reads must
+    not look 'not running and nothing after': that would be a 204, and the browser then stops for good and never gets the
+    events it missed. The Run ends right after the second store call of the request: the route's 404 check is the first, so
+    that is `_read`'s first read, whichever it is (swap the two and the events come back empty, the status 'failed')."""
+    client, _ = api
+    page_id = store.find_page(conn, "book_a", 1)["id"]
+    run_id = store.start_run(conn, page_id=page_id, config="baseline", params={}, model="m")
+    for seq, kind in ((1, "run_start"), (2, "stage_start")):
+        store.add_run_event(conn, RunEvent(run_id, seq, kind, {}))
+    real_get_run, real_run_events = store.get_run, store.run_events
+    calls = 0
+
+    def after_second_call(real):
+        def wrapped(c, *args, **kwargs):
+            nonlocal calls
+            result = real(c, *args, **kwargs)
+            calls += 1
+            if calls == 2:  # `_read`'s first read has happened; now the Run finishes and stores the rest
+                conn.execute("UPDATE runs SET status = 'succeeded' WHERE id = ?", (run_id,))
+                conn.commit()
+                store.add_run_event(conn, RunEvent(run_id, 3, "stage_end", {}))
+                store.add_run_event(conn, RunEvent(run_id, 4, "run_end", {"status": "succeeded"}))
+            return result
+
+        return wrapped
+
+    monkeypatch.setattr(store, "get_run", after_second_call(real_get_run))
+    monkeypatch.setattr(store, "run_events", after_second_call(real_run_events))
+    with Stream(app, path(run_id), last_event_id=2) as stream:
+        assert stream.status == 200  # not a 204
+        events = stream.read_all(timeout=10)
+
+    assert [e["id"] for e in events] == ["3", "4"] and events[-1]["event"] == "run_end"
+
+
 def test_an_unknown_run_is_a_404(api):
     client, _ = api
 
