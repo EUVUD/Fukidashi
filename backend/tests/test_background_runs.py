@@ -500,6 +500,37 @@ def test_a_thread_that_cannot_start_leaves_the_page_free(api, background, conn, 
     assert post_translate(client, background).status_code == 202
 
 
+def test_a_run_started_while_another_start_is_pruning_stays_listed_for_wait_idle(api, background, conn, monkeypatch):
+    """`wait_idle` is what keeps a Run's thread from outliving a test's database. A thread is listed only once it is alive,
+    so another `start` that prunes the ended threads at that moment cannot drop it. Held inside the first `Thread.start`,
+    a second start (another page) prunes: both threads must be listed afterwards."""
+    client, _ = api
+    clone_page(conn, "book_a", 3)
+    inside_start, go_on = threading.Event(), threading.Event()
+    real_start = threading.Thread.start
+    first = []
+
+    def start(self):
+        if self.name.startswith("run ") and not first:
+            first.append(self)
+            inside_start.set()
+            assert go_on.wait(10)
+        return real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    app.dependency_overrides[get_client_factory] = lambda: lambda: FakeClient([GOOD])  # one client for each Run
+    poster = threading.Thread(target=lambda: client.post(PAGE), daemon=True)
+    poster.start()  # run 1's start() is held before its thread is alive
+    assert inside_start.wait(10)
+
+    assert client.post("/api/pages/book_a/3/translate").status_code == 202  # this start prunes the list meanwhile
+    go_on.set()
+    poster.join(10)
+
+    assert first[0] in background._threads  # (the second thread may have ended and been pruned by now: only the first matters)
+    assert background.wait_idle(10)
+
+
 @pytest.mark.parametrize("page, status", [(99, 404), (2, 422)])
 def test_a_refused_page_is_free_again_before_the_caller_is_answered(api, background, monkeypatch, page, status):
     """The thread lets the page go and then reports the refusal, so a retry sent at once is not refused as busy."""
