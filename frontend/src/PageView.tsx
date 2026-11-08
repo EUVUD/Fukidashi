@@ -72,11 +72,14 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
       setTranslating(true)
       stopWatching.current = watchRun(runId, async (end: RunEnd | null) => {
         stopWatching.current = null
+        setNotice(null) // the run is over: "already being translated" is no longer true
         try {
           const page = await fetchPage(book, pageIndex)
           setDetail(page)
           if (page.run) onTranslated(book, pageIndex)
           if (end?.status === 'failed') setTranslateError(end.error ?? 'the run failed')
+          // The stream ended without a run_end (the server restarted mid-run, say): the page cannot say whether it failed.
+          else if (end === null) setNotice('The run ended without reporting its result. The page shows its latest translation.')
         } catch (e) {
           setTranslateError((e as Error).message)
         } finally {
@@ -120,6 +123,7 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
         fetchPage(book, pageIndex).then((page) => {
           setDetail(page)
           if (page.running_run_id !== null) watch(page.running_run_id)
+          else setNotice(null) // the run ended between the 409 and this read
         }, () => {})
       } else {
         setTranslateError((e as Error).message)

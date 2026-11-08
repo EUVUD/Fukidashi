@@ -389,20 +389,52 @@ def test_the_thread_has_its_own_connection_so_the_requests_connection_is_never_s
     assert len(seen.opened) == 1  # one connection for the one Run, opened from the database path
 
 
-def test_the_page_is_free_as_soon_as_run_end_can_be_read(api, background, conn):
-    """A client that has the `run_end` event can Translate again at once: the registry lets the page go before the event
-    is stored, so seeing it, there is no 409 to race."""
+def test_the_page_is_free_before_run_end_is_stored(api, background, conn, monkeypatch):
+    """The registry lets the page go before `run_end` is stored, so a client that has seen `run_end` can Translate at once.
+    Held at the moment the Run's thread stores its `run_end`: the Run's row is finished, the event is not yet stored, and a
+    POST on the page is already accepted."""
     client, use_replies = api
-    for _ in range(20):
-        use_replies(GOOD)
-        run_id = client.post(PAGE).json()["run_id"]
-        deadline = time.monotonic() + 10
-        while "run_end" not in kinds(conn, run_id):
-            assert time.monotonic() < deadline
-            time.sleep(0.001)
+    use_replies(GOOD)
+    at_run_end, go_on = threading.Event(), threading.Event()
+    real = store.add_run_event
 
-        assert client.post(PAGE).status_code in (202,)  # no waiting for the thread to end in between
-        assert background.wait_idle(10)
+    def holding(c, event):
+        if event.kind == "run_end" and not at_run_end.is_set():
+            at_run_end.set()
+            assert go_on.wait(10)
+        return real(c, event)
+
+    monkeypatch.setattr(store, "add_run_event", holding)
+    first = client.post(PAGE).json()["run_id"]
+    assert at_run_end.wait(10)
+    assert store.get_run(conn, first)["status"] == "succeeded" and "run_end" not in kinds(conn, first)
+
+    use_replies(GOOD)
+    second = client.post(PAGE)  # accepted: the first Run's thread has not ended, but it no longer holds the page
+
+    assert second.status_code == 202 and second.json()["run_id"] != first
+    go_on.set()
+    assert background.wait_idle(10)
+    assert kinds(conn, first)[-1] == "run_end" == kinds(conn, second.json()["run_id"])[-1]
+    assert [r["status"] for r in run_rows(conn)] == ["succeeded", "succeeded"]
+
+
+@pytest.mark.parametrize("page, status", [(99, 404), (2, 422)])
+def test_a_refused_page_is_free_again_before_the_caller_is_answered(api, background, monkeypatch, page, status):
+    """The thread lets the page go and then reports the refusal, so a retry sent at once is not refused as busy."""
+    client, use_replies = api
+    use_replies(GOOD)
+    real = background_module.BackgroundRuns._release
+
+    def slow_release(self, key, token):
+        time.sleep(0.2)  # were the caller told first, it would be answered while the key was still held
+        real(self, key, token)
+
+    monkeypatch.setattr(background_module.BackgroundRuns, "_release", slow_release)
+
+    assert client.post(f"/api/pages/book_a/{page}/translate").status_code == status
+
+    assert background._active == {}  # released already: no waiting for the thread to end
 
 
 # --- AC4: the Editor KB ------------------------------------------------------------------------------------------------
