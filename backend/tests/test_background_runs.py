@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import pytest
-from conftest import CrashAfterCallClient, GatedClient, mock_llm_client, post_translate
+from conftest import CrashAfterCallClient, FakeClient, GatedClient, mock_llm_client, post_translate
 from live_trace_support import assert_well_formed
 from test_agent_loop import Provider, answer
 from test_reviewer import APPROVE
@@ -417,6 +417,87 @@ def test_the_page_is_free_before_run_end_is_stored(api, background, conn, monkey
     assert background.wait_idle(10)
     assert kinds(conn, first)[-1] == "run_end" == kinds(conn, second.json()["run_id"])[-1]
     assert [r["status"] for r in run_rows(conn)] == ["succeeded", "succeeded"]
+
+
+def test_a_run_whose_events_cannot_be_stored_frees_its_page_all_the_same(api, background, conn, monkeypatch):
+    """No `run_end` reaches the registry's sink (the first failed store stops the sink), so the thread's end must free the
+    page: the registry may not wait for an event that never comes."""
+    client, use_replies = api
+    use_replies(GOOD)
+
+    def broken(c, event):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(store, "add_run_event", broken)
+    assert post_translate(client, background).status_code == 202
+    assert background._active == {}
+
+    use_replies(GOOD)
+    assert post_translate(client, background).status_code == 202  # not refused as busy
+    assert [r["status"] for r in run_rows(conn)] == ["succeeded", "succeeded"]
+
+
+def test_an_ended_runs_late_release_does_not_free_the_page_of_the_run_that_took_it(api, background, conn, monkeypatch, new_hold):
+    """A's `run_end` frees the page; B takes it; A's thread then ends and releases again. The token says the key is B's, so
+    the page stays held and a third POST is refused, even while B has no Run row yet (held in building its client)."""
+    client, use_replies = api
+    use_replies(GOOD)
+    at_run_end, go_on = threading.Event(), threading.Event()
+    real = store.add_run_event
+
+    def holding(c, event):
+        if event.kind == "run_end" and not at_run_end.is_set():
+            at_run_end.set()
+            assert go_on.wait(10)
+        return real(c, event)
+
+    monkeypatch.setattr(store, "add_run_event", holding)
+    assert client.post(PAGE).status_code == 202 and at_run_end.wait(10)  # A: its row is finished, its thread is held
+    thread_a = background._threads[0]
+
+    building = new_hold()
+
+    def slow_factory():
+        building.wait()
+        return FakeClient([GOOD])
+
+    app.dependency_overrides[get_client_factory] = lambda: slow_factory
+    holder: dict = {}
+    poster = threading.Thread(target=lambda: holder.update(resp=client.post(PAGE)), daemon=True)
+    poster.start()  # B: takes the page, then waits for its client, before any Run row exists
+    assert building.entered.wait(10)
+
+    go_on.set()  # A's thread goes on and ends, releasing its (old) token
+    thread_a.join(10)
+    assert not thread_a.is_alive()
+
+    third = client.post(PAGE)
+    assert third.status_code == 409  # B still holds the page
+
+    building.release.set()
+    poster.join(10)
+    assert holder["resp"].status_code == 202
+    assert background.wait_idle(10)
+    assert [r["status"] for r in run_rows(conn)] == ["succeeded", "succeeded"]
+
+
+def test_a_thread_that_cannot_start_leaves_the_page_free(api, background, conn, monkeypatch):
+    client, use_replies = api
+    use_replies(GOOD)
+    real_start = threading.Thread.start
+
+    def cannot(self):
+        if self.name.startswith("run "):  # a Run's thread only: the test client's own threads start as usual
+            raise RuntimeError("can't start new thread")
+        return real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", cannot)
+    with pytest.raises(RuntimeError, match="can't start new thread"):
+        client.post(PAGE)
+    monkeypatch.setattr(threading.Thread, "start", real_start)
+
+    assert background._active == {} and run_rows(conn) == []
+    assert post_translate(client, background).status_code == 202
 
 
 @pytest.mark.parametrize("page, status", [(99, 404), (2, 422)])
