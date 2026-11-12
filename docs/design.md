@@ -256,6 +256,12 @@ classDiagram
         translate_page()
     }
     class PageDetail:::api
+    class RunsRouter:::api {
+        get_run_events()
+    }
+    class BackgroundRuns:::service {
+        start()
+    }
     class EvalHarness:::eval {
         run_eval()
     }
@@ -401,7 +407,9 @@ classDiagram
     }
 
     PagesRouter ..> PageDetail : returns
-    PagesRouter ..> Runs : translate
+    PagesRouter ..> BackgroundRuns : translate
+    BackgroundRuns ..> Runs : translate_page, store_events
+    RunsRouter ..> Store : run events
     PagesRouter ..> Store : reads
     EvalHarness ..> Runs : validate, translate
     EvalHarness ..> Store : reads Runs, Translations; makes the KB (full)
@@ -507,6 +515,7 @@ classDiagram
         fetchPages()
         fetchPage()
         translatePage()
+        watchRun()
         editTranslation()
     }
     class FastAPI {
@@ -546,7 +555,7 @@ classDiagram
 - **M8 (done):** the cost / latency summary went into `evaluation/` (#63) and reads each eval run's lines of the ledger by range. The charts became a standalone script in `eval/` (#65), like COMET, and read only the report's, the intervals' and the cost summary's files. No model was called, and nothing in the translation path changed.
 - **M7 (in progress, OUTLINE §8):**
   - `Runs.translate_page` takes an optional event sink, which the Orchestrator, the agents and `AgentLoop` call (built, #70: `live_trace.py` holds the contract, `Runs.store_events` stores the events through `Store.add_run_event`).
-  - The API runs pages in the background and streams their Live trace events over SSE from the `run_events` table (the table is built, #70).
+  - The API runs pages in the background and streams their Live trace events over SSE from the `run_events` table (built, #72: `BackgroundRuns` in `background.py`, the stream in `api/runs.py`).
   - A human edit is a Run of config `human`, written by `Runs.edit_translation` through `Store.insert_human_run` (built, #68).
   - A person's KB decisions go through `kb/curator.py`.
-  - The frontend adds a canvas to `PageView` (editing is built: `TranslationEditor`, #68), plus SSE, which adds an event subscription to the `api` module.
+  - The frontend adds a canvas to `PageView` (editing is built: `TranslationEditor`, #68), plus SSE, which adds an event subscription to the `api` module (built, #72: `watchRun`; the events are not shown yet).
