@@ -124,9 +124,17 @@ class Stream:
         return events
 
     def close(self) -> None:
+        """The client going away: the app is told by a disconnect, then the thread is joined. A response that is already over
+        has nobody to tell: `asyncio.run` closes the loop when the app returns, and a test thread that reads the end and gets
+        here a moment later finds it closed, so then `close` only joins."""
         self._closed.set()
-        if self._loop is not None and self._disconnect is not None:
-            self._loop.call_soon_threadsafe(self._disconnect.set)
+        loop, disconnect = self._loop, self._disconnect
+        if loop is not None and disconnect is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(disconnect.set)
+            except RuntimeError:
+                if not loop.is_closed():  # it closed between the look and the call; any other RuntimeError is a real one
+                    raise
         self._thread.join(10)
 
     def __enter__(self) -> Stream:
