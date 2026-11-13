@@ -8,6 +8,7 @@
   --accent-text: #ffffff;
   --error: #b3261e;
   --error-bg: #fdecea;
+  --ok: #1e7a45;
   color-scheme: light dark;
   font: 15px/1.5 system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Hiragino Sans', sans-serif;
   color: var(--text);
@@ -25,6 +26,7 @@
     --accent-text: #0d0d10;
     --error: #f2928b;
     --error-bg: #3a1f1d;
+    --ok: #7ccf98;
   }
 }
 
@@ -108,3 +110,54 @@ button.secondary:hover:not(:disabled) { border-color: var(--accent); }
 .editor-actions .hint { font-size: 12px; }
 .ref { font-size: 13px; color: var(--muted); }
 .tag { font-size: 11px; border: 1px solid var(--border); border-radius: 3px; padding: 0 4px; margin-right: 4px; }
+
+/* The live trace panel (TracePanel.tsx): beside the list on a wide screen (image | list | panel), under the list from
+   900 to 1199 px (the image beside both), and under the list in one column below that. A sticky box would stay on top of
+   what follows it in the grid, so the image is sticky only while it has the panel beside it, not under it. */
+.columns.with-trace { grid-template-columns: minmax(240px, 1fr) minmax(300px, 1.3fr) minmax(300px, 1fr); }
+@media (max-width: 1199px) {
+  .columns.with-trace { grid-template-columns: minmax(300px, 520px) minmax(320px, 1fr); }
+  .columns.with-trace .stage { grid-column: 1; grid-row: 1 / span 2; }
+  .columns.with-trace .segments { grid-column: 2; grid-row: 1; }
+  .columns.with-trace .trace { grid-column: 2; grid-row: 2; position: static; max-height: none; }
+  .trace-log { max-height: 70vh; }
+}
+@media (max-width: 900px) {
+  .columns.with-trace { grid-template-columns: minmax(0, 1fr); }
+  .columns.with-trace .stage, .columns.with-trace .segments, .columns.with-trace .trace { grid-column: auto; grid-row: auto; }
+  .columns.with-trace .stage { position: static; }
+}
+
+.trace {
+  position: sticky; top: 16px; max-height: calc(100vh - 32px); min-width: 0; display: flex; flex-direction: column;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+}
+.trace-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--border); }
+.trace-head h3 { margin: 0; font-size: 14px; }
+.trace-head .muted { font-size: 12px; }
+.trace-gap { margin: 8px 12px 0; font-size: 13px; }
+.trace-log { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 12px 12px; font-size: 13px; line-height: 1.45; }
+.trace-log:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.trace-log > p { margin: 0; }
+.trace-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.trace-stage { padding-left: 8px; border-left: 2px solid var(--accent); }
+.trace-row { display: grid; grid-template-columns: 2.4em minmax(0, 1fr); gap: 8px; }
+.trace-row .seq {
+  padding-top: 2px; text-align: right; color: var(--muted); font: 11px ui-monospace, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+}
+.row-body { min-width: 0; overflow-wrap: anywhere; }
+.row-body p { margin: 2px 0 0; }
+.kind-stage_start { padding: 2px 0; border-radius: 4px; background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.stage-title { font-size: 14px; }
+.trace-calls, .trace-notes { margin: 2px 0 0; padding: 0; list-style: none; }
+.trace-calls li::before { content: '→ '; color: var(--muted); }
+.trace-notes li { margin-top: 2px; }
+.trace-notes .badge { min-width: 18px; height: 18px; font-size: 11px; vertical-align: 1px; }
+.trace-notes .suggestion { font-weight: 500; }
+.args { color: var(--muted); }
+.trace-result { white-space: pre-wrap; }
+.trace-error { white-space: pre-wrap; color: var(--error); background: var(--error-bg); padding: 4px 8px; border-radius: 4px; }
+.tag.ok { color: var(--ok); border-color: var(--ok); }
+.tag.bad { color: var(--error); border-color: var(--error); }
+button.link-button { padding: 0; background: none; color: var(--accent); font-size: 12px; text-decoration: underline; border-radius: 0; }

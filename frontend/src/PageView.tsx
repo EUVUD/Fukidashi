@@ -10,10 +10,14 @@ import {
   type Run,
   type RunEnd,
   type Segment,
+  type TraceEvent,
   type TranslateConfig,
 } from './api'
+import { hue } from './hue'
 import { Link } from './Link'
+import { addEvent } from './liveTrace'
 import { routePath } from './route'
+import { TracePanel } from './TracePanel'
 import { TranslationEditor } from './TranslationEditor'
 
 interface Props {
@@ -24,15 +28,23 @@ interface Props {
   onTranslated: (book: string, pageIndex: number) => void
 }
 
-// One hue per segment, shared by its box on the image and its row in the list.
-const hue = (index: number) => `hsl(${(index * 67) % 360} 70% 48%)`
-
 // The row being edited: the text typed so far, and why the last save failed.
 interface Editing {
   index: number
   draft: string
   error: string | null
 }
+
+// The run whose trace the panel shows. `events` are those received so far (a seq is held once); `open`: the stream is
+// still open; `live`: the run is being waited for, not a finished run's trace replayed.
+interface Followed {
+  runId: number
+  events: readonly TraceEvent[]
+  open: boolean
+  live: boolean
+}
+
+const isEditorConfig = (config: string): config is TranslateConfig => config === 'baseline' || config === 'full'
 
 const when = (iso: string) => new Date(iso).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'medium' })
 
@@ -64,28 +76,46 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
   const [active, setActive] = useState<number | null>(null)
   const [editing, setEditing] = useState<Editing | null>(null) // one row at a time
   const [saving, setSaving] = useState(false)
+  const [followed, setFollowed] = useState<Followed | null>(null) // the trace on show: it stays until the next Translate
 
-  // Watch a run until its `run_end`, then show what it left on the page. The run goes on in the backend if this view goes away.
+  // Follow a run's trace. With `live` (the default) also wait for its `run_end`, then show what it left on the page: the
+  // run goes on in the backend if this view goes away. Without it, replay the trace of a run that is over, and nothing else.
   const watch = useCallback(
-    (runId: number) => {
+    (runId: number, live = true) => {
       stopWatching.current?.()
-      setTranslating(true)
-      stopWatching.current = watchRun(runId, async (end: RunEnd | null) => {
-        stopWatching.current = null
-        setNotice(null) // the run is over: "already being translated" is no longer true
-        try {
-          const page = await fetchPage(book, pageIndex)
-          setDetail(page)
-          if (page.run) onTranslated(book, pageIndex)
-          if (end?.status === 'failed') setTranslateError(end.error ?? 'the run failed')
-          // The stream ended without a run_end (the server restarted mid-run, say): the page cannot say whether it failed.
-          else if (end === null) setNotice('The run ended without reporting its result. The page shows its latest translation.')
-        } catch (e) {
-          setTranslateError((e as Error).message)
-        } finally {
-          setTranslating(false)
-        }
-      })
+      // The same run again (a stream opened anew replays it from seq 1) keeps the events it has; another run starts empty.
+      setFollowed((f) => ({ runId, events: f?.runId === runId ? f.events : [], open: true, live }))
+      if (live) setTranslating(true)
+      stopWatching.current = watchRun(
+        runId,
+        (event) => {
+          setFollowed((f) => {
+            if (f === null || f.runId !== runId) return f
+            const events = addEvent(f.events, event)
+            return events === f.events ? f : { ...f, events }
+          })
+          // After a reload the select shows the config of the run being waited for, as that run's `run_start` says.
+          if (live && event.kind === 'run_start' && isEditorConfig(event.data.config)) setConfig(event.data.config)
+        },
+        async (end: RunEnd | null) => {
+          stopWatching.current = null
+          setFollowed((f) => (f !== null && f.runId === runId ? { ...f, open: false } : f))
+          if (!live) return
+          setNotice(null) // the run is over: "already being translated" is no longer true
+          try {
+            const page = await fetchPage(book, pageIndex)
+            setDetail(page)
+            if (page.run) onTranslated(book, pageIndex)
+            if (end?.status === 'failed') setTranslateError(end.error ?? 'the run failed')
+            // The stream ended without a run_end (the server restarted mid-run, say): the page cannot say whether it failed.
+            else if (end === null) setNotice('The run ended without reporting its result. The page shows its latest translation.')
+          } catch (e) {
+            setTranslateError((e as Error).message)
+          } finally {
+            setTranslating(false)
+          }
+        },
+      )
     },
     [book, pageIndex, onTranslated],
   )
@@ -99,6 +129,7 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
         setDetail(page)
         if (page.run) onTranslated(book, pageIndex) // a run that ended while this page was off screen still marks it
         if (page.running_run_id !== null) watch(page.running_run_id) // a reload: the page goes on waiting for its run
+        else if (page.run) watch(page.run.id, false) // else the trace of the run on show, if one was recorded
       },
       (e: Error) => {
         if (!ctrl.signal.aborted) setLoadError(e.message)
@@ -188,7 +219,7 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
       {!detail && !loadError && <p className="muted">Loading…</p>}
 
       {detail && (
-        <div className="columns">
+        <div className={followed ? 'columns with-trace' : 'columns'}>
           <div className="stage">
             <img
               src={detail.image_url}
@@ -263,6 +294,8 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
               </li>
             ))}
           </ol>
+
+          {followed && <TracePanel key={followed.runId} events={followed.events} open={followed.open} live={followed.live} />}
         </div>
       )}
     </div>
