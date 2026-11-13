@@ -508,7 +508,19 @@ classDiagram
         detail
         translating
         editing
+        followed
         error
+    }
+    class TracePanel {
+        events
+        open
+        live
+    }
+    class liveTrace {
+        <<module>>
+        addEvent()
+        buildView()
+        findGaps()
     }
     class api {
         <<module>>
@@ -525,7 +537,10 @@ classDiagram
     App *-- PageList
     App *-- PageView
     App ..> api : fetchPages
-    PageView ..> api : fetchPage, translatePage, editTranslation
+    PageView ..> api : fetchPage, translatePage, watchRun, editTranslation
+    PageView *-- TracePanel
+    PageView ..> liveTrace : addEvent
+    TracePanel ..> liveTrace : buildView
     api ..> FastAPI : HTTP
 ```
 
@@ -558,4 +573,4 @@ classDiagram
   - The API runs pages in the background and streams their Live trace events over SSE from the `run_events` table (built, #72: `BackgroundRuns` in `background.py`, the stream in `api/runs.py`).
   - A human edit is a Run of config `human`, written by `Runs.edit_translation` through `Store.insert_human_run` (built, #68).
   - A person's KB decisions go through `kb/curator.py`.
-  - The frontend adds a canvas to `PageView` (editing is built: `TranslationEditor`, #68), plus SSE, which adds an event subscription to the `api` module (built, #72: `watchRun`; the events are not shown yet).
+  - The frontend adds a canvas to `PageView` (editing is built: `TranslationEditor`, #68), plus SSE, which adds an event subscription to the `api` module (built, #72: `watchRun`) and a panel that shows the events (built, #74: `TracePanel`, with what it shows decided in the pure module `liveTrace`).
