@@ -1,8 +1,8 @@
-"""REST endpoints for pages: list, detail (segments + latest translation), image, translate, edit a translation.
+"""REST endpoints for pages: list, detail (segments + latest translation + review), image, translate, edit a translation.
 
 This layer parses requests, maps errors to status codes and shapes responses. The work itself lives in
-fukidashi.runs (translate or edit, and record a Run), fukidashi.background (a translate runs in the background) and
-fukidashi.store (SQL).
+fukidashi.runs (translate or edit, and record a Run), fukidashi.background (a translate runs in the background),
+fukidashi.review_notes (the review of a page, read from its Run's record) and fukidashi.store (SQL).
 """
 
 from __future__ import annotations
@@ -14,11 +14,12 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from .. import runs, store
 from ..background import BackgroundRuns, RunInProgress
 from ..llm.client import LLMClient, LLMNotConfigured
+from ..review_notes import build_review
 from .deps import get_background_runs, get_client_factory, get_dataset_root, get_db, get_db_path
 
 router = APIRouter(prefix="/api")
@@ -58,6 +59,38 @@ class RunOut(BaseModel):
     finished_at: str | None
 
 
+class ReviewFlag(BaseModel):
+    """A Translator's Flag (OUTLINE §0) of the review's Run: a region it was unsure of, and why."""
+
+    region: int
+    reason: str  # Simplified Chinese
+    pass_: int = Field(alias="pass")  # 0: the first pass; n: the nth revision (`pass` is a Python keyword, so an alias)
+    current: bool  # made by the stage that produced the displayed translation, and the region is not edited
+
+
+class ReviewIssue(BaseModel):
+    """A Reviewer's Issue (OUTLINE §0) of the review's Run: its remark on one region."""
+
+    region: int
+    comment: str  # Simplified Chinese
+    suggestion: str | None
+    verdict: str | None  # the Verdict of the review that gave it: "approve" or "revise" (None: that review gave none)
+    review: int  # 1 for the first review, 2 for the second
+    current: bool  # from the review that judged the displayed translation, and the region is not edited
+
+
+class PageReview(BaseModel):
+    """What the Orchestrator's stages say about the displayed translation (`fukidashi.review_notes`)."""
+
+    run_id: int  # the review's Run: the `full` or `full_no_kb` Run whose stages produced the translation
+    config: str
+    send_backs: int
+    final_stop: str  # "approved", "review_unusable", "revision_unusable" or "send_back_limit"
+    edited: list[int]  # the regions a person edited since that Run, sorted
+    flags: list[ReviewFlag]
+    issues: list[ReviewIssue]
+
+
 class PageDetail(BaseModel):
     book_title: str
     page_index: int
@@ -65,6 +98,7 @@ class PageDetail(BaseModel):
     segments: list[SegmentOut]
     run: RunOut | None  # latest succeeded run; None until the page has been translated
     running_run_id: int | None  # the id of the page's `running` Run, or None: a reload finds the Run to watch
+    review: PageReview | None  # None when the displayed translation has no review: `baseline`, `translator`, no Run
 
 
 class TranslateRequest(BaseModel):
@@ -104,6 +138,7 @@ def _page_detail(conn: sqlite3.Connection, page_row: sqlite3.Row) -> PageDetail:
         ],
         run=RunOut(**{k: run[k] for k in RunOut.model_fields}) if run else None,
         running_run_id=store.running_run_id(conn, page_row["id"]),
+        review=build_review(run, lambda run_id: store.get_run(conn, run_id)),
     )
 
 
