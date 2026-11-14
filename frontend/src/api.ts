@@ -34,6 +34,32 @@ export interface Run {
   finished_at: string | null
 }
 
+// What the Orchestrator's stages say about the displayed translation (backend/fukidashi/review_notes.py builds it from the
+// stored run, so a page the dev books already show has it with no model call). A note is a Flag or an Issue.
+export interface ReviewFlag {
+  region: number
+  reason: string // Simplified Chinese
+  pass: number // 0: the first pass; n: the nth revision
+  current: boolean // made by the stage that produced the displayed translation, and the region is not edited
+}
+export interface ReviewIssue {
+  region: number
+  comment: string // Simplified Chinese
+  suggestion: string | null
+  verdict: string | null // the verdict of the review that gave it: 'approve' or 'revise'; null: that review gave none
+  review: number // 1 for the first review, 2 for the second
+  current: boolean // from the review that judged the displayed translation, and the region is not edited
+}
+export interface PageReview {
+  run_id: number // the review's run: the `full` or `full_no_kb` run whose stages produced the translation
+  config: string
+  send_backs: number
+  final_stop: string // 'approved', 'review_unusable', 'revision_unusable' or 'send_back_limit'
+  edited: number[] // the regions a person edited since that run, sorted
+  flags: ReviewFlag[]
+  issues: ReviewIssue[]
+}
+
 export interface PageDetail {
   book_title: string
   page_index: number
@@ -41,6 +67,7 @@ export interface PageDetail {
   segments: Segment[]
   run: Run | null // latest succeeded run
   running_run_id: number | null // the page's running run, if any: a reload watches it
+  review: PageReview | null // null: the displayed translation has no review (`baseline`, `translator`, no run yet)
 }
 
 // The configs the editor runs (OUTLINE §8, "Running pages from the editor").

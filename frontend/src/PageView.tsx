@@ -17,6 +17,8 @@ import { measureText } from './canvasText'
 import { hue } from './hue'
 import { Link } from './Link'
 import { addEvent } from './liveTrace'
+import { NoteList, NoteMarks, ReviewLine } from './PageNotes'
+import { describeRegion, groupNotes } from './reviewNotes'
 import { routePath } from './route'
 import { TracePanel } from './TracePanel'
 import { TranslationEditor } from './TranslationEditor'
@@ -86,6 +88,8 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
   const [saving, setSaving] = useState(false)
   const [followed, setFollowed] = useState<Followed | null>(null) // the trace on show: it stays until the next Translate
   const [original, setOriginal] = useState(false) // the reader asked for the original: the typeset translations are hidden
+  const [selected, setSelected] = useState<number | null>(null) // the region whose box was clicked: it stays until cleared
+  const rows = useRef(new Map<number, HTMLLIElement>()) // the rows of the list by region, to scroll the selected one into view
 
   // Follow a run's trace. With `live` (the default) also wait for its `run_end`, then show what it left on the page: the
   // run goes on in the backend if this view goes away. Without it, replay the trace of a run that is over, and nothing else.
@@ -189,6 +193,27 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
     }
   }
 
+  // Clicking a box selects its region: the box and its row are shown selected, and the row scrolls into view. The selection stays
+  // until another box is clicked; clicking the selected box again, or pressing Esc, clears it.
+  const select = (index: number) => {
+    if (selected === index) {
+      setSelected(null)
+      return
+    }
+    setSelected(index)
+    const calm = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    rows.current.get(index)?.scrollIntoView({ block: 'center', behavior: calm ? 'auto' : 'smooth' })
+  }
+  useEffect(() => {
+    if (selected === null) return
+    // An editor's own Esc (cancel) has handled the key already, and an input method's Esc is not ours.
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !e.defaultPrevented && !e.isComposing) setSelected(null)
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [selected])
+
   const siblings = pages.filter((p) => p.book_title === book)
   const at = siblings.findIndex((p) => p.page_index === pageIndex)
   const prev = at > 0 ? siblings[at - 1] : null
@@ -200,6 +225,8 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
   const results = useMemo(() => typesetPage(segments, measureText), [segments])
   const figures = useMemo(() => overflowRate(results), [results])
   const showTranslated = figures.typeset > 0 && !original // the default view is the translated one, once there is one
+  const review = detail?.review ?? null
+  const notes = useMemo(() => groupNotes(review), [review]) // the review's notes by region
 
   return (
     <div className="page-view">
@@ -229,6 +256,7 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
       {translating && <p className="muted">Waiting for the model. The page updates when the run ends.</p>}
       {detail && segments.length === 0 && <p className="muted">This page has no text regions.</p>}
       {detail?.run && <p className="muted run-info">{runSummary(detail.run)}</p>}
+      {review && <ReviewLine review={review} />}
       {detail && segments.length > 0 && (
         <div className="typeset-bar">
           <p
@@ -263,31 +291,53 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
               </Suspense>
             )}
             {natural &&
-              segments.map((s, i) => (
-                <div
-                  key={s.index}
-                  className={`box${active === s.index ? ' active' : ''}${results[i]?.overflow ? ' overflow' : ''}`}
-                  title={results[i]?.overflow ? `Overflows: its translation does not fit at ${MIN_FONT_PX} px` : undefined}
-                  style={{
-                    left: `${(s.x / natural.w) * 100}%`,
-                    top: `${(s.y / natural.h) * 100}%`,
-                    width: `${(s.w / natural.w) * 100}%`,
-                    height: `${(s.h / natural.h) * 100}%`,
-                    ['--c' as string]: hue(s.index),
-                  }}
-                  onMouseEnter={() => setActive(s.index)}
-                  onMouseLeave={() => setActive(null)}
-                >
-                  <span className="badge">{s.index}</span>
-                </div>
-              ))}
+              segments.map((s, i) => {
+                const overflow = results[i]?.overflow
+                const regionNotes = notes.get(s.index)
+                const words = regionNotes && describeRegion(regionNotes)
+                return (
+                  <div
+                    key={s.index}
+                    className={`box${active === s.index ? ' active' : ''}${selected === s.index ? ' selected' : ''}${overflow ? ' overflow' : ''}`}
+                    role="button"
+                    tabIndex={0}
+                    aria-pressed={selected === s.index}
+                    aria-label={[`Region ${s.index}`, overflow ? 'overflows' : null, words].filter((part) => part).join(', ')}
+                    title={[overflow ? `Overflows: its translation does not fit at ${MIN_FONT_PX} px` : null, words].filter((part) => part).join(' · ') || undefined}
+                    style={{
+                      left: `${(s.x / natural.w) * 100}%`,
+                      top: `${(s.y / natural.h) * 100}%`,
+                      width: `${(s.w / natural.w) * 100}%`,
+                      height: `${(s.h / natural.h) * 100}%`,
+                      ['--c' as string]: hue(s.index),
+                    }}
+                    onMouseEnter={() => setActive(s.index)}
+                    onMouseLeave={() => setActive(null)}
+                    onClick={() => select(s.index)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault()
+                        select(s.index)
+                      }
+                    }}
+                  >
+                    <span className="badge">{s.index}</span>
+                    {regionNotes && <NoteMarks notes={regionNotes} />}
+                  </div>
+                )
+              })}
           </div>
 
           <ol className="segments">
             {segments.map((s, i) => (
               <li
                 key={s.index}
-                className={active === s.index ? 'active' : undefined}
+                ref={(row) => {
+                  if (row) rows.current.set(s.index, row)
+                  else rows.current.delete(s.index)
+                }}
+                className={[active === s.index ? 'active' : '', selected === s.index ? 'selected' : ''].filter((c) => c).join(' ') || undefined}
+                aria-current={selected === s.index ? 'true' : undefined}
                 style={{ ['--c' as string]: hue(s.index) }}
                 onMouseEnter={() => setActive(s.index)}
                 onMouseLeave={() => setActive(null)}
@@ -329,6 +379,7 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
                       )}
                     </div>
                   )}
+                  <NoteList region={s.index} notes={notes.get(s.index)?.notes ?? []} />
                   <p className="ref" lang="zh-Hant">
                     <span className="tag">zh-Hant reference</span> {s.text_zh_hant}
                   </p>
