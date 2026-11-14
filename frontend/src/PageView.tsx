@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ApiError,
   editTranslation,
@@ -13,12 +13,18 @@ import {
   type TraceEvent,
   type TranslateConfig,
 } from './api'
+import { measureText } from './canvasText'
 import { hue } from './hue'
 import { Link } from './Link'
 import { addEvent } from './liveTrace'
 import { routePath } from './route'
 import { TracePanel } from './TracePanel'
 import { TranslationEditor } from './TranslationEditor'
+import { MIN_FONT_PX, describeFigures, overflowRate, typesetPage } from './typeset'
+
+// Konva and react-konva are most of the bundle, and a page needs them only once it has a translation to draw: the canvas
+// layer is its own chunk, loaded the first time it shows.
+const TypesetLayer = lazy(() => import('./TypesetLayer').then((m) => ({ default: m.TypesetLayer })))
 
 interface Props {
   book: string
@@ -45,6 +51,8 @@ interface Followed {
 }
 
 const isEditorConfig = (config: string): config is TranslateConfig => config === 'baseline' || config === 'full'
+
+const NO_SEGMENTS: Segment[] = [] // one array for every render without a page, so the typesetting below is not redone for it
 
 const when = (iso: string) => new Date(iso).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'medium' })
 
@@ -77,6 +85,7 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
   const [editing, setEditing] = useState<Editing | null>(null) // one row at a time
   const [saving, setSaving] = useState(false)
   const [followed, setFollowed] = useState<Followed | null>(null) // the trace on show: it stays until the next Translate
+  const [original, setOriginal] = useState(false) // the reader asked for the original: the typeset translations are hidden
 
   // Follow a run's trace. With `live` (the default) also wait for its `run_end`, then show what it left on the page: the
   // run goes on in the backend if this view goes away. Without it, replay the trace of a run that is over, and nothing else.
@@ -185,8 +194,12 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
   const prev = at > 0 ? siblings[at - 1] : null
   const next = at >= 0 && at < siblings.length - 1 ? siblings[at + 1] : null
 
-  const segments = detail?.segments ?? []
+  const segments = detail?.segments ?? NO_SEGMENTS
   const label = `${book}/${String(pageIndex).padStart(3, '0')}`
+  // Typeset again whenever the displayed translations change: an edit saved, a run that ended, another page (OUTLINE §8).
+  const results = useMemo(() => typesetPage(segments, measureText), [segments])
+  const figures = useMemo(() => overflowRate(results), [results])
+  const showTranslated = figures.typeset > 0 && !original // the default view is the translated one, once there is one
 
   return (
     <div className="page-view">
@@ -216,6 +229,24 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
       {translating && <p className="muted">Waiting for the model. The page updates when the run ends.</p>}
       {detail && segments.length === 0 && <p className="muted">This page has no text regions.</p>}
       {detail?.run && <p className="muted run-info">{runSummary(detail.run)}</p>}
+      {detail && segments.length > 0 && (
+        <div className="typeset-bar">
+          <p
+            className="muted typeset-line"
+            title={`A box overflows when its translation does not fit at ${MIN_FONT_PX} px, in image pixels. Boxes with no translation are left out of the rate.`}
+          >
+            Typesetting: {describeFigures(figures)}
+          </p>
+          <div className="view-toggle" role="group" aria-label="What the page shows">
+            <button type="button" aria-pressed={showTranslated} disabled={figures.typeset === 0} onClick={() => setOriginal(false)}>
+              Translated
+            </button>
+            <button type="button" aria-pressed={!showTranslated} onClick={() => setOriginal(true)}>
+              Original
+            </button>
+          </div>
+        </div>
+      )}
       {!detail && !loadError && <p className="muted">Loading…</p>}
 
       {detail && (
@@ -226,11 +257,17 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
               alt={label}
               onLoad={(e) => setNatural({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })}
             />
+            {natural && showTranslated && (
+              <Suspense fallback={null}>
+                <TypesetLayer segments={segments} results={results} natural={natural} />
+              </Suspense>
+            )}
             {natural &&
-              segments.map((s) => (
+              segments.map((s, i) => (
                 <div
                   key={s.index}
-                  className={`box${active === s.index ? ' active' : ''}`}
+                  className={`box${active === s.index ? ' active' : ''}${results[i]?.overflow ? ' overflow' : ''}`}
+                  title={results[i]?.overflow ? `Overflows: its translation does not fit at ${MIN_FONT_PX} px` : undefined}
                   style={{
                     left: `${(s.x / natural.w) * 100}%`,
                     top: `${(s.y / natural.h) * 100}%`,
@@ -247,7 +284,7 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
           </div>
 
           <ol className="segments">
-            {segments.map((s) => (
+            {segments.map((s, i) => (
               <li
                 key={s.index}
                 className={active === s.index ? 'active' : undefined}
@@ -274,6 +311,11 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
                       <p className={s.text_zh_hans ? 'out' : 'out empty'} lang="zh-Hans">
                         {s.text_zh_hans ?? (translating ? '…' : 'not translated yet')}
                       </p>
+                      {results[i]?.overflow && (
+                        <span className="tag bad" title={`Does not fit its box at ${MIN_FONT_PX} px`}>
+                          overflows
+                        </span>
+                      )}
                       {s.text_zh_hans !== null && (
                         <button
                           type="button"

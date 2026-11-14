@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { fetchPages, type PageSummary } from './api'
+import { BookTypesetting } from './BookTypesetting'
 import { PageList } from './PageList'
 import { PageView } from './PageView'
 import { useRoute } from './route'
@@ -33,6 +34,8 @@ export default function App() {
         {pages && <PageList pages={pages} route={route} navigate={navigate} />}
       </aside>
       <main className="main">
+        {/* Keyed by book, not by page: a book's measurement stays on screen while the reader moves between its pages. */}
+        {route && pages && <BookTypesetting key={route.book} book={route.book} pages={pages} navigate={navigate} />}
         {route ? (
           <PageView
             key={`${route.book}/${route.pageIndex}`}
