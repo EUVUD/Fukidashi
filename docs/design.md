@@ -504,12 +504,31 @@ classDiagram
         route
     }
     class PageList
+    class BookTypesetting {
+        state
+    }
     class PageView {
         detail
         translating
         editing
         followed
+        original
         error
+    }
+    class TypesetLayer {
+        width
+    }
+    class typeset {
+        <<module>>
+        typeset()
+        typesetPage()
+        overflowRate()
+        summarizeBook()
+    }
+    class canvasText {
+        <<module>>
+        FONT_FAMILY
+        measureText()
     }
     class TracePanel {
         events
@@ -535,12 +554,21 @@ classDiagram
     }
 
     App *-- PageList
+    App *-- BookTypesetting
     App *-- PageView
     App ..> api : fetchPages
+    BookTypesetting ..> api : fetchPage
+    BookTypesetting ..> typeset : typesetPage, summarizeBook
     PageView ..> api : fetchPage, translatePage, watchRun, editTranslation
     PageView *-- TracePanel
+    PageView *-- TypesetLayer
     PageView ..> liveTrace : addEvent
+    PageView ..> typeset : typesetPage, overflowRate
     TracePanel ..> liveTrace : buildView
+    TypesetLayer ..> typeset : blockHeight, LINE_HEIGHT
+    TypesetLayer ..> canvasText : FONT_FAMILY, measureText
+    BookTypesetting ..> canvasText : measureText
+    PageView ..> canvasText : measureText
     api ..> FastAPI : HTTP
 ```
 
@@ -573,4 +601,4 @@ classDiagram
   - The API runs pages in the background and streams their Live trace events over SSE from the `run_events` table (built, #72: `BackgroundRuns` in `background.py`, the stream in `api/runs.py`).
   - A human edit is a Run of config `human`, written by `Runs.edit_translation` through `Store.insert_human_run` (built, #68).
   - A person's KB decisions go through `kb/curator.py`.
-  - The frontend adds a canvas to `PageView` (editing is built: `TranslationEditor`, #68), plus SSE, which adds an event subscription to the `api` module (built, #72: `watchRun`) and a panel that shows the events (built, #74: `TracePanel`, with what it shows decided in the pure module `liveTrace`).
+  - The frontend adds a canvas to `PageView` (built, #77: `TypesetLayer`, a Konva stage loaded lazily, draws what the pure module `typeset` lays out with the measure of `canvasText`; `BookTypesetting`, which `App` keys by book, measures a whole book) and editing (built: `TranslationEditor`, #68). SSE adds an event subscription to the `api` module (built, #72: `watchRun`) and a panel that shows the events (built, #74: `TracePanel`, with what it shows decided in the pure module `liveTrace`).
