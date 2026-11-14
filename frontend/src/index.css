@@ -9,6 +9,8 @@
   --error: #b3261e;
   --error-bg: #fdecea;
   --ok: #1e7a45;
+  --flag: #9a5b00; /* the Translator's Flags and the Reviewer's Issues, in their rows (PageNotes.tsx) */
+  --issue: #5b3aa6;
   color-scheme: light dark;
   font: 15px/1.5 system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Hiragino Sans', sans-serif;
   color: var(--text);
@@ -27,6 +29,8 @@
     --error: #f2928b;
     --error-bg: #3a1f1d;
     --ok: #7ccf98;
+    --flag: #e3a64e;
+    --issue: #b8a3f2;
   }
 }
 
@@ -193,3 +197,38 @@ button.secondary:hover:not(:disabled) { border-color: var(--accent); }
 .tag.ok { color: var(--ok); border-color: var(--ok); }
 .tag.bad { color: var(--error); border-color: var(--error); }
 button.link-button { padding: 0; background: none; color: var(--accent); font-size: 12px; text-decoration: underline; border-radius: 0; }
+
+/* Review notes (PageNotes.tsx, reviewNotes.ts; OUTLINE §0, Flag and Verdict / Issue). A box with a note carries a marker at its
+   bottom-right corner (the badge is at the top-left): "?" for a Flag, "!" for an Issue, so the two differ in shape and not only
+   in colour. The markers are drawn on the manga page, which is light in either theme, so they do not follow the theme; the notes
+   in the rows do. A marker is hollow when none of the region's notes is about the translation on show. Clicking a box selects its
+   region (PageView): a ring round the box, which hover does not have, and a tinted row. */
+.box { cursor: pointer; }
+.box:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+.box.selected { border-width: 3px; background: color-mix(in srgb, var(--c) 32%, transparent); box-shadow: 0 0 0 2px #fff, 0 0 0 5px var(--c); }
+.box.overflow.selected { background: color-mix(in srgb, var(--error) 30%, transparent); }
+.segments li.selected { outline: 3px solid var(--c); background: color-mix(in srgb, var(--c) 10%, var(--panel)); }
+.marks { position: absolute; right: -10px; bottom: -10px; display: inline-flex; gap: 2px; line-height: 1; }
+.mark {
+  display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 18px; padding: 0 4px;
+  font: 700 12px/1 system-ui, sans-serif; color: #fff; border: 1.5px solid #fff; border-radius: 9px; box-shadow: 0 0 0 1px rgb(0 0 0 / 40%);
+}
+.mark.flag { background: #9a5b00; }
+.mark.issue { background: #5b3aa6; }
+.marks.earlier .mark { background: #fff; border: 1.5px dashed currentColor; box-shadow: none; }
+.marks.earlier .mark.flag { color: #9a5b00; }
+.marks.earlier .mark.issue { color: #5b3aa6; }
+
+.review-line { margin: -8px 0 12px; font-size: 13px; overflow-wrap: anywhere; }
+.notes { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+/* `.segments li` styles every list item under the list of rows, the notes' included, so these rules need its weight. */
+.segments .note { display: block; padding: 4px 8px; font-size: 13px; line-height: 1.45; border: 0; border-left: 3px solid var(--note); border-radius: 0 4px 4px 0; background: color-mix(in srgb, var(--note) 9%, transparent); }
+.segments .note.earlier { border-left-style: dashed; }
+.note.flag { --note: var(--flag); }
+.note.issue { --note: var(--issue); }
+.note-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; }
+.note .tag { margin-right: 0; font-weight: 600; color: var(--note); border-color: var(--note); }
+.note .about { font-size: 12px; font-style: italic; color: var(--muted); }
+.texts .note-text, .texts .note-suggestion { margin-top: 2px; }
+.note-suggestion { font-weight: 500; }
+.note.earlier .note-text, .note.earlier .note-suggestion { color: var(--muted); }
