@@ -15,6 +15,10 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def find_book(conn: sqlite3.Connection, book_title: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM books WHERE book_title = ?", (book_title,)).fetchone()
+
+
 def find_page(conn: sqlite3.Connection, book_title: str, page_index: int) -> sqlite3.Row | None:
     return conn.execute(
         "SELECT * FROM pages WHERE book_title = ? AND page_index = ?", (book_title, page_index)
@@ -173,16 +177,18 @@ def run_events(conn: sqlite3.Connection, run_id: int, after_seq: int = 0) -> lis
 # --- Knowledge Base (OUTLINE 3.3) ---
 # Reads are open to everyone. The functions named in KB_WRITES write entries, profiles and proposals, and only
 # kb/curator.py calls them (a test scans the code for any other caller). They do not commit: the Curator's `apply`
-# opens the transaction with `transaction` and so owns all-or-nothing. `create_kb` only makes the empty container,
-# so it is not in KB_WRITES.
+# and a person's decisions open the transaction with `transaction` and so own all-or-nothing. `create_kb` only makes
+# the empty container, so it is not in KB_WRITES.
 
 KB_WRITES = (
     "insert_proposal", "set_proposal_status", "insert_entry", "insert_profile",
-    "add_entry_evidence", "add_profile_evidence", "add_profile_aliases",
+    "add_entry_evidence", "add_profile_evidence", "add_profile_aliases", "set_entry_status", "set_profile_status",
 )
 
 # The states a lookup or a KB snippet may return (OUTLINE 3.3): 'proposed' and 'rejected' are not shown.
 READABLE_STATUSES = ("approved", "pending_human")
+# Every state an entry, a profile or a proposal can be in (the CHECK of each table).
+ALL_STATUSES = ("proposed", "approved", "rejected", "pending_human")
 
 
 @contextmanager
@@ -196,6 +202,18 @@ def transaction(conn: sqlite3.Connection) -> Iterator[None]:
     except BaseException:
         conn.rollback()
         raise
+
+
+@contextmanager
+def reading(conn: sqlite3.Connection) -> Iterator[None]:
+    """One read-only view of the database: what is read inside is one state of it, even when another connection commits a
+    write meanwhile (the database is in WAL mode). Writes nothing and takes no write lock. Call it with no transaction
+    open."""
+    conn.execute("BEGIN")
+    try:
+        yield
+    finally:
+        conn.rollback()
 
 
 def create_kb(conn: sqlite3.Connection, *, book_title: str, purpose: str, label: str) -> int:
@@ -231,6 +249,11 @@ def editor_kb(conn: sqlite3.Connection, book_title: str) -> int:
     return find_kb(conn, book_title=book_title, purpose=EDITOR, label=EDITOR_KB_LABEL)["id"]
 
 
+def find_editor_kb(conn: sqlite3.Connection, book_title: str) -> sqlite3.Row | None:
+    """The book's Editor KB, or None when it has none yet. Unlike `editor_kb` it never makes one: a read leaves no row."""
+    return find_kb(conn, book_title=book_title, purpose=EDITOR, label=EDITOR_KB_LABEL)
+
+
 def get_kb(conn: sqlite3.Connection, kb_id: int) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM kbs WHERE id = ?", (kb_id,)).fetchone()
 
@@ -259,6 +282,27 @@ def kb_proposals(conn: sqlite3.Connection, kb_id: int, status: str | None = None
         "SELECT * FROM proposals WHERE kb_id = ? AND (? IS NULL OR status = ?) ORDER BY rowid",
         (kb_id, status, status),
     ).fetchall()
+
+
+def proposal_counts(conn: sqlite3.Connection, kb_id: int) -> dict[str, int]:
+    """How many of the KB's proposals have each status: every status is a key, 0 when none has it."""
+    counts = dict.fromkeys(ALL_STATUSES, 0)
+    for r in conn.execute("SELECT status, COUNT(*) AS n FROM proposals WHERE kb_id = ? GROUP BY status", (kb_id,)):
+        counts[r["status"]] = r["n"]
+    return counts
+
+
+def get_entry(conn: sqlite3.Connection, kb_id: int, entry_id: int) -> sqlite3.Row | None:
+    """The entry with this id, if it belongs to this KB: an id of another KB's entry is not found."""
+    return conn.execute("SELECT * FROM glossary_entries WHERE kb_id = ? AND id = ?", (kb_id, entry_id)).fetchone()
+
+
+def get_profile(conn: sqlite3.Connection, kb_id: int, profile_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM character_profiles WHERE kb_id = ? AND id = ?", (kb_id, profile_id)).fetchone()
+
+
+def get_proposal(conn: sqlite3.Connection, kb_id: int, proposal_id: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM proposals WHERE kb_id = ? AND proposal_id = ?", (kb_id, proposal_id)).fetchone()
 
 
 def find_entry(conn: sqlite3.Connection, kb_id: int, source_term: str) -> sqlite3.Row | None:
@@ -342,6 +386,32 @@ def _add_evidence(conn: sqlite3.Connection, table: str, row_id: int, page_index:
         (_dumps(sorted([*pages, page_index])), _dumps(history), now, row_id),
     )
     return True
+
+
+def _history_with(conn: sqlite3.Connection, table: str, row_id: int, now: str, event: dict) -> str:
+    """The row's history as JSON, with `event` added as its last line (stamped `now`). Reads only."""
+    row = conn.execute(f"SELECT history FROM {table} WHERE id = ?", (row_id,)).fetchone()
+    return _dumps([*json.loads(row["history"]), {"at": now, **event}])
+
+
+def set_entry_status(conn: sqlite3.Connection, entry_id: int, *, status: str, provenance: str, event: dict) -> None:
+    """A person's decision on an entry: its new status and provenance, and `event` as the last line of its history. The
+    evidence stays as it is."""
+    now = _now()
+    conn.execute(
+        "UPDATE glossary_entries SET status = ?, provenance = ?, history = ?, updated_at = ? WHERE id = ?",
+        (status, provenance, _history_with(conn, "glossary_entries", entry_id, now, event), now, entry_id),
+    )
+
+
+def set_profile_status(conn: sqlite3.Connection, profile_id: int, *, status: str, event: dict) -> None:
+    """A person's decision on a profile: its new status, and `event` as the last line of its history. A profile has no
+    provenance column; the `by` of its history lines says who decided."""
+    now = _now()
+    conn.execute(
+        "UPDATE character_profiles SET status = ?, history = ?, updated_at = ? WHERE id = ?",
+        (status, _history_with(conn, "character_profiles", profile_id, now, event), now, profile_id),
+    )
 
 
 def add_entry_evidence(conn: sqlite3.Connection, entry_id: int, page_index: int, event: dict) -> bool:
