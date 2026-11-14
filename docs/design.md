@@ -68,7 +68,7 @@ classDiagram
 - **Reference translations** (OpenMantra's zh-Hant and en translations) belong to the Segment and are used only for comparison and evaluation, never in a prompt.
 - `Run.config` is `baseline` (one call per page, no tools, no KB), `translator` (the Translator Agent alone, M2's smoke config), `full_no_kb` (Translator, Reviewer, Send-backs) or `full` (the same with a Knowledge Base).
 - A book has one **KnowledgeBase** per use: each `full` eval run makes a new one, and the editor will keep one per book (M7). A `full` Run **proposes** entries; at finalize the Curator and the rules **decide** each Proposal, and only then can it become a Glossary entry or a Character Profile.
-- A review's **Issues** (a comment and a suggestion for one region) are kept in the Run's record. The editor does not show them yet (M7).
+- A review's **Issues** (a comment and a suggestion for one region) and the Translator's **Flags** are kept in the Run's record, with the stage that made each. The editor shows them on the page, read from that record (#79): a note is current when it is about the translation on show, and a person's edit of a region makes that region's notes about the text before the edit.
 
 ---
 
@@ -243,7 +243,7 @@ The objects in the code and how they depend on each other (the actual structure 
 
 ### 4.1 Backend
 
-Colors mark layers: blue = API, teal = eval, pink = service (`runs.py` and the Orchestrator), green = pipeline, lime = agents, brown = Knowledge Base, orange = LLM, purple = data, grey = tracing.
+Colors mark layers: blue = API, teal = eval, pink = service (`runs.py`, `review_notes.py` and the Orchestrator), green = pipeline, lime = agents, brown = Knowledge Base, orange = LLM, purple = data, grey = tracing.
 
 ```mermaid
 classDiagram
@@ -256,6 +256,9 @@ classDiagram
         translate_page()
     }
     class PageDetail:::api
+    class ReviewNotes:::service {
+        build_review()
+    }
     class RunsRouter:::api {
         get_run_events()
     }
@@ -407,6 +410,7 @@ classDiagram
     }
 
     PagesRouter ..> PageDetail : returns
+    PagesRouter ..> ReviewNotes : page review, via Store.get_run
     PagesRouter ..> BackgroundRuns : translate
     BackgroundRuns ..> Runs : translate_page, store_events
     RunsRouter ..> Store : run events
@@ -477,7 +481,7 @@ classDiagram
     classDef data fill:#f1e9fb,stroke:#8a5fc4,color:#222
 ```
 
-- `PagesRouter` only parses parameters, maps errors to status codes and shapes responses; it has no SQL. "Translate a page and record a Run" lives in `Runs.translate_page`, and the SQL lives in `Store`.
+- `PagesRouter` only parses parameters, maps errors to status codes and shapes responses; it has no SQL. `PageDetail.review` comes from `ReviewNotes` (`review_notes.py`), a pure function over the stored Runs' records: it follows a person's edits back to the `full` or `full_no_kb` Run that produced the translation, through the `Store.get_run` it is handed, and calls no model. "Translate a page and record a Run" lives in `Runs.translate_page`, and the SQL lives in `Store`.
 - `Runs.translate_page` does not depend on HTTP, so the eval harness calls it directly (OUTLINE §1.3, Same code path). An invalid page raises `PageNotFound` or another `TranslateError` before any Run exists, which the router maps to 404 / 422. A failed model call or unparseable output is not an exception but a `failed` Run (502). An unexpected exception after the Run row exists marks that Run failed and is raised as `RunCrashed` with its `run_id` (500).
 - `EvalHarness` (`evaluation/harness.py`; CLI `eval/run.py`) calls `validate_page` for every page before the first model call, then `translate_page` page by page, and scores the stored Translations against references converted with OpenCC `t2s`. It writes `EvalOutputs` to `runs/eval/<id>/` after every page, so an interrupted eval keeps the pages it finished (its manifest's `finished_at` stays null); `scores.json` reports scored and failed Runs' cost separately, and any unknown cost makes a total `null`. For `full` it also reports KB reach, read from each stored Run: the snippets the page was shown (`kb_snippets`, which `Runs` records from `KBSnapshot.snippet_items`), the lookups that found something or not, and the items that reached the page.
 - Scorers read a finished eval run's `EvalOutputs` and write a file of their own next to them, outside `EvalHarness` and the translation path, so they can score old runs again. `TermAccuracy` (`evaluation/terms.py`; CLI `eval/terms.py`) writes `terms.json` and reads neither the database nor the zh-Hant reference. `CometScript` (`eval/comet.py`) is a standalone script with its own environment that imports nothing from `fukidashi`, so PyTorch stays out of the project's lock and CI, and the script can run on another machine. Two more call the judge model, a second `LLMClient` with a configuration (`JUDGE_*`), a `Meter` and a ledger of its own, so the evaluation's cost never reaches a Run: `MqmScorer` (`evaluation/mqm_scorer.py`; CLI `eval/mqm.py`) writes `mqm-<model>.json`, and `TermConsistency` (`evaluation/consistency.py`; CLI `eval/consistency.py`) writes `consistency-<model>.json`. `AgreementCheck` (`evaluation/agreement.py`; CLI `eval/mqm_agreement.py`) compares an annotator's labels on the human sample with a judge's `mqm-*.json` and calls no model.
@@ -513,6 +517,7 @@ classDiagram
         editing
         followed
         original
+        selected
         error
     }
     class TypesetLayer {
@@ -529,6 +534,17 @@ classDiagram
         <<module>>
         FONT_FAMILY
         measureText()
+    }
+    class PageNotes {
+        ReviewLine
+        NoteMarks
+        NoteList
+    }
+    class reviewNotes {
+        <<module>>
+        groupNotes()
+        reviewLine()
+        describeRegion()
     }
     class TracePanel {
         events
@@ -569,6 +585,9 @@ classDiagram
     TypesetLayer ..> canvasText : FONT_FAMILY, measureText
     BookTypesetting ..> canvasText : measureText
     PageView ..> canvasText : measureText
+    PageView *-- PageNotes
+    PageView ..> reviewNotes : groupNotes, describeRegion
+    PageNotes ..> reviewNotes : reviewLine, aboutText
     api ..> FastAPI : HTTP
 ```
 
@@ -585,7 +604,7 @@ classDiagram
 | Knowledge Base | `kbs` | `kb_id`; `KBSnapshot` (`load_snapshot`) to read it; one per `full` eval run | none yet |
 | Term entry / Character Profile | `glossary_entries` / `character_profiles` | `GlossaryEntry` / `CharacterProfile` (`kb/entities.py`) | none yet |
 | Proposal | `proposals` | `Proposal`, from `ProposalCollector`; written only by `curator.apply` | none yet |
-| Flag, Verdict / Issue | none (inside a `full_no_kb` or `full` Run's `attempts_json`) | `TranslatorResult.flags`, `ReviewResult` | none yet |
+| Flag, Verdict / Issue | none (inside a `full_no_kb` or `full` Run's `attempts_json`) | `TranslatorResult.flags`, `ReviewResult`; read back by `review_notes.build_review` | `PageReview` (`ReviewFlag`, `ReviewIssue`) / `PageReview` |
 | Curator decision, proposal outcome | `proposals.status` and reason; also a `full` Run's `attempts_json` (`finalize`) | `CuratorResult.decisions`; `curator.Outcome` (one of 9 results) | none yet |
 
 ### 4.4 Where later milestones plug in
@@ -601,4 +620,4 @@ classDiagram
   - The API runs pages in the background and streams their Live trace events over SSE from the `run_events` table (built, #72: `BackgroundRuns` in `background.py`, the stream in `api/runs.py`).
   - A human edit is a Run of config `human`, written by `Runs.edit_translation` through `Store.insert_human_run` (built, #68).
   - A person's KB decisions go through `kb/curator.py`.
-  - The frontend adds a canvas to `PageView` (built, #77: `TypesetLayer`, a Konva stage loaded lazily, draws what the pure module `typeset` lays out with the measure of `canvasText`; `BookTypesetting`, which `App` keys by book, measures a whole book) and editing (built: `TranslationEditor`, #68). SSE adds an event subscription to the `api` module (built, #72: `watchRun`) and a panel that shows the events (built, #74: `TracePanel`, with what it shows decided in the pure module `liveTrace`).
+  - The frontend adds a canvas to `PageView` (built, #77: `TypesetLayer`, a Konva stage loaded lazily, draws what the pure module `typeset` lays out with the measure of `canvasText`; `BookTypesetting`, which `App` keys by book, measures a whole book) and editing (built: `TranslationEditor`, #68). SSE adds an event subscription to the `api` module (built, #72: `watchRun`) and a panel that shows the events (built, #74: `TracePanel`, with what it shows decided in the pure module `liveTrace`). `PageView` shows the Flags and Issues of the Run behind the displayed translation (built, #79: `PageDetail.review` from `ReviewNotes`; the words and the grouping by region in the pure module `reviewNotes`, placed by `PageNotes`).
