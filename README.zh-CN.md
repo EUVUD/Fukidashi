@@ -4,7 +4,7 @@
 
 多 agent 漫画翻译编辑器（日 → 简体中文）。在 [OpenMantra](https://github.com/mantra-inc/open-mantra-dataset) 数据集上，用标准的 MT evaluation framework 和单次调用的 baseline 做对比。
 
-> **现状（2026-11-13）：** M0 到 M6 以及 M8 已完成，eval 代码已冻结在标签 `exp-frozen` 上。vertical slice 已经跑通：导入 OpenMantra，对一页做一次模型调用完成翻译，在浏览器里逐句对照图上的 box 检查译文。M2 新增了用 chrF / BLEU 给各个 config 打分的 eval harness；第一版 Translator Agent（即 `translator` config），它跑在调用工具的 agent loop 上，底下是带计量的 client；还有可选的 tracing，trace 发到本机的 Arize Phoenix（[记录](docs/m2.md)）。M3 加上了多 agent 系统（[记录](docs/m3.md)）：Reviewer Agent、把页面退回修改的 Orchestrator、每本书一个的 Knowledge Base（Curator Agent 是它唯一的写者）、`full` 和 `full_no_kb` 两个 config，以及两部 dev 作品的 gold glossary。M4 加上了按整本书跑的 eval、COMET 打分脚本、对照 gold glossary 的 term accuracy、KB 触达各页次数的统计、汇总多次 eval 的报告，以及 GitHub Actions 上的 CI，然后在两部 dev 作品上把每个 config 各跑了一遍（[记录](docs/m4.md)）。M5 加上了 judge 模型（GPT-4o mini，计量和翻译模型分开）和 GEMBA-MQM 打分脚本、term consistency、三部 test 作品的 gold glossary、在 dev 作品上调了一轮 prompt，以及一页的 eval protocol（[记录](docs/m5.md)）。在约 30 个标注 segment 上做一致性检查时，GPT-4o mini 和备用的 judge 都没有和标注对上（标注是 LLM 做的），所以 MQM 只作参考报告。M6 先写好 paired bootstrap，在翻译任何 test 页之前合并，然后从这个标签出发，在三部 test 作品上把每个 config 各跑一次并打分（[记录](docs/m6.md)）。在这些运行上算出的 95% 置信区间只反映抽到哪些页带来的不确定性，不包括重跑带来的波动，因为每个 config 只跑了一次。和每页一次调用相比，full system 的 COMET 没有提升（−0.0028，区间 −0.0068 到 +0.0014），chrF（−1.2，区间 −2.3 到 −0.1）和 BLEU（−2.1，区间 −3.5 到 −0.8）更低，每页成本是它的 5.0 到 7.9 倍（是一个范围，因为账本看不出缓存输入实际按什么价格计费）。它在 glossary 的人名和自造词上的 term accuracy 和每页一次调用分不出高低（+2.1 个百分点，区间 −2.7 到 +6.8），Knowledge Base 也没有让它提高（+0.0 个百分点，区间 −5.1 到 +5.0）。它的 term consistency 比每页一次调用高 4.5 个百分点（区间 +0.8 到 +6.7），但在 dev 作品上把每页一次调用重跑一遍，consistency 就变了 7.0 个百分点，所以这个提升和重跑本身的波动分不开。M8 加上了成本和延迟小结，以及五张图表（[记录](docs/m8.md)）。M7（编辑器）已经开始：现在可以手工修改一个 box 的译文，修改单独存为一个 Run；也可以在编辑器里用 `baseline` 或完整系统在后台翻译一页，实时看到它的每一步，还能看到每句译文排进它的 box，以及放不下的 box 占多少。下一步：编辑器的其余部分（M7），然后是报告（M9）。
+> **现状（2026-11-14）：** M0 到 M6 以及 M8 已完成，eval 代码已冻结在标签 `exp-frozen` 上。vertical slice 已经跑通：导入 OpenMantra，对一页做一次模型调用完成翻译，在浏览器里逐句对照图上的 box 检查译文。M2 新增了用 chrF / BLEU 给各个 config 打分的 eval harness；第一版 Translator Agent（即 `translator` config），它跑在调用工具的 agent loop 上，底下是带计量的 client；还有可选的 tracing，trace 发到本机的 Arize Phoenix（[记录](docs/m2.md)）。M3 加上了多 agent 系统（[记录](docs/m3.md)）：Reviewer Agent、把页面退回修改的 Orchestrator、每本书一个的 Knowledge Base（Curator Agent 是它唯一的写者）、`full` 和 `full_no_kb` 两个 config，以及两部 dev 作品的 gold glossary。M4 加上了按整本书跑的 eval、COMET 打分脚本、对照 gold glossary 的 term accuracy、KB 触达各页次数的统计、汇总多次 eval 的报告，以及 GitHub Actions 上的 CI，然后在两部 dev 作品上把每个 config 各跑了一遍（[记录](docs/m4.md)）。M5 加上了 judge 模型（GPT-4o mini，计量和翻译模型分开）和 GEMBA-MQM 打分脚本、term consistency、三部 test 作品的 gold glossary、在 dev 作品上调了一轮 prompt，以及一页的 eval protocol（[记录](docs/m5.md)）。在约 30 个标注 segment 上做一致性检查时，GPT-4o mini 和备用的 judge 都没有和标注对上（标注是 LLM 做的），所以 MQM 只作参考报告。M6 先写好 paired bootstrap，在翻译任何 test 页之前合并，然后从这个标签出发，在三部 test 作品上把每个 config 各跑一次并打分（[记录](docs/m6.md)）。在这些运行上算出的 95% 置信区间只反映抽到哪些页带来的不确定性，不包括重跑带来的波动，因为每个 config 只跑了一次。和每页一次调用相比，full system 的 COMET 没有提升（−0.0028，区间 −0.0068 到 +0.0014），chrF（−1.2，区间 −2.3 到 −0.1）和 BLEU（−2.1，区间 −3.5 到 −0.8）更低，每页成本是它的 5.0 到 7.9 倍（是一个范围，因为账本看不出缓存输入实际按什么价格计费）。它在 glossary 的人名和自造词上的 term accuracy 和每页一次调用分不出高低（+2.1 个百分点，区间 −2.7 到 +6.8），Knowledge Base 也没有让它提高（+0.0 个百分点，区间 −5.1 到 +5.0）。它的 term consistency 比每页一次调用高 4.5 个百分点（区间 +0.8 到 +6.7），但在 dev 作品上把每页一次调用重跑一遍，consistency 就变了 7.0 个百分点，所以这个提升和重跑本身的波动分不开。M8 加上了成本和延迟小结，以及五张图表（[记录](docs/m8.md)）。M7（编辑器）已经开始：现在可以手工修改一个 box 的译文，修改单独存为一个 Run；也可以在编辑器里用 `baseline` 或完整系统在后台翻译一页，实时看到它的每一步，还能看到每句译文排进它的 box，以及放不下的 box 占多少，并且逐个 box 看到 Translator 哪里没把握、Reviewer 说了什么。下一步：编辑器的其余部分（M7），然后是报告（M9）。
 
 ## 它做什么
 
@@ -15,6 +15,7 @@
 - **逐页积累的 Knowledge Base（M3）。** 在 `full` config 里，两个 agent 共用每本书的 Knowledge Base。Translator 查询 Glossary 条目和 Character Profiles，也可以提议新的；Reviewer 只能查询。一页翻完后，Curator Agent 逐条决定接受还是拒绝提议的术语，并写明理由，然后由代码规则一次性写入 KB。所有人名，以及和已有条目冲突的提议，都交给人来确认。`full_no_kb` 是关掉 KB 的同一个系统，用来做 ablation。
 - **在编辑器里翻译一页（M7）。** 选 `baseline` 或 `full`，点 Translate。页面在后台翻译，每一步都存下来，并实时显示在页面旁的轨迹面板里：每次模型调用及其 token 数和耗时、每次工具调用及其结果、Reviewer 的结论和意见、每次修改，以及 Curator 做了什么。断线或刷新后从断开处接着收；打开一页时会重放这一页当前显示的那个 Run 的轨迹。用 `full` 时，一本书的各页共用一个 Knowledge Base。
 - **看中文版的页面（M7）。** 每句译文画在页面上方的画布里、排进自己的 box，字号从 24 px 往下试到 14 px，取放得下的最大字号；一个开关可以切回原图。14 px 还放不下的 box 会被标出来。每一页，以及点一下就能算出的整本书，都给出溢出率：有译文的 box 里放不下的比例。
+- **看 agent 怀疑过什么、退回过什么（M7）。** 在用完整系统翻译的页面上，Translator 标为不确定的 box 标 `?`，Reviewer 提过意见的 box 标 `!`。点一个 box 会跳到它那一行，按轮次列出它的不确定标记和 Reviewer 的意见（简体中文，有建议的附上建议），并注明哪些针对的是后来被修改稿替换掉的早先译文。另有一行说明审校的结果。这些内容从存下来的 Run 里读，不调用模型。
 - **手工改一句（M7）。** 在列表里修改任意一个 box 的译文。修改存为一个 config 为 `human` 的 Run，和模型的 Run 并存；页面一直显示它，直到有更新的 Run 取代它。
 
 ## 怎么评测
@@ -53,7 +54,7 @@ npm install --prefix frontend                   # 第一次
 npm run dev --prefix frontend                   # http://localhost:5173/tojime_no_siora/002
 ```
 
-选一页，选 `baseline`（一次调用，不用 tools 和 KB）或 `full`（多个 agent 加这本书的 Knowledge Base，多次调用），点 Translate。后端在后台翻译这一页，把 Run、zh-Hans 译文和每一步存进 SQLite；轨迹面板实时显示每一步，Run 结束时页面自动更新。Translate 会真实调用 `.env` 里配置的模型。后端不加 `--timeout-graceful-shutdown` 的话，按 Ctrl-C 会一直等浏览器开着的事件流。点某一行的 Edit 可以修改它的译文（Esc 取消，Ctrl/Cmd+Enter 保存）：修改不调用模型，存为一个 config 为 `human` 的 Run，页面会显示它，直到有更新的 Run。页面会把每句译文排进它的 box，用 Translated / Original 在排好的译文和原图之间切换。点 "Measure the book" 可以得到整本书的溢出率，并链接到有溢出的页；它不调用模型。DB 路径可以用环境变量 `FUKIDASHI_DB` 改。
+选一页，选 `baseline`（一次调用，不用 tools 和 KB）或 `full`（多个 agent 加这本书的 Knowledge Base，多次调用），点 Translate。后端在后台翻译这一页，把 Run、zh-Hans 译文和每一步存进 SQLite；轨迹面板实时显示每一步，Run 结束时页面自动更新。Translate 会真实调用 `.env` 里配置的模型。后端不加 `--timeout-graceful-shutdown` 的话，按 Ctrl-C 会一直等浏览器开着的事件流。点某一行的 Edit 可以修改它的译文（Esc 取消，Ctrl/Cmd+Enter 保存）：修改不调用模型，存为一个 config 为 `human` 的 Run，页面会显示它，直到有更新的 Run。页面会把每句译文排进它的 box，用 Translated / Original 在排好的译文和原图之间切换。点 "Measure the book" 可以得到整本书的溢出率，并链接到有溢出的页；它不调用模型。译文来自 `full` 的页面上，`?` 标出 Translator 标为不确定的 box，`!` 标出 Reviewer 提过意见的 box；点一个 box（Esc 取消选中）会跳到它那一行和它的意见。DB 路径可以用环境变量 `FUKIDASHI_DB` 改。
 
 ```bash
 uv run python eval/run.py --config baseline --book tojime_no_siora --pages 2,3,4     # 真实调用：每页一次
@@ -119,7 +120,7 @@ uv run python eval/glossary.py check                # 对照数据集检查 gold
 | M4 Dev 评测 | 11/15 | 完成（[记录](docs/m4.md)） |
 | M5 Eval protocol 与冻结 | 11/22 | 完成（[记录](docs/m5.md)） |
 | M6 Test 运行 | 12/13 | 完成（[记录](docs/m6.md)） |
-| M7–M8 编辑器产品化、分析 | 1/3 | 进行中（分析已完成：[记录](docs/m8.md)；编辑器已开始：修改译文、后台翻译、实时轨迹面板、排版已完成） |
+| M7–M8 编辑器产品化、分析 | 1/3 | 进行中（分析已完成：[记录](docs/m8.md)；编辑器已开始：修改译文、后台翻译、实时轨迹面板、排版、审校意见的显示已完成） |
 | M9 报告与发布 | 1/17 | 计划中 |
 
 完整计划：[OUTLINE.md](OUTLINE.md)（设计、milestones、决定、风险）和 [SCOPE.md](SCOPE.md)（范围和 cut order），均为英文。
