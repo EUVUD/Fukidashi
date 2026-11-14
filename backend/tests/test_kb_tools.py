@@ -327,7 +327,12 @@ def test_a_valid_term_and_a_valid_character_proposal_are_collected_and_answered_
     result, collector = translate_with_kb(page, provider, snapshot())
 
     assert result.ok
-    term, character = collector.proposals
+    # Both calls are in one reply, so they run side by side, and the collector lists them in the order they arrived: a
+    # race (kb/collector.py). So take each proposal by its kind, never by its position.
+    proposals = collector.proposals
+    assert sorted(p.kind for p in proposals) == ["character", "term"]   # exactly two, one of each kind
+    term = next(p for p in proposals if p.kind == "term")
+    character = next(p for p in proposals if p.kind == "character")
     assert (term.kind, term.payload) == ("term", {"source_term": "封印", "target_term": "封印术", "category": "technique"})
     assert (character.kind, character.payload) == ("character", {
         "name_src": "ユキ", "name_tgt": "小雪", "aliases": ["ゆき"], "notes": "说话轻声"})
