@@ -508,6 +508,17 @@ def test_a_profile_is_not_approved_when_that_leaves_two_readable_rows_for_one_na
     refused(imported, lambda: decide_profile(imported, kb, rejected, approve=True), f"profile {rival} \\(小雪\\) is {rival_status}")
 
 
+def test_a_pending_row_is_not_approved_while_another_readable_row_holds_its_source(imported, kb):
+    """Approving a `pending_human` row only changes its status, but two readable rows would stay for one source: refused."""
+    insert_entry(imported, kb, "封印", "封印")
+    pending_entry = insert_entry(imported, kb, "封印", "封缄", status="pending_human")
+    insert_profile(imported, kb, "ユキ", "小雪")
+    pending_profile = insert_profile(imported, kb, "ユキ", "雪儿", status="pending_human")
+
+    refused(imported, lambda: decide_entry(imported, kb, pending_entry, approve=True), "two readable entries")
+    refused(imported, lambda: decide_profile(imported, kb, pending_profile, approve=True), "two readable profiles")
+
+
 def test_a_profile_is_approved_when_the_other_rows_for_its_name_are_not_readable(imported, kb):
     insert_profile(imported, kb, "ユキ", "小雪", status="rejected")
     wanted = insert_profile(imported, kb, "ユキ", "雪儿", status="rejected")
