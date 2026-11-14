@@ -45,6 +45,26 @@ not there for these rules. A term is compared with the entries and a name with t
 same-kind match comes first. Only the cross-kind conflict of rule 3 looks at the other kind, and only when the proposal
 would otherwise create a new entry or profile. Rule 6 comes after rules 2 and 3, so the same name is still a
 confirmation or a conflict, and a name that is a term's source is still a conflict across kinds.
+
+A person's decisions (OUTLINE 8, "A person's decisions on KB items") are the other entry points: `decide_proposal`,
+`decide_entry` and `decide_profile`, each approve or reject, in one transaction that writes nothing when the decision is
+refused. A person decides only in a book's Editor KB (never in an eval run's KB). They add no rule of their own for
+proposals and change none of the six above:
+
+- An undecided term (status `proposed`) that a person approves goes through rules 2, 3 and 5 as the KB is now, as an
+  accepted term would: a new `approved` entry made by a person (provenance `human`), a confirmation, a conflict, or a
+  conflict across kinds. Rejecting it sets it `rejected`.
+- A new name (a `pending_human` proposal with the profile rule 4 made) is decided through that profile: the profile and
+  the proposal become `approved` or `rejected` together. A conflict (`pending_human`, nothing written) can be rejected,
+  and its approval is refused: taking a conflicting rendering in place of the one the KB holds is a rename, not built.
+- An entry or a profile can be approved or rejected whatever its state (this stops a wrong entry), unless that changes
+  nothing, or approving would leave two readable rows for one source term (one `name_src`), or a term whose source is a
+  readable profile's name or alias (a name that is a readable entry's source): the collisions the rules above refuse.
+  Deciding a profile also settles the proposal it was made from, while that is still `pending_human`.
+
+What a person decided is recorded: a history line `{"event": "approved" | "rejected", "by": "human", "from": <previous
+status>}` (plus `proposal_id` when the decision came through a proposal), an entry's provenance `human`, and a proposal's
+reason that says a person decided it. A person's outcomes (`HUMAN_OUTCOMES`) are not `RESULTS`, which count what `apply` did.
 """
 
 from __future__ import annotations
@@ -56,6 +76,10 @@ from dataclasses import dataclass
 
 from .. import store
 from .entities import APPROVED, PENDING_HUMAN, TERM, KBNotFound, Proposal, proposal_id
+
+# Who made an entry: the Curator's rules from an agent's proposal, or a person (a decision of theirs, `decide_*`).
+AGENT = "agent"
+HUMAN = "human"
 
 # What happened to a proposal.
 DUPLICATE = "duplicate"
@@ -69,6 +93,27 @@ REJECTED = "rejected"
 UNDECIDED = "undecided"
 
 RESULTS = (DUPLICATE, CONFIRMED, MERGED, CONFLICT, CONFLICT_ACROSS_KINDS, PENDING, ACCEPTED, REJECTED, UNDECIDED)
+
+# What a person's decision did, and what the API answers with. Not `RESULTS`: those count what `apply` did with a page's
+# proposals, and the eval harness counts each of the nine.
+ENTRY_CREATED = "entry_created"  # an undecided term approved: a new entry, made by a person
+ENTRY_CONFIRMED = "entry_confirmed"  # an undecided term approved: it confirms the entry that holds this pair now
+HELD_AS_CONFLICT = "held_as_conflict"  # approved, but the KB holds another rendering: it waits for a person again
+HELD_ACROSS_KINDS = "held_as_conflict_across_kinds"  # approved, but its source is a profile's name or alias: same
+PROPOSAL_REJECTED = "proposal_rejected"  # an undecided term, or a conflict, rejected: only the proposal is written
+ENTRY_APPROVED = "entry_approved"
+ENTRY_REJECTED = "entry_rejected"
+PROFILE_APPROVED = "profile_approved"  # a profile decided as an item, or through its new-name proposal: both change
+PROFILE_REJECTED = "profile_rejected"
+
+HUMAN_OUTCOMES = (
+    ENTRY_CREATED, ENTRY_CONFIRMED, HELD_AS_CONFLICT, HELD_ACROSS_KINDS, PROPOSAL_REJECTED, ENTRY_APPROVED,
+    ENTRY_REJECTED, PROFILE_APPROVED, PROFILE_REJECTED,
+)
+
+_PROPOSED = "proposed"  # a proposal's status while it is undecided
+_REJECTED_STATUS = "rejected"
+_APPROVED_BY_PERSON = "approved by a person"
 
 
 @dataclass(frozen=True)
@@ -124,28 +169,35 @@ def _event(kind: str, p: Proposal, run_id: int, **extra) -> dict:
     return {"event": kind, "page": p.page_index, "run_id": run_id, "proposal_id": p.proposal_id, **extra}
 
 
-def _term(conn: sqlite3.Connection, p: Proposal, run_id: int, decision: Decision | None) -> str:
+def _term(
+    conn: sqlite3.Connection, p: Proposal, run_id: int, decision: Decision | None, provenance: str = AGENT,
+) -> str:
+    """Rules 2, 3 and 5 for a term. `provenance` is `agent` when `apply` applies a page, and `human` when a person approves
+    an undecided term (`decide_proposal`): the rules are the same, the entry made is the person's, and what is written says
+    so (the history lines carry `"by": "human"`, and a reason starts with the person's approval)."""
     source, target = p.payload["source_term"], p.payload["target_term"]
+    by = {"by": HUMAN} if provenance == HUMAN else {}
+    lead = f"{_APPROVED_BY_PERSON}; " if by else ""
     existing = store.find_entry(conn, p.kb_id, source)
     if existing is not None:
         if existing["target_term"] != target:
-            return _conflict(conn, p, f"entry {existing['id']}", existing["target_term"])
-        store.add_entry_evidence(conn, existing["id"], p.page_index, _event("confirmed", p, run_id))
-        store.set_proposal_status(conn, p.proposal_id, status=APPROVED, reason=f"confirms entry {existing['id']}")
+            return _conflict(conn, p, f"entry {existing['id']}", existing["target_term"], lead)
+        store.add_entry_evidence(conn, existing["id"], p.page_index, _event("confirmed", p, run_id, **by))
+        store.set_proposal_status(conn, p.proposal_id, status=APPROVED, reason=f"{lead}confirms entry {existing['id']}")
         return CONFIRMED
     if (profile := _profile_called(conn, p.kb_id, source)) is not None:
         called = "the name" if source == profile["name_src"] else "an alias"
         return _wrong_kind(conn, p, f"{source} is proposed as a term, but it is {called} of profile {profile['id']} "
-                                    f"({profile['name_tgt']}), a character")
+                                    f"({profile['name_tgt']}), a character", lead)
     if decision is None:
         return UNDECIDED  # stays 'proposed'
     if not decision.accept:
-        store.set_proposal_status(conn, p.proposal_id, status="rejected", reason=decision.reason)
+        store.set_proposal_status(conn, p.proposal_id, status=_REJECTED_STATUS, reason=decision.reason)
         return REJECTED
     store.insert_entry(
         conn, kb_id=p.kb_id, source_term=source, target_term=target, category=p.payload["category"],
-        status=APPROVED, provenance="agent", page_index=p.page_index,
-        event=_event("created", p, run_id, reason=decision.reason),
+        status=APPROVED, provenance=provenance, page_index=p.page_index,
+        event=_event("created", p, run_id, reason=decision.reason, **by),
     )
     store.set_proposal_status(conn, p.proposal_id, status=APPROVED, reason=decision.reason)
     return ACCEPTED
@@ -226,13 +278,13 @@ def _known_character(
     return MERGED
 
 
-def _conflict(conn: sqlite3.Connection, p: Proposal, existing: str, rendering: str) -> str:
+def _conflict(conn: sqlite3.Connection, p: Proposal, existing: str, rendering: str, lead: str = "") -> str:
     """The existing entry is not touched; the proposal waits for a human."""
-    return _conflict_reason(conn, p, f"conflicts with {existing}, which is {rendering}")
+    return _conflict_reason(conn, p, f"conflicts with {existing}, which is {rendering}", lead)
 
 
-def _conflict_reason(conn: sqlite3.Connection, p: Proposal, reason: str) -> str:
-    store.set_proposal_status(conn, p.proposal_id, status=PENDING_HUMAN, reason=reason)
+def _conflict_reason(conn: sqlite3.Connection, p: Proposal, reason: str, lead: str = "") -> str:
+    store.set_proposal_status(conn, p.proposal_id, status=PENDING_HUMAN, reason=lead + reason)
     return CONFLICT
 
 
@@ -245,8 +297,212 @@ def _profile_called(conn: sqlite3.Connection, kb_id: int, name: str) -> sqlite3.
     return min(called, key=lambda row: (row["status"] != APPROVED, row["id"]), default=None)
 
 
-def _wrong_kind(conn: sqlite3.Connection, p: Proposal, what: str) -> str:
+def _wrong_kind(conn: sqlite3.Connection, p: Proposal, what: str, lead: str = "") -> str:
     """A conflict across kinds: `p`'s source is already something else in the KB. Nothing is written for it and the
     existing row is not touched; the proposal waits for a human, and its reason says `what` is wrong."""
-    store.set_proposal_status(conn, p.proposal_id, status=PENDING_HUMAN, reason=f"conflicts across kinds: {what}")
+    store.set_proposal_status(conn, p.proposal_id, status=PENDING_HUMAN, reason=f"{lead}conflicts across kinds: {what}")
     return CONFLICT_ACROSS_KINDS
+
+
+# --- a person's decisions (OUTLINE 8, "A person's decisions on KB items") ---
+
+
+class ItemNotFound(LookupError):
+    """The KB has no proposal, entry or profile with that id (the id of another KB's does not count)."""
+
+
+class DecisionRefused(ValueError):
+    """The rules do not allow this decision, whoever asks. Nothing was written; the message says why."""
+
+
+# What the rules did with an approved undecided term, as a person's outcome.
+_FROM_RULES = {
+    ACCEPTED: ENTRY_CREATED, CONFIRMED: ENTRY_CONFIRMED, CONFLICT: HELD_AS_CONFLICT,
+    CONFLICT_ACROSS_KINDS: HELD_ACROSS_KINDS,
+}
+_APPROVAL = Decision(True, _APPROVED_BY_PERSON)
+
+
+def made_from_proposal(profile: sqlite3.Row) -> str | None:
+    """The id of the proposal that made the profile (rule 4), or None for a profile no proposal made. The profile's first
+    history line is `created` and carries the proposal's id, which is how a new name's proposal and its profile find each
+    other."""
+    history = json.loads(profile["history"])
+    first = history[0] if history else {}
+    return first.get("proposal_id") if first.get("event") == "created" else None
+
+
+def decide_proposal(conn: sqlite3.Connection, kb_id: int, pid: str, *, approve: bool) -> str:
+    """A person approves or rejects proposal `pid` of the Editor KB `kb_id`, in one transaction. Returns what it did, one
+    of `HUMAN_OUTCOMES`.
+
+    - An undecided term (`proposed`): rejected, it becomes `rejected`. Approved, it goes through the term rules as the KB
+      is now, as an accepted term would (the KB may have changed since its page), and a new entry is made by a person.
+    - A new name (`pending_human`, with the profile rule 4 made): decided through that profile, so the profile and the
+      proposal become `approved` or `rejected` together.
+    - A conflict (`pending_human`, nothing written): rejected, it becomes `rejected` and the KB keeps what it holds. Its
+      approval is refused (a rename, not built).
+    - A decided proposal (`approved`, `rejected`) is refused.
+
+    Raises KBNotFound for a KB that is not an Editor KB, ItemNotFound for a proposal the KB does not have, and
+    DecisionRefused; in each case nothing is written. Must be called with no transaction open."""
+    with store.transaction(conn):
+        _require_editor_kb(conn, kb_id)
+        row = store.get_proposal(conn, kb_id, pid)
+        if row is None:
+            raise ItemNotFound(f"no proposal {pid} in the KB")
+        if row["status"] == _PROPOSED:
+            return _decide_undecided(conn, row, approve)
+        if row["status"] == PENDING_HUMAN:
+            return _decide_waiting(conn, row, approve)
+        raise DecisionRefused(f"proposal {pid} is already {row['status']}: only a proposal that waits in the Proposal "
+                              f"Queue or the Human Review Queue can be decided")
+
+
+def decide_entry(conn: sqlite3.Connection, kb_id: int, entry_id: int, *, approve: bool) -> str:
+    """A person approves or rejects entry `entry_id` of the Editor KB `kb_id`, in one transaction. Its status becomes
+    `approved` or `rejected`, its provenance `human`, and its history gets the person's line. Returns `ENTRY_APPROVED` or
+    `ENTRY_REJECTED`.
+
+    Refused (DecisionRefused) when it changes nothing, and when approving would leave two readable entries for one source
+    term, or an entry whose source is a readable profile's name or alias. Otherwise raises what `decide_proposal` does.
+    Must be called with no transaction open."""
+    with store.transaction(conn):
+        _require_editor_kb(conn, kb_id)
+        entry = store.get_entry(conn, kb_id, entry_id)
+        if entry is None:
+            raise ItemNotFound(f"no entry {entry_id} in the KB")
+        status = APPROVED if approve else _REJECTED_STATUS
+        if entry["status"] == status:
+            raise DecisionRefused(f"entry {entry_id} is already {status}")
+        if approve:
+            _refuse_entry_collision(conn, entry)
+        store.set_entry_status(conn, entry_id, status=status, provenance=HUMAN, event=_decided(approve, entry["status"]))
+    return ENTRY_APPROVED if approve else ENTRY_REJECTED
+
+
+def decide_profile(conn: sqlite3.Connection, kb_id: int, profile_id: int, *, approve: bool) -> str:
+    """A person approves or rejects profile `profile_id` of the Editor KB `kb_id`, in one transaction. Its status becomes
+    `approved` or `rejected` and its history gets the person's line (a profile has no provenance column: the line's `by`
+    is the record). When the profile was made from a proposal that still waits in the Human Review Queue, that proposal
+    is settled the same way. Returns `PROFILE_APPROVED` or `PROFILE_REJECTED`.
+
+    Refused when it changes nothing, and when approving would leave two readable profiles with one `name_src`, or a
+    profile whose `name_src` is a readable entry's source. Otherwise raises what `decide_proposal` does. Must be called
+    with no transaction open."""
+    with store.transaction(conn):
+        _require_editor_kb(conn, kb_id)
+        profile = store.get_profile(conn, kb_id, profile_id)
+        if profile is None:
+            raise ItemNotFound(f"no profile {profile_id} in the KB")
+        return _decide_profile(conn, profile, approve)
+
+
+def _require_editor_kb(conn: sqlite3.Connection, kb_id: int) -> None:
+    """A person decides in a book's Editor KB only: an eval run's KB is an eval artefact, and nothing here changes one."""
+    kb = store.get_kb(conn, kb_id)
+    if kb is None or kb["purpose"] != store.EDITOR:
+        raise KBNotFound(f"no Editor KB has id {kb_id}")
+
+
+def _person_reason(approve: bool, earlier: str | None, as_profile: int | None = None) -> str:
+    """A proposal's reason once a person has decided it: who decided what, then what it said before (what it was waiting
+    for), which would otherwise be lost."""
+    reason = _APPROVED_BY_PERSON if approve else "rejected by a person"
+    if as_profile is not None:
+        reason += f", as profile {as_profile}"
+    return reason + (f" (earlier: {earlier})" if earlier else "")
+
+
+def _decided(approve: bool, before: str, proposal: str | None = None) -> dict:
+    """The history line of a person's decision on an entry or a profile: what they did, that a person did it, and the
+    status it replaced; the proposal's id when the decision came through one."""
+    event = {"event": APPROVED if approve else _REJECTED_STATUS, "by": HUMAN, "from": before}
+    return event if proposal is None else {**event, "proposal_id": proposal}
+
+
+def _stored_proposal(row: sqlite3.Row) -> Proposal:
+    return Proposal(row["proposal_id"], row["kb_id"], row["page_index"], row["kind"], json.loads(row["payload"]),
+                    row["proposer"])
+
+
+def _decide_undecided(conn: sqlite3.Connection, row: sqlite3.Row, approve: bool) -> str:
+    """A proposal that is still `proposed`: only a term can be (`apply` makes a name a pending profile at once)."""
+    p = _stored_proposal(row)
+    if not approve:
+        store.set_proposal_status(conn, p.proposal_id, status=_REJECTED_STATUS, reason=_person_reason(False, row["reason"]))
+        return PROPOSAL_REJECTED
+    if p.kind != TERM:
+        raise DecisionRefused(f"proposal {p.proposal_id} is a name that waits undecided, which the rules never leave: only "
+                              f"an undecided term can be approved")
+    return _FROM_RULES[_term(conn, p, row["run_id"], _APPROVAL, HUMAN)]
+
+
+def _decide_waiting(conn: sqlite3.Connection, row: sqlite3.Row, approve: bool) -> str:
+    """A proposal in the Human Review Queue: a new name, whose profile `apply` made, or a conflict, for which `apply` wrote
+    nothing."""
+    profile = next((r for r in store.kb_profiles(conn, row["kb_id"], store.ALL_STATUSES)
+                    if made_from_proposal(r) == row["proposal_id"]), None)
+    if profile is not None:
+        return _decide_profile(conn, profile, approve, via=row)
+    if approve:
+        raise DecisionRefused(f"proposal {row['proposal_id']} is a conflict, and a conflict cannot be approved: the KB "
+                              f"keeps what it holds, and taking the proposed rendering in its place is a rename, which "
+                              f"is not built. Reject it to close it")
+    store.set_proposal_status(conn, row["proposal_id"], status=_REJECTED_STATUS,
+                              reason=_person_reason(False, row["reason"]))
+    return PROPOSAL_REJECTED
+
+
+def _decide_profile(conn: sqlite3.Connection, profile: sqlite3.Row, approve: bool, via: sqlite3.Row | None = None) -> str:
+    """Decide a profile, as an item or `via` the new-name proposal it was made from, and settle that proposal: a new name is
+    one decision, whichever way it is reached, so the two queues never disagree."""
+    status = APPROVED if approve else _REJECTED_STATUS
+    if profile["status"] == status:
+        raise DecisionRefused(f"profile {profile['id']} is already {status}")
+    if approve:
+        _refuse_profile_collision(conn, profile)
+    store.set_profile_status(
+        conn, profile["id"], status=status,
+        event=_decided(approve, profile["status"], None if via is None else via["proposal_id"]),
+    )
+    queued = via
+    if queued is None and (pid := made_from_proposal(profile)) is not None:
+        queued = store.get_proposal(conn, profile["kb_id"], pid)
+    if queued is not None and queued["status"] == PENDING_HUMAN:
+        store.set_proposal_status(
+            conn, queued["proposal_id"], status=status,
+            reason=_person_reason(approve, queued["reason"], None if via is not None else profile["id"]),
+        )
+    return PROFILE_APPROVED if approve else PROFILE_REJECTED
+
+
+def _refuse_entry_collision(conn: sqlite3.Connection, entry: sqlite3.Row) -> None:
+    """Approving `entry` makes it readable: refuse when that would leave two readable entries for its source term, or when
+    its source is a readable profile's name or alias (the collisions `apply` refuses)."""
+    source = entry["source_term"]
+    rival = next((e for e in store.kb_entries(conn, entry["kb_id"], store.READABLE_STATUSES)
+                  if e["source_term"] == source and e["id"] != entry["id"]), None)
+    if rival is not None:
+        raise DecisionRefused(f"entry {entry['id']} cannot be approved: entry {rival['id']} ({rival['target_term']}) is "
+                              f"{rival['status']} for the source term {source}, and two readable entries for one term "
+                              f"would leave the agents a choice")
+    if (profile := _profile_called(conn, entry["kb_id"], source)) is not None:
+        called = "the name" if source == profile["name_src"] else "an alias"
+        raise DecisionRefused(f"entry {entry['id']} cannot be approved: {source} is {called} of profile {profile['id']} "
+                              f"({profile['name_tgt']}), a character")
+
+
+def _refuse_profile_collision(conn: sqlite3.Connection, profile: sqlite3.Row) -> None:
+    """Approving `profile` makes it readable: refuse when that would leave two readable profiles with its `name_src`, or
+    when that name is a readable entry's source."""
+    name = profile["name_src"]
+    rival = next((r for r in store.kb_profiles(conn, profile["kb_id"], store.READABLE_STATUSES)
+                  if r["name_src"] == name and r["id"] != profile["id"]), None)
+    if rival is not None:
+        raise DecisionRefused(f"profile {profile['id']} cannot be approved: profile {rival['id']} ({rival['name_tgt']}) is "
+                              f"{rival['status']} for the name {name}, and two readable profiles for one name would leave "
+                              f"the agents a choice")
+    if (entry := store.find_entry(conn, profile["kb_id"], name)) is not None:
+        raise DecisionRefused(f"profile {profile['id']} cannot be approved: {name} is the source of entry {entry['id']} "
+                              f"({entry['target_term']}), a term")

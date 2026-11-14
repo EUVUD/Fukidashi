@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 
 from . import config, store, tracing
+from .api.kb import router as kb_router
 from .api.pages import router as pages_router
 from .api.runs import router as runs_router
 from .db import connect, init_db
@@ -42,3 +43,4 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="Fukidashi", lifespan=lifespan)
 app.include_router(pages_router)
 app.include_router(runs_router)
+app.include_router(kb_router)
