@@ -111,6 +111,36 @@ button.secondary:hover:not(:disabled) { border-color: var(--accent); }
 .ref { font-size: 13px; color: var(--muted); }
 .tag { font-size: 11px; border: 1px solid var(--border); border-radius: 3px; padding: 0 4px; margin-right: 4px; }
 
+/* Typesetting (TypesetLayer.tsx, BookTypesetting.tsx; OUTLINE §8, "Typesetting and the overflow rate"). The canvas fills the
+   image's frame and takes no pointer events: the boxes of the DOM, which come after it, keep their hover and badges. A box
+   whose translation does not fit at the minimum size is marked in the error colour and dashed, so that it cannot be
+   mistaken for a region's own hue (region 0's is red). */
+.typeset-layer { position: absolute; inset: 0; pointer-events: none; }
+/* Konva sizes its canvas in pixels. Until it has been told the image's new size, the canvas follows the frame, so the text it
+   still shows keeps to its boxes (the aspect ratio is the image's, which does not change). The wrapper is sized too, or
+   the percentages below have nothing to resolve against. */
+.typeset-layer > div, .typeset-layer .konvajs-content, .typeset-layer canvas { width: 100% !important; height: 100% !important; }
+.box.overflow { border-color: var(--error); border-style: dashed; background: color-mix(in srgb, var(--error) 14%, transparent); }
+.box.overflow.active { background: color-mix(in srgb, var(--error) 30%, transparent); }
+.typeset-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 16px; margin: -4px 0 12px; }
+.typeset-line { margin: 0; font-size: 13px; }
+.view-toggle { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.view-toggle button { padding: 1px 12px; font-size: 13px; background: transparent; color: var(--accent); border-radius: 0; }
+.view-toggle button[aria-pressed='true'] { background: var(--accent); color: var(--accent-text); }
+.book-typeset { margin: 0 0 12px; padding: 8px 12px; font-size: 13px; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; }
+.book-typeset-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 16px; }
+.book-typeset h3 { margin: 0; font-size: 14px; }
+.book-typeset-head button { padding: 2px 12px; font-size: 13px; }
+.book-typeset p { margin: 6px 0 0; }
+.book-list { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin-top: 6px; }
+.book-typeset .chip.overflowing { color: var(--error); border-color: var(--error); }
+.book-typeset summary { margin-top: 8px; cursor: pointer; }
+.book-pages { width: min(100%, 480px); margin-top: 6px; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.book-pages th, .book-pages td { padding: 2px 6px; text-align: right; font-weight: 400; border-bottom: 1px solid var(--border); }
+.book-pages thead th { font-size: 12px; color: var(--muted); }
+.book-pages tbody th, .book-pages thead th:first-child { text-align: left; }
+.book-pages a { color: var(--accent); }
+
 /* The live trace panel (TracePanel.tsx): beside the list on a wide screen (image | list | panel), under the list from
    900 to 1199 px (the image beside both), and under the list in one column below that. A sticky box would stay on top of
    what follows it in the grid, so the image is sticky only while it has the panel beside it, not under it. */
@@ -125,7 +155,9 @@ button.secondary:hover:not(:disabled) { border-color: var(--accent); }
 @media (max-width: 900px) {
   .columns.with-trace { grid-template-columns: minmax(0, 1fr); }
   .columns.with-trace .stage, .columns.with-trace .segments, .columns.with-trace .trace { grid-column: auto; grid-row: auto; }
-  .columns.with-trace .stage { position: static; }
+  /* Relative, not static: the boxes and the typeset canvas are positioned against the image's frame, so it must stay a
+     containing block (a static one left them against the page, over the sidebar). */
+  .columns.with-trace .stage { position: relative; top: auto; }
 }
 
 .trace {
