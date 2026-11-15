@@ -1,4 +1,4 @@
-// Mirrors the response models in backend/fukidashi/api/pages.py.
+// Mirrors the response models in backend/fukidashi/api/pages.py, and, below the live trace, those in api/kb.py.
 
 export interface PageSummary {
   book_title: string
@@ -262,3 +262,105 @@ export const editTranslation = (book: string, index: number, segment: number, te
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ text_zh_hans: text }),
   })
+
+// ---- A book's Editor KB (backend/fukidashi/api/kb.py; each field is commented there) -----------------------------------
+// The Proposal Queue, the Human Review Queue, the entries and the profiles of the KB the editor keeps for a book (OUTLINE §0,
+// Editor KB), and what a person's decision answers with. kbView.ts says what each field means in words.
+
+// One change of a row's history. The backend sends a dict: `at` (UTC, seconds) and `event` are always there; a person's
+// decision also has `by` ('human') and `from` (the status it replaced), and the rest depends on the event (`page`, `run_id`,
+// `proposal_id`, `reason`, `aliases`). kbView.ts reads the keys it knows and checks their types.
+export type HistoryLine = { at: string; event: string } & Record<string, unknown>
+
+// A glossary entry, in any status: a rejected one stays listed, so a person can approve it again.
+export interface KBEntry {
+  id: number
+  source_term: string // as written in the Japanese text
+  target_term: string // its rendering in Simplified Chinese
+  category: string // a short label such as place or organisation; may be empty
+  status: string // 'approved' or 'pending_human' (the agents can find it), 'rejected' or 'proposed' (they cannot)
+  provenance: string // 'agent', or 'human' once a person has decided the entry (approved, rejected, or made it)
+  evidence_pages: number[] // the pages that show it, ascending
+  history: HistoryLine[] // one object per change, oldest first
+}
+
+// A character profile, in any status.
+export interface KBProfile {
+  id: number
+  name_src: string // the name as written in the Japanese text
+  name_tgt: string // its rendering in Simplified Chinese
+  aliases: string[] // other Japanese names the character is called by
+  notes: string // speech style and anything else worth keeping; may be empty
+  status: string // as for an entry
+  provenance: string // derived, a profile has no such column: 'human' when a history line has `by` 'human', else 'agent'
+  evidence_pages: number[]
+  history: HistoryLine[] // as for an entry
+}
+
+// A proposal in the Proposal Queue (status 'proposed': a term nobody decided yet).
+export interface KBProposal {
+  proposal_id: string
+  kind: string // 'term' or 'character'
+  payload: Record<string, unknown> // a term: source_term, target_term, category; a character: name_src, name_tgt, aliases, notes
+  proposer: string // who proposed it ('translator')
+  page_index: number // the page it was proposed on
+  run_id: number // the Run that proposed it
+  reason: string | null // null while the proposal is undecided; later what was said when it was decided or sent to a person
+}
+
+// A proposal in the Human Review Queue (status 'pending_human'), and what it waits for.
+export interface ReviewProposal extends KBProposal {
+  waits_for: string // 'new_name': a profile was made and waits for a person; 'conflict': nothing was written for it
+  profile_id: number | null // the new name's profile (a `KBProfile.id`); null for a conflict
+}
+
+// How many of the KB's proposals have each status, decided ones included; every status is there, 0 when none.
+export interface ProposalCounts {
+  proposed: number
+  approved: number
+  rejected: number
+  pending_human: number
+}
+
+// The book's Editor KB as it is now (`KBOut`). `kb_id` is null while the book has no Editor KB: every list is empty then.
+export interface KBView {
+  kb_id: number | null
+  entries: KBEntry[] // every status, by id
+  profiles: KBProfile[] // every status, by id
+  proposal_queue: KBProposal[] // the Proposal Queue, in the order the proposals were queued
+  human_review_queue: ReviewProposal[] // the Human Review Queue, in the same order
+  proposal_counts: ProposalCounts
+}
+
+// What a person decides (the body of every decision is exactly `{ decision }`).
+export type KBDecision = 'approve' | 'reject'
+
+// A proposal's decision answers what it did and the KB after it. `outcome` is one of `curator.HUMAN_OUTCOMES`; kbView.ts words
+// the seven the proposals route sends and shows any other as it is.
+export interface ProposalDecision {
+  outcome: string
+  kb: KBView
+}
+
+const kbPath = (book: string) => `/api/books/${encodeURIComponent(book)}/kb`
+
+const decisionRequest = (decision: KBDecision): RequestInit => ({
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ decision }),
+})
+
+// The book's Editor KB. A book that has none yet answers `kb_id` null and empty lists: reading never makes one.
+export const fetchKB = (book: string, signal?: AbortSignal) => request<KBView>(kbPath(book), { signal })
+
+// A person's decisions. A 409 carries the reason the rules refused it, in the error's message; a decision writes nothing when
+// it is refused. The proposals route answers the outcome and the KB, the other two the KB.
+export const decideProposal = (book: string, proposalId: string, decision: KBDecision) =>
+  request<ProposalDecision>(
+    `${kbPath(book)}/proposals/${encodeURIComponent(proposalId)}/decision`,
+    decisionRequest(decision),
+  )
+export const decideEntry = (book: string, entryId: number, decision: KBDecision) =>
+  request<KBView>(`${kbPath(book)}/entries/${entryId}/decision`, decisionRequest(decision))
+export const decideProfile = (book: string, profileId: number, decision: KBDecision) =>
+  request<KBView>(`${kbPath(book)}/profiles/${profileId}/decision`, decisionRequest(decision))

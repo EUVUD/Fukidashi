@@ -232,3 +232,41 @@ button.link-button { padding: 0; background: none; color: var(--accent); font-si
 .texts .note-text, .texts .note-suggestion { margin-top: 2px; }
 .note-suggestion { font-weight: 500; }
 .note.earlier .note-text, .note.earlier .note-suggestion { color: var(--muted); }
+
+/* The KB panel (KBPanel.tsx, kbView.ts; OUTLINE §0, Proposal Queue, Human Review Queue and Editor KB; SCOPE.md #5): one disclosure
+   per book, above the page. Every rule is under .kb-panel, never under .segments: `.segments li` styles every `li` inside a row,
+   and the panel sits outside the rows, so nothing of one reaches the other. The colours are the page's tokens, which hold 4.5:1
+   on --panel and on --bg in both themes. A rejected row is muted with --muted, not with `opacity`, which would take its text
+   below that, and it stays listed so that it can be approved again. */
+.kb-panel { margin: 0 0 12px; padding: 8px 12px; font-size: 13px; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; }
+.kb-panel > details > summary { cursor: pointer; font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+.kb-panel summary:focus-visible, .kb-panel button:focus-visible, .kb-panel a:focus-visible, .kb-panel .kb-status:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.kb-panel a { color: var(--accent); }
+.kb-panel .chip { color: var(--text); }
+.kb-panel p { margin: 4px 0 0; overflow-wrap: anywhere; }
+.kb-panel h3 { margin: 16px 0 0; font-size: 14px; }
+.kb-panel button { padding: 2px 12px; font-size: 13px; }
+.kb-panel button.secondary { padding: 1px 11px; }
+.kb-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 16px; margin-top: 8px; }
+.kb-toolbar span { min-width: 0; overflow-wrap: anywhere; }
+.kb-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.kb-item { min-width: 0; padding: 8px 10px; background: var(--bg); border: 1px solid var(--border); border-left: 4px solid var(--tone, var(--border)); border-radius: 6px; }
+.kb-item.approved { --tone: var(--ok); }
+.kb-item.waiting, .kb-item.pending_human { --tone: var(--flag); }
+.kb-item.rejected { --tone: var(--muted); color: var(--muted); border-style: dashed; border-left-width: 4px; background: transparent; }
+.kb-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; margin: 0; }
+.kb-head .tag { margin-right: 0; }
+.kb-pair { min-width: 0; overflow-wrap: anywhere; font-size: 16px; font-weight: 600; }
+.kb-item.rejected .kb-pair { font-weight: 500; }
+.kb-panel .tag.wait { color: var(--flag); border-color: var(--flag); }
+.kb-rivals { list-style: none; margin: 6px 0 0; padding: 2px 0 2px 8px; border-left: 3px dashed var(--flag); }
+.kb-rivals li { margin-top: 2px; overflow-wrap: anywhere; }
+.kb-pages { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin-top: 6px; }
+.kb-history { margin-top: 6px; }
+.kb-history summary { cursor: pointer; }
+.kb-history ol { margin: 4px 0 0; padding-left: 22px; }
+.kb-history li { margin-top: 2px; overflow-wrap: anywhere; }
+.kb-at { font-variant-numeric: tabular-nums; }
+.kb-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; margin-top: 8px; }
+.kb-note { min-width: 0; font-size: 12px; overflow-wrap: anywhere; }
+.kb-panel .kb-refusal { margin-top: 8px; }

@@ -34,6 +34,7 @@ interface Props {
   pages: PageSummary[]
   navigate: (path: string) => void
   onTranslated: (book: string, pageIndex: number) => void
+  onRunEnd: () => void // a Run this view was waiting for is over, however it ended (stable: `watch` depends on it)
 }
 
 // The row being edited: the text typed so far, and why the last save failed.
@@ -74,7 +75,7 @@ function runSummary(run: Run): string {
   return parts.join(' · ')
 }
 
-export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Props) {
+export function PageView({ book, pageIndex, pages, navigate, onTranslated, onRunEnd }: Props) {
   const [detail, setDetail] = useState<PageDetail | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [translating, setTranslating] = useState(false) // a run of this page is being watched, started here or found on load
@@ -114,6 +115,7 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
           stopWatching.current = null
           setFollowed((f) => (f !== null && f.runId === runId ? { ...f, open: false } : f))
           if (!live) return
+          onRunEnd() // `run_end` came, or the stream ended without one: what the run wrote to the book's KB can be read now
           setNotice(null) // the run is over: "already being translated" is no longer true
           try {
             const page = await fetchPage(book, pageIndex)
@@ -130,7 +132,7 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated }: Pro
         },
       )
     },
-    [book, pageIndex, onTranslated],
+    [book, pageIndex, onTranslated, onRunEnd],
   )
 
   // The parent keys this component by page, so every page starts from fresh state.
