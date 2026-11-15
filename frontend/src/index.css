@@ -247,26 +247,26 @@ button.link-button { padding: 0; background: none; color: var(--accent); font-si
 .kb-panel h3 { margin: 16px 0 0; font-size: 14px; }
 .kb-panel button { padding: 2px 12px; font-size: 13px; }
 .kb-panel button.secondary { padding: 1px 11px; }
-.kb-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 16px; margin-top: 8px; }
-.kb-toolbar span { min-width: 0; overflow-wrap: anywhere; }
-.kb-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
-.kb-item { min-width: 0; padding: 8px 10px; background: var(--bg); border: 1px solid var(--border); border-left: 4px solid var(--tone, var(--border)); border-radius: 6px; }
-.kb-item.approved { --tone: var(--ok); }
-.kb-item.waiting, .kb-item.pending_human { --tone: var(--flag); }
-.kb-item.rejected { --tone: var(--muted); color: var(--muted); border-style: dashed; border-left-width: 4px; background: transparent; }
-.kb-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; margin: 0; }
-.kb-head .tag { margin-right: 0; }
-.kb-pair { min-width: 0; overflow-wrap: anywhere; font-size: 16px; font-weight: 600; }
-.kb-item.rejected .kb-pair { font-weight: 500; }
+.kb-panel .kb-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 16px; margin-top: 8px; }
+.kb-panel .kb-toolbar span { min-width: 0; overflow-wrap: anywhere; }
+.kb-panel .kb-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.kb-panel .kb-item { min-width: 0; padding: 8px 10px; background: var(--bg); border: 1px solid var(--border); border-left: 4px solid var(--tone, var(--border)); border-radius: 6px; }
+.kb-panel .kb-item.approved { --tone: var(--ok); }
+.kb-panel .kb-item.waiting, .kb-panel .kb-item.pending_human { --tone: var(--flag); }
+.kb-panel .kb-item.rejected { --tone: var(--muted); color: var(--muted); border-style: dashed; border-left-width: 4px; background: transparent; }
+.kb-panel .kb-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; margin: 0; }
+.kb-panel .kb-head .tag { margin-right: 0; }
+.kb-panel .kb-pair { min-width: 0; overflow-wrap: anywhere; font-size: 16px; font-weight: 600; }
+.kb-panel .kb-item.rejected .kb-pair { font-weight: 500; }
 .kb-panel .tag.wait { color: var(--flag); border-color: var(--flag); }
-.kb-rivals { list-style: none; margin: 6px 0 0; padding: 2px 0 2px 8px; border-left: 3px dashed var(--flag); }
-.kb-rivals li { margin-top: 2px; overflow-wrap: anywhere; }
-.kb-pages { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin-top: 6px; }
-.kb-history { margin-top: 6px; }
-.kb-history summary { cursor: pointer; }
-.kb-history ol { margin: 4px 0 0; padding-left: 22px; }
-.kb-history li { margin-top: 2px; overflow-wrap: anywhere; }
-.kb-at { font-variant-numeric: tabular-nums; }
-.kb-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; margin-top: 8px; }
-.kb-note { min-width: 0; font-size: 12px; overflow-wrap: anywhere; }
+.kb-panel .kb-rivals { list-style: none; margin: 6px 0 0; padding: 2px 0 2px 8px; border-left: 3px dashed var(--flag); }
+.kb-panel .kb-rivals li { margin-top: 2px; overflow-wrap: anywhere; }
+.kb-panel .kb-pages { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin-top: 6px; }
+.kb-panel .kb-history { margin-top: 6px; }
+.kb-panel .kb-history summary { cursor: pointer; }
+.kb-panel .kb-history ol { margin: 4px 0 0; padding-left: 22px; }
+.kb-panel .kb-history li { margin-top: 2px; overflow-wrap: anywhere; }
+.kb-panel .kb-at { font-variant-numeric: tabular-nums; }
+.kb-panel .kb-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; margin-top: 8px; }
+.kb-panel .kb-note { min-width: 0; font-size: 12px; overflow-wrap: anywhere; }
 .kb-panel .kb-refusal { margin-top: 8px; }
