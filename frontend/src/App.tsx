@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { fetchPages, type PageSummary } from './api'
 import { BookTypesetting } from './BookTypesetting'
+import { KBPanel } from './KBPanel'
 import { PageList } from './PageList'
 import { PageView } from './PageView'
 import { useRoute } from './route'
@@ -9,6 +10,7 @@ export default function App() {
   const [route, navigate] = useRoute()
   const [pages, setPages] = useState<PageSummary[] | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [runsEnded, setRunsEnded] = useState(0) // a Run that ended in the editor may have written the book's KB: the panel reads it again
 
   useEffect(() => {
     fetchPages().then(setPages, (e: Error) => setError(e.message))
@@ -19,6 +21,9 @@ export default function App() {
       all && all.map((p) => (p.book_title === book && p.page_index === pageIndex ? { ...p, translated: true } : p)),
     )
   }, [])
+
+  // Stable, like markTranslated: PageView's `watch` depends on it, and a new one would watch the page's Run again.
+  const countRunEnd = useCallback(() => setRunsEnded((n) => n + 1), [])
 
   return (
     <div className="app">
@@ -36,6 +41,8 @@ export default function App() {
       <main className="main">
         {/* Keyed by book, not by page: a book's measurement stays on screen while the reader moves between its pages. */}
         {route && pages && <BookTypesetting key={route.book} book={route.book} pages={pages} navigate={navigate} />}
+        {/* Keyed by book too: the KB it loaded and whether the reader opened it stay while the reader moves between the book's pages. */}
+        {route && <KBPanel key={route.book} book={route.book} navigate={navigate} runsEnded={runsEnded} />}
         {route ? (
           <PageView
             key={`${route.book}/${route.pageIndex}`}
@@ -44,6 +51,7 @@ export default function App() {
             pages={pages ?? []}
             navigate={navigate}
             onTranslated={markTranslated}
+            onRunEnd={countRunEnd}
           />
         ) : (
           <p className="muted">Pick a page on the left.</p>
