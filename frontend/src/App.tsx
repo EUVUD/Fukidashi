@@ -41,8 +41,9 @@ export default function App() {
       <main className="main">
         {/* Keyed by book, not by page: a book's measurement stays on screen while the reader moves between its pages. */}
         {route && pages && <BookTypesetting key={route.book} book={route.book} pages={pages} navigate={navigate} />}
-        {/* Keyed by book too: the KB it loaded and whether the reader opened it stay while the reader moves between the book's pages. */}
-        {route && <KBPanel key={route.book} book={route.book} navigate={navigate} runsEnded={runsEnded} />}
+        {/* Keyed by book too: the KB it loaded and whether the reader opened it stay while the reader moves between the book's pages.
+            Its own key, not the book's: siblings with one key are not unique, and React says so on every render. */}
+        {route && <KBPanel key={`kb-panel:${route.book}`} book={route.book} navigate={navigate} runsEnded={runsEnded} />}
         {route ? (
           <PageView
             key={`${route.book}/${route.pageIndex}`}
