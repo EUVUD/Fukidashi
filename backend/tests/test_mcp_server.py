@@ -305,7 +305,10 @@ def test_every_call_opens_the_database_read_only_and_closes_it_again(seeded, mon
     real = sqlite3.connect
 
     def spy(*args, **kwargs):
-        conn = real(*args, **kwargs)
+        # The tool's worker thread makes the connection. This test uses it from another thread afterwards, so it is made
+        # usable from there: what SQLite then says is whether it is closed, not whether it is in the wrong thread (which it
+        # checks first, and says of a closed connection too).
+        conn = real(*args, **kwargs, check_same_thread=False)
         opened.append((args, kwargs, conn))
         return conn
 
@@ -324,7 +327,7 @@ def test_every_call_opens_the_database_read_only_and_closes_it_again(seeded, mon
     assert len(opened) == len(asked)  # one connection for each call, even for the call that was refused
     for args, kwargs, conn in opened:
         assert kwargs == {"uri": True} and args[0].startswith("file:") and args[0].endswith("?mode=ro")
-        with pytest.raises(sqlite3.ProgrammingError):  # closed
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
             conn.execute("SELECT 1")
 
 
