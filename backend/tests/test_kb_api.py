@@ -268,6 +268,21 @@ def test_approving_a_conflict_is_a_409_that_says_why_and_writes_nothing(api, con
     assert dump(conn) == before
 
 
+def test_the_409_for_approving_a_conflict_points_to_the_entrys_rename_or_to_rejecting_it(api, conn, scene):
+    """The text an API client reads (task 047): the rendering is taken by renaming the entry, a rename that exists now, or the
+    proposal is rejected. It no longer says that a rename is not built."""
+    client, _ = api
+
+    detail = decide(client, "proposals", scene.rival.proposal_id, "approve").json()["detail"]
+
+    assert detail == (
+        f"proposal {scene.rival.proposal_id} is a conflict, and a conflict cannot be approved: the KB keeps what it holds. "
+        "To take a term's proposed rendering, rename the entry that holds its source term to it, which settles this "
+        "proposal; otherwise reject the proposal to close it"
+    )
+    assert "not built" not in detail
+
+
 @pytest.mark.parametrize("decision", ["approve", "reject"])
 def test_a_proposal_in_no_queue_is_a_409_and_writes_nothing(api, conn, scene, decision):
     client, _ = api

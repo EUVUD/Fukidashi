@@ -56,7 +56,8 @@ proposals and change none of the six above:
   conflict across kinds. Rejecting it sets it `rejected`.
 - A new name (a `pending_human` proposal with the profile rule 4 made) is decided through that profile: the profile and
   the proposal become `approved` or `rejected` together. A conflict (`pending_human`, nothing written) can be rejected,
-  and its approval is refused: taking a conflicting rendering in place of the one the KB holds is a rename, not built.
+  and its approval is refused: the KB keeps what it holds. A term's conflicting rendering is taken in place of the entry's
+  by renaming the entry (`rename_entry`, below), which settles the conflict.
 - An entry or a profile can be approved or rejected whatever its state (this stops a wrong entry), unless that changes
   nothing, or approving would leave two readable rows for one source term (one `name_src`), or a term whose source is a
   readable profile's name or alias (a name that is a readable entry's source): the collisions the rules above refuse.
@@ -98,7 +99,7 @@ from dataclasses import dataclass
 
 from .. import store
 from .entities import APPROVED, PENDING_HUMAN, TERM, KBNotFound, Proposal, proposal_id
-from .rename import Box, BoxChange, plan_boxes, rendering
+from .rename import Box, BoxChange, plan_boxes, rendering as checked_rendering
 
 # Who made an entry: the Curator's rules from an agent's proposal, or a person (a decision of theirs, `decide_*`).
 AGENT = "agent"
@@ -364,7 +365,7 @@ def decide_proposal(conn: sqlite3.Connection, kb_id: int, pid: str, *, approve: 
     - A new name (`pending_human`, with the profile rule 4 made): decided through that profile, so the profile and the
       proposal become `approved` or `rejected` together.
     - A conflict (`pending_human`, nothing written): rejected, it becomes `rejected` and the KB keeps what it holds. Its
-      approval is refused (a rename, not built).
+      approval is refused: a term's rendering is taken by renaming the entry (`rename_entry`), which settles the conflict.
     - A decided proposal (`approved`, `rejected`) is refused.
 
     Raises KBNotFound for a KB that is not an Editor KB, ItemNotFound for a proposal the KB does not have, and
@@ -472,8 +473,8 @@ def _decide_waiting(conn: sqlite3.Connection, row: sqlite3.Row, approve: bool) -
         return _decide_profile(conn, profile, approve, via=row)
     if approve:
         raise DecisionRefused(f"proposal {row['proposal_id']} is a conflict, and a conflict cannot be approved: the KB "
-                              f"keeps what it holds, and taking the proposed rendering in its place is a rename, which "
-                              f"is not built. Reject it to close it")
+                              f"keeps what it holds. To take a term's proposed rendering, rename the entry that holds its "
+                              f"source term to it, which settles this proposal; otherwise reject the proposal to close it")
     store.set_proposal_status(conn, row["proposal_id"], status=_REJECTED_STATUS,
                               reason=_person_reason(False, row["reason"]))
     return PROPOSAL_REJECTED
@@ -647,7 +648,7 @@ def rename_profile(conn: sqlite3.Connection, kb_id: int, profile_id: int, target
 def _prepare_entry(conn: sqlite3.Connection, kb_id: int, entry_id: int, target: str) -> _Prepared:
     """Everything a rename of an entry needs, after every check. The preview and the write both start here, so they refuse
     the same and plan the same."""
-    new = rendering(target)
+    new = checked_rendering(target)
     kb = _require_editor_kb(conn, kb_id)
     entry = store.get_entry(conn, kb_id, entry_id)
     if entry is None:
@@ -665,7 +666,7 @@ def _prepare_entry(conn: sqlite3.Connection, kb_id: int, entry_id: int, target: 
 
 
 def _prepare_profile(conn: sqlite3.Connection, kb_id: int, profile_id: int, target: str) -> _Prepared:
-    new = rendering(target)
+    new = checked_rendering(target)
     kb = _require_editor_kb(conn, kb_id)
     profile = store.get_profile(conn, kb_id, profile_id)
     if profile is None:
