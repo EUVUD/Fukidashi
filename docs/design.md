@@ -67,7 +67,7 @@ classDiagram
 - A page has many **Segments**. Every click on Translate creates a **Run**, and the Run gives each Segment one **Translation**. The page shows its latest successful Run.
 - **Reference translations** (OpenMantra's zh-Hant and en translations) belong to the Segment and are used only for comparison and evaluation, never in a prompt.
 - `Run.config` is `baseline` (one call per page, no tools, no KB), `translator` (the Translator Agent alone, M2's smoke config), `full_no_kb` (Translator, Reviewer, Send-backs) or `full` (the same with a Knowledge Base).
-- A book has one **KnowledgeBase** per use: each `full` eval run makes a new one, and the editor keeps one per book, its Editor KB (#72). A `full` Run **proposes** entries; at finalize the Curator and the rules **decide** each Proposal, and only then can it become a Glossary entry or a Character Profile. In an Editor KB a **person** can then approve or reject a Proposal that waits, an entry or a profile (#82), through the same module and rules.
+- A book has one **KnowledgeBase** per use: each `full` eval run makes a new one, and the editor keeps one per book, its Editor KB (#72). A `full` Run **proposes** entries; at finalize the Curator and the rules **decide** each Proposal, and only then can it become a Glossary entry or a Character Profile. In an Editor KB a **person** can then approve or reject a Proposal that waits, an entry or a profile, in the editor's KB panel (#82, #84), through the same module and rules.
 - A review's **Issues** (a comment and a suggestion for one region) and the Translator's **Flags** are kept in the Run's record, with the stage that made each. The editor shows them on the page, read from that record (#79): a note is current when it is about the translation on show, and a person's edit of a region makes that region's notes about the text before the edit.
 
 ---
@@ -521,6 +521,7 @@ classDiagram
     class App {
         pages
         route
+        runsEnded
     }
     class PageList
     class BookTypesetting {
@@ -549,6 +550,21 @@ classDiagram
         <<module>>
         FONT_FAMILY
         measureText()
+    }
+    class KBPanel {
+        kb
+        busy
+        said
+        refused
+    }
+    class kbView {
+        <<module>>
+        summaryLine()
+        offerForProposal()
+        offerForRow()
+        rivalsOf()
+        describeOutcome()
+        describeHistoryLine()
     }
     class PageNotes {
         ReviewLine
@@ -579,6 +595,10 @@ classDiagram
         translatePage()
         watchRun()
         editTranslation()
+        fetchKB()
+        decideProposal()
+        decideEntry()
+        decideProfile()
     }
     class FastAPI {
         <<backend /api>>
@@ -586,6 +606,9 @@ classDiagram
 
     App *-- PageList
     App *-- BookTypesetting
+    App *-- KBPanel
+    KBPanel ..> api : fetchKB, decideProposal, decideEntry, decideProfile
+    KBPanel ..> kbView : summaryLine, offers, rivalsOf, describeOutcome
     App *-- PageView
     App ..> api : fetchPages
     BookTypesetting ..> api : fetchPage
@@ -616,12 +639,12 @@ classDiagram
 | Run | `runs` | No class of its own: `Runs.translate_page` writes the row through `Store.start_run` / `finish_run`, using `Meter.summary()` and `BaselineResult`; a human edit's Run is written by `Runs.edit_translation` through `Store.insert_human_run` | `RunOut` / `Run` |
 | Translation | `translations` | `BaselineResult.translations` or `TranslatorResult.translations` | `Segment.text_zh_hans` |
 | Manifest | none (`runs/eval/<id>/manifest.json`) | written by `run_eval` | none |
-| Knowledge Base | `kbs` | `kb_id`; `KBSnapshot` (`load_snapshot`) to read it; one per `full` eval run, and one Editor KB per book (`store.editor_kb`) | `KBOut` (a book's Editor KB, #82) / none yet |
-| Term entry / Character Profile | `glossary_entries` / `character_profiles` | `GlossaryEntry` / `CharacterProfile` (`kb/entities.py`) | `KBEntryOut` / `KBProfileOut` / none yet |
-| Proposal | `proposals` | `Proposal`, from `ProposalCollector`; written only by `kb/curator.py` | `KBProposalOut`; in the Human Review Queue `ReviewProposalOut` / none yet |
+| Knowledge Base | `kbs` | `kb_id`; `KBSnapshot` (`load_snapshot`) to read it; one per `full` eval run, and one Editor KB per book (`store.editor_kb`) | `KBOut` (a book's Editor KB, #82) / `KBView` (#84) |
+| Term entry / Character Profile | `glossary_entries` / `character_profiles` | `GlossaryEntry` / `CharacterProfile` (`kb/entities.py`) | `KBEntryOut` / `KBProfileOut`; `KBEntry` / `KBProfile` |
+| Proposal | `proposals` | `Proposal`, from `ProposalCollector`; written only by `kb/curator.py` | `KBProposalOut`, in the Human Review Queue `ReviewProposalOut` / `KBProposal`, `ReviewProposal` |
 | Flag, Verdict / Issue | none (inside a `full_no_kb` or `full` Run's `attempts_json`) | `TranslatorResult.flags`, `ReviewResult`; read back by `review_notes.build_review` | `PageReview` (`ReviewFlag`, `ReviewIssue`) / `PageReview` |
 | Curator decision, proposal outcome | `proposals.status` and reason; also a `full` Run's `attempts_json` (`finalize`) | `CuratorResult.decisions`; `curator.Outcome` (one of 9 results) | none yet |
-| A person's KB decision | the item's `status` and a history line with `"by": "human"`; an entry's `provenance`; the proposal's `status` and reason | `curator.decide_proposal` / `decide_entry` / `decide_profile`, answering one of `HUMAN_OUTCOMES` | `ProposalDecisionOut.outcome` / none yet |
+| A person's KB decision | the item's `status` and a history line with `"by": "human"`; an entry's `provenance`; the proposal's `status` and reason | `curator.decide_proposal` / `decide_entry` / `decide_profile`, answering one of `HUMAN_OUTCOMES` | `ProposalDecisionOut.outcome` / `ProposalDecision.outcome`, worded by `kbView.describeOutcome` |
 
 ### 4.4 Where later milestones plug in
 
@@ -635,5 +658,5 @@ classDiagram
   - `Runs.translate_page` takes an optional event sink, which the Orchestrator, the agents and `AgentLoop` call (built, #70: `live_trace.py` holds the contract, `Runs.store_events` stores the events through `Store.add_run_event`).
   - The API runs pages in the background and streams their Live trace events over SSE from the `run_events` table (built, #72: `BackgroundRuns` in `background.py`, the stream in `api/runs.py`).
   - A human edit is a Run of config `human`, written by `Runs.edit_translation` through `Store.insert_human_run` (built, #68).
-  - A person's KB decisions go through `kb/curator.py` (built, #82: `decide_proposal`, `decide_entry` and `decide_profile`, reached through `KBRouter` in `api/kb.py`). The KB panel that calls them is not built yet.
+  - A person's KB decisions go through `kb/curator.py` (built, #82: `decide_proposal`, `decide_entry` and `decide_profile`, reached through `KBRouter` in `api/kb.py`). The KB panel calls them (built, #84: `KBPanel`, which `App` mounts per book, with what it offers and says decided in the pure module `kbView`; it loads the KB again when `PageView` reports that a Run it followed has ended).
   - The frontend adds a canvas to `PageView` (built, #77: `TypesetLayer`, a Konva stage loaded lazily, draws what the pure module `typeset` lays out with the measure of `canvasText`; `BookTypesetting`, which `App` keys by book, measures a whole book) and editing (built: `TranslationEditor`, #68). SSE adds an event subscription to the `api` module (built, #72: `watchRun`) and a panel that shows the events (built, #74: `TracePanel`, with what it shows decided in the pure module `liveTrace`). `PageView` shows the Flags and Issues of the Run behind the displayed translation (built, #79: `PageDetail.review` from `ReviewNotes`; the words and the grouping by region in the pure module `reviewNotes`, placed by `PageNotes`).
