@@ -357,6 +357,19 @@ def test_approving_a_conflict_is_refused_and_writes_nothing(imported, kb, run_id
     assert proposal_row(imported, proposal)["status"] == "pending_human"  # still waiting, and the rendering was not taken
 
 
+@pytest.mark.parametrize("make", CONFLICTS, ids=lambda f: f.__name__.removeprefix("conflict_of_"))
+def test_the_refusal_of_a_conflicts_approval_says_how_to_take_a_rendering_or_to_reject(imported, kb, run_id, make):
+    proposal = make(imported, kb, run_id)
+
+    with pytest.raises(DecisionRefused) as refusal:
+        decide_proposal(imported, kb, proposal.proposal_id, approve=True)
+
+    text = str(refusal.value)
+    assert text.startswith(f"proposal {proposal.proposal_id} is a conflict, and a conflict cannot be approved: the KB keeps what it holds.")
+    assert "rename the entry that holds its source term" in text and "reject the proposal" in text
+    assert "not built" not in text  # a rename is built: the entry's, which settles a term's conflict
+
+
 def test_approving_a_conflict_never_replaces_the_rendering_the_kb_holds(imported, kb, run_id):
     rival = conflict_of_a_term(imported, kb, run_id)
     (held,) = entries(imported, kb)
