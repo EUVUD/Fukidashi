@@ -1,5 +1,16 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { ApiError, EVENT_KINDS, decideEntry, decideProfile, decideProposal, fetchKB, parseEvent } from './api'
+import {
+  ApiError,
+  EVENT_KINDS,
+  decideEntry,
+  decideProfile,
+  decideProposal,
+  fetchKB,
+  parseEvent,
+  previewRename,
+  renameRow,
+  type RenameKind,
+} from './api'
 
 // What the browser hands over for one event of the stream: its `event:` name, `lastEventId` (the `id:` field, the event's
 // seq) and `data`. The importing of `api.ts` needs no DOM: `EventSource` is only touched inside `watchRun`.
@@ -141,6 +152,145 @@ describe('the KB requests', () => {
     const error = await decideEntry(TITLE, 40, 'reject').catch((e: unknown) => e)
     expect(error).toBeInstanceOf(ApiError)
     expect((error as ApiError).status).toBe(0)
+  })
+
+  it('leaves no stub of fetch behind', () => {
+    expect(vi.isMockFunction(globalThis.fetch)).toBe(false)
+  })
+})
+
+// The rename's two requests (`previewRename`, `renameRow`): one function for each, whatever the row is, so each is checked for an entry
+// and for a profile. A rename's body is exactly `{"target"}`, and the title is one segment of the path, as for the decisions.
+describe('the rename requests', () => {
+  const TITLE = 'a b/c?d#e%f'
+  const TITLE_IN_PATH = 'a%20b%2Fc%3Fd%23e%25f'
+  const KB = { kb_id: 11, entries: [], profiles: [], proposal_queue: [], human_review_queue: [], proposal_counts: {} }
+  const BOX = { page_index: 4, idx: 5, text_ja: 'ここら一帯を仕切るトルティヤー一家の名', before: '托尔蒂亚家族掌管', after: '托尔蒂亚一家掌管' }
+  const LISTED = { page_index: 7, idx: 4, text_ja: 'トルティヤー一家', before: '托尔蒂亚一家', after: null }
+  const PREVIEW = (kind: RenameKind, id: number) => ({
+    kind,
+    id,
+    before: '托尔蒂亚家族',
+    after: '托尔蒂亚一家',
+    changes: [BOX],
+    listed: [LISTED],
+    settles: ['c6f34baec105729df518f50d8ef4e37e'],
+  })
+  const ROWS = [
+    { kind: 'entry', id: 40, segment: 'entries' },
+    { kind: 'profile', id: 38, segment: 'profiles' },
+  ] as const
+  const TARGET = '托尔蒂亚一家'
+  const posted = (target: string) => ({
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ target }), // exactly this: the route takes no other key
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  function stubFetch(body: unknown, status = 200, statusText = '') {
+    const stub = vi.fn((_url: string, _init?: RequestInit) =>
+      Promise.resolve(new Response(JSON.stringify(body), { status, statusText, headers: { 'Content-Type': 'application/json' } })),
+    )
+    vi.stubGlobal('fetch', stub)
+    return stub
+  }
+  const only = (stub: ReturnType<typeof stubFetch>) => {
+    expect(stub).toHaveBeenCalledTimes(1)
+    const [url, init] = stub.mock.calls[0]
+    return { url, init }
+  }
+  const failure = (call: () => Promise<unknown>) => call().then(() => null, (e: unknown) => e as ApiError)
+
+  it.each(ROWS)('previews the rename of a $kind with a POST of exactly {"target"}, the title one segment, and answers the plan', async ({ kind, id, segment }) => {
+    const answer = PREVIEW(kind, id)
+    const stub = stubFetch(answer)
+    expect(await previewRename(TITLE, kind, id, TARGET)).toEqual(answer)
+    const { url, init } = only(stub)
+    expect(url).toBe(`/api/books/${TITLE_IN_PATH}/kb/${segment}/${id}/rename/preview`)
+    expect(init).toMatchObject(posted(TARGET))
+    expect(JSON.parse(init?.body as string)).toEqual({ target: TARGET })
+  })
+
+  it.each(ROWS)('renames a $kind with a POST of exactly {"target"}, the title one segment, and answers the write', async ({ kind, id, segment }) => {
+    const answer = { ...PREVIEW(kind, id), runs: [{ page_index: 4, run_id: 906 }], kb: KB }
+    const stub = stubFetch(answer)
+    expect(await renameRow(TITLE, kind, id, TARGET)).toEqual(answer)
+    const { url, init } = only(stub)
+    expect(url).toBe(`/api/books/${TITLE_IN_PATH}/kb/${segment}/${id}/rename`)
+    expect(init).toMatchObject(posted(TARGET))
+    expect(JSON.parse(init?.body as string)).toEqual({ target: TARGET })
+  })
+
+  it('sends the rendering as it was typed: spaces, quotes and a newline are the server\'s to judge, so a 422 can say so', async () => {
+    for (const target of ['', '  ', ' 托尔蒂亚一家 ', 'a "quoted" \\ name', 'two\nlines']) {
+      const stub = stubFetch(PREVIEW('entry', 40))
+      await previewRename('tojime_no_siora', 'entry', 40, target)
+      expect(JSON.parse(only(stub).init?.body as string), JSON.stringify(target)).toEqual({ target })
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('keeps a 409 and its reason: the status, and the server\'s detail as the message, for the preview and the write', async () => {
+    const DETAIL = 'a Run is still running on page 10 (Run 914) of tojime_no_siora, and a Run that finishes writes the KB: rename after it ends'
+    for (const call of [() => previewRename(TITLE, 'entry', 40, TARGET), () => renameRow(TITLE, 'profile', 38, TARGET)]) {
+      stubFetch({ detail: DETAIL }, 409, 'Conflict')
+      const error = await failure(call)
+      expect(error).toBeInstanceOf(ApiError)
+      expect(error?.status).toBe(409)
+      expect(error?.message).toBe(DETAIL)
+      expect(error?.fromDetail).toBe(true)
+    }
+  })
+
+  it('keeps a 422 that carries a sentence: the rendering the KB would not store, as the server words it', async () => {
+    const DETAIL = 'invalid new rendering: it is empty (or only spaces)'
+    for (const call of [() => previewRename(TITLE, 'entry', 40, ''), () => renameRow(TITLE, 'entry', 40, '')]) {
+      stubFetch({ detail: DETAIL }, 422, 'Unprocessable Entity')
+      const error = await failure(call)
+      expect(error?.status).toBe(422)
+      expect(error?.message).toBe(DETAIL)
+      expect(error?.fromDetail).toBe(true)
+    }
+  })
+
+  it('does not show a 422 whose detail is a list as text: that is a body the route did not take, a bug of the caller\'s', async () => {
+    const LIST = [{ type: 'missing', loc: ['body', 'target'], msg: 'Field required', input: {} }]
+    for (const call of [() => previewRename(TITLE, 'entry', 40, TARGET), () => renameRow(TITLE, 'profile', 38, TARGET)]) {
+      stubFetch({ detail: LIST }, 422, 'Unprocessable Entity')
+      const error = await failure(call)
+      expect(error).toBeInstanceOf(ApiError)
+      expect(error?.status).toBe(422)
+      expect(error?.fromDetail).toBe(false)
+      expect(error?.message).toBe('422 Unprocessable Entity')
+      for (const piece of ['missing', 'Field required', 'target', 'body', 'loc']) expect(error?.message, piece).not.toContain(piece)
+    }
+  })
+
+  it('tells a row that is gone by the status: 404, and the detail as the message', async () => {
+    stubFetch({ detail: 'no entry 40 in the KB' }, 404, 'Not Found')
+    const error = await failure(() => previewRename(TITLE, 'entry', 40, TARGET))
+    expect(error?.status).toBe(404)
+    expect(error?.message).toBe('no entry 40 in the KB')
+  })
+
+  it('tells a backend that did not answer by the status too: 0, and not a refusal of the rules', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new TypeError('Failed to fetch'))))
+    const error = await failure(() => renameRow(TITLE, 'entry', 40, TARGET))
+    expect(error).toBeInstanceOf(ApiError)
+    expect(error?.status).toBe(0)
+    expect(error?.fromDetail).toBe(false)
+  })
+
+  it('does not take the dev server\'s own 5xx for the backend\'s sentence', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response('Bad Gateway', { status: 502, statusText: 'Bad Gateway' }))))
+    const error = await failure(() => previewRename(TITLE, 'entry', 40, TARGET))
+    expect(error?.status).toBe(502)
+    expect(error?.fromDetail).toBe(false)
+    expect(error?.message).toMatch(/Cannot reach the backend/)
   })
 
   it('leaves no stub of fetch behind', () => {

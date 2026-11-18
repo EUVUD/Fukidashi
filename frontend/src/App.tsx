@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useState } from 'react'
-import { fetchPages, type PageSummary } from './api'
+import { fetchPages, type PageSummary, type RenamedPage } from './api'
 import { BookTypesetting } from './BookTypesetting'
 import { KBPanel } from './KBPanel'
 import { PageList } from './PageList'
-import { PageView } from './PageView'
+import { PageView, type RenameSignal } from './PageView'
 import { useRoute } from './route'
 
 export default function App() {
@@ -11,6 +11,7 @@ export default function App() {
   const [pages, setPages] = useState<PageSummary[] | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [runsEnded, setRunsEnded] = useState(0) // a Run that ended in the editor may have written the book's KB: the panel reads it again
+  const [renamed, setRenamed] = useState<RenameSignal>({ n: 0, book: '', pages: [] }) // the last rename: the open page reads again if it was written
 
   useEffect(() => {
     fetchPages().then(setPages, (e: Error) => setError(e.message))
@@ -24,6 +25,13 @@ export default function App() {
 
   // Stable, like markTranslated: PageView's `watch` depends on it, and a new one would watch the page's Run again.
   const countRunEnd = useCallback(() => setRunsEnded((n) => n + 1), [])
+
+  // The KB panel's rename wrote a Human edit on each of these pages of the book. Stable, like the two above: the panel's requests close over it.
+  const noteRename = useCallback(
+    (book: string, runs: readonly RenamedPage[]) =>
+      setRenamed((last) => ({ n: last.n + 1, book, pages: runs.map((run) => run.page_index) })),
+    [],
+  )
 
   return (
     <div className="app">
@@ -43,7 +51,9 @@ export default function App() {
         {route && pages && <BookTypesetting key={route.book} book={route.book} pages={pages} navigate={navigate} />}
         {/* Keyed by book too: the KB it loaded and whether the reader opened it stay while the reader moves between the book's pages.
             Its own key, not the book's: siblings with one key are not unique, and React says so on every render. */}
-        {route && <KBPanel key={`kb-panel:${route.book}`} book={route.book} navigate={navigate} runsEnded={runsEnded} />}
+        {route && (
+          <KBPanel key={`kb-panel:${route.book}`} book={route.book} navigate={navigate} runsEnded={runsEnded} onRenamed={noteRename} />
+        )}
         {route ? (
           <PageView
             key={`${route.book}/${route.pageIndex}`}
@@ -53,6 +63,7 @@ export default function App() {
             navigate={navigate}
             onTranslated={markTranslated}
             onRunEnd={countRunEnd}
+            renamed={renamed}
           />
         ) : (
           <p className="muted">Pick a page on the left.</p>

@@ -1,11 +1,15 @@
 import { describe, expect, it } from 'vitest'
 import type { HistoryLine, KBDecision, KBEntry, KBProfile, KBProposal, KBView, ReviewProposal } from './api'
 import {
+  CONFLICT_NOTE,
   EMPTY_PROPOSAL_QUEUE,
   NO_EDITOR_KB,
   NO_RIVAL,
-  RENAME_NOTE,
+  RENAME_LABEL,
+  TAKE_LABEL,
+  TAKE_NOTE,
   UNDECIDED_NAME_NOTE,
+  canRename,
   describeEntry,
   describeHistoryLine,
   describeOutcome,
@@ -18,6 +22,7 @@ import {
   formatAt,
   isConflict,
   isReadable,
+  isRefusal,
   itemKey,
   offerForProposal,
   offerForRow,
@@ -29,9 +34,12 @@ import {
   proposalWords,
   provenanceLabel,
   reasonText,
+  renameControlName,
   rivalsOf,
   statusLabel,
   summaryLine,
+  takeControlName,
+  takeOffer,
 } from './kbView'
 
 // ---- Fixtures: an Editor KB as the backend sends it (backend/fukidashi/api/kb.py) ------------------------------------------
@@ -279,36 +287,52 @@ describe('what a proposal waits for', () => {
 
 describe('the decisions offered', () => {
   it('offers an undecided term Approve and Reject', () => {
-    expect(offerForProposal(termProposal('u1', '魔法', '魔法'))).toEqual({ decisions: ['approve', 'reject'], note: null })
+    expect(offerForProposal(termProposal('u1', '魔法', '魔法'), kb)).toEqual({ decisions: ['approve', 'reject'], note: null })
   })
 
   it('offers a new name Approve and Reject', () => {
-    expect(offerForProposal(waiting(nameProposal('n1', 'ユキ', '小雪'), 'new_name', 38))).toEqual({
+    expect(offerForProposal(waiting(nameProposal('n1', 'ユキ', '小雪'), 'new_name', 38), kb)).toEqual({
       decisions: ['approve', 'reject'],
       note: null,
     })
   })
 
-  it('offers a conflict Reject only, with one line that says why', () => {
-    const offer = offerForProposal(waiting(termProposal('c1', '封印', '封缄'), 'conflict'))
-    expect(offer.decisions).toEqual(['reject'])
-    expect(offer.note).toBe(RENAME_NOTE)
-    expect(RENAME_NOTE).toMatch(/rename, which is not built yet/)
+  it('offers a conflict Reject only, with one line that says why, and that the rendering can be taken when it can', () => {
+    const taken = offerForProposal(waiting(termProposal('c1', '封印', '封缄'), 'conflict'), kb) // entry 40 holds 封印
+    expect(taken).toEqual({ decisions: ['reject'], note: TAKE_NOTE })
+    expect(TAKE_NOTE).toMatch(/Take this rendering to rename that entry to it, or reject the proposal/)
+    const kept = offerForProposal(waiting(termProposal('c2', 'ユキ', '雪'), 'conflict'), kb) // a profile's name, not an entry's source
+    expect(kept).toEqual({ decisions: ['reject'], note: CONFLICT_NOTE })
+    expect(CONFLICT_NOTE).toMatch(/Reject the proposal to close it/)
+  })
+
+  it('no longer says that there is no rename to take: the two notes name what to do, and differ', () => {
+    for (const note of [TAKE_NOTE, CONFLICT_NOTE]) {
+      expect(note).not.toMatch(/not\s+built|\byet\b/)
+      expect(note).toMatch(/^Approving is not offered: the KB keeps /)
+    }
+    expect(TAKE_NOTE).not.toBe(CONFLICT_NOTE)
   })
 
   it('offers every conflict Reject only, whatever kind of proposal it is', () => {
     for (const p of [termProposal('c1', '封印', '封缄'), nameProposal('c2', 'ユキ', '雪')]) {
-      expect(offerForProposal(waiting(p, 'conflict')).decisions, p.kind).toEqual(['reject'])
+      expect(offerForProposal(waiting(p, 'conflict'), kb).decisions, p.kind).toEqual(['reject'])
+    }
+  })
+
+  it('gives a character conflict, and a term whose source is a character\'s name or alias, the note that only rejects', () => {
+    for (const p of [nameProposal('c2', 'ユキ', '雪'), termProposal('c3', 'ユキ', '雪'), termProposal('c4', 'ゆき', '雪')]) {
+      expect(offerForProposal(waiting(p, 'conflict'), kb).note, plain(proposalWords(p))).toBe(CONFLICT_NOTE)
     }
   })
 
   it('offers a name that waits undecided Reject only, as the server never approves one', () => {
-    const offer = offerForProposal(nameProposal('n1', 'ユキ', '小雪'))
+    const offer = offerForProposal(nameProposal('n1', 'ユキ', '小雪'), kb)
     expect(offer).toEqual({ decisions: ['reject'], note: UNDECIDED_NAME_NOTE })
   })
 
   it('offers nothing for a wait it does not know', () => {
-    expect(offerForProposal(waiting(termProposal('x1', '魔法', '魔法'), 'a_wait_from_the_future'))).toEqual({ decisions: [], note: null })
+    expect(offerForProposal(waiting(termProposal('x1', '魔法', '魔法'), 'a_wait_from_the_future'), kb)).toEqual({ decisions: [], note: null })
   })
 
   it('offers an approved entry or profile Reject only', () => {
@@ -584,9 +608,34 @@ describe('the history of a row', () => {
     expect(say('confirmed', { by: 'human', page: 18 })).toBe('Confirmed by a person, from the proposal made on page 18')
   })
 
+  it('words a rename by the person and the two renderings, in Simplified Chinese, and the status it replaced', () => {
+    const renamed = { by: 'human', from: 'approved', before: '托尔蒂亚家族', after: '托尔蒂亚一家' }
+    expect(say('renamed', renamed)).toBe('Renamed by a person: 托尔蒂亚家族 → 托尔蒂亚一家 (was approved)')
+    expect(say('renamed', { ...renamed, from: 'pending_human' })).toBe(
+      'Renamed by a person: 托尔蒂亚家族 → 托尔蒂亚一家 (was waiting for a person)',
+    )
+    const words = describeHistoryLine(line('renamed', renamed))
+    expect(words).toContainEqual({ text: '托尔蒂亚家族', lang: 'zh-Hans' })
+    expect(words).toContainEqual({ text: '托尔蒂亚一家', lang: 'zh-Hans' })
+    expect(words.filter((piece) => typeof piece !== 'string' && piece.lang === 'ja')).toEqual([])
+  })
+
+  it('words the line a rename leaves on the conflict it settled: a confirmation by a person', () => {
+    expect(say('confirmed', { by: 'human', page: 7, run_id: 437, proposal_id: 'c6f34bae' })).toBe(
+      'Confirmed by a person, from the proposal made on page 7',
+    )
+  })
+
+  it('leaves out the renderings of a rename line that lacks them or holds something else', () => {
+    expect(say('renamed', { by: 'human', from: 'approved' })).toBe('Renamed by a person (was approved)')
+    expect(say('renamed', { by: 'human', before: '托尔蒂亚家族' })).toBe('Renamed by a person')
+    expect(say('renamed', { by: 'human', before: 3, after: null })).toBe('Renamed by a person')
+    expect(say('renamed')).toBe('Renamed')
+  })
+
   it('shows an event it does not know as it is', () => {
-    expect(say('renamed', { by: 'human', from: 'approved' })).toBe('Event "renamed" by a person (was approved)')
-    expect(say('renamed')).toBe('Event "renamed"')
+    expect(say('frobnicated', { by: 'human', from: 'approved' })).toBe('Event "frobnicated" by a person (was approved)')
+    expect(say('frobnicated')).toBe('Event "frobnicated"')
   })
 
   it('shows a status it does not know as it is', () => {
@@ -629,5 +678,139 @@ describe('states and provenance', () => {
     expect(provenanceLabel('human')).toBe('person')
     expect(provenanceLabel('agent')).toBe('agent')
     expect(provenanceLabel('a_provenance_from_the_future')).toBe('a_provenance_from_the_future')
+  })
+})
+
+// ---- Rename: where it is offered ---------------------------------------------------------------------------------------------
+
+describe('the rename offered', () => {
+  it('is offered on a readable entry or profile: an approved one, and one that waits for a person', () => {
+    expect(canRename('approved')).toBe(true)
+    expect(canRename('pending_human')).toBe(true)
+  })
+
+  it('is not offered on a rejected or an undecided row, which the server refuses, nor on a status it does not know', () => {
+    for (const status of ['rejected', 'proposed', 'a_status_from_the_future', '', 'constructor']) {
+      expect(canRename(status), status).toBe(false)
+    }
+  })
+
+  it('goes with the states the rules read, and no other', () => {
+    for (const status of ['approved', 'pending_human', 'rejected', 'proposed']) expect(canRename(status), status).toBe(isReadable(status))
+  })
+
+  it('names the row it renames, with its pair now, and starts with what the button says', () => {
+    expect(renameControlName('entry', 40, describeEntry(kb.entries[0]).pair)).toBe('Rename entry 40: 封印 → 封印')
+    expect(renameControlName('profile', 38, describeProfile(kb.profiles[0]).pair)).toBe('Rename profile 38: ユキ → 小雪')
+    expect(renameControlName('entry', 40, describeEntry(kb.entries[0]).pair).startsWith(RENAME_LABEL)).toBe(true)
+  })
+
+  it('names two rows of one pair apart by their ids', () => {
+    const words = describeEntry(entry(40, '封印', '封印')).pair
+    expect(renameControlName('entry', 40, words)).not.toBe(renameControlName('entry', 41, words))
+    expect(renameControlName('entry', 40, words)).not.toBe(renameControlName('profile', 40, words))
+  })
+})
+
+// ---- "Take this rendering": zero, one and two entry rivals, and a profile rival ------------------------------------------------
+
+describe('"Take this rendering"', () => {
+  const conflict = (source: string, target: string, over: Partial<KBProposal> = {}) =>
+    waiting(termProposal('c1', source, target, over), 'conflict')
+
+  it('is offered when exactly one readable entry has the source: that entry, renamed to the proposal\'s rendering', () => {
+    const offer = takeOffer(conflict('封印', '封缄'), kb)
+    expect(offer).toEqual({ entry: kb.entries[0], target: '封缄' })
+    expect(offer?.entry.id).toBe(40)
+  })
+
+  it('is not offered when no entry has the source', () => {
+    expect(takeOffer(conflict('呪文', '咒语'), kb)).toBeNull()
+    expect(takeOffer(conflict('封印', '封缄'), kbOf())).toBeNull()
+  })
+
+  it('is not offered when two readable entries have it: there is no one entry to rename', () => {
+    const two = kbOf({ entries: [entry(50, '封印', '封印'), entry(51, '封印', '封缄印', 'pending_human')] })
+    expect(rivalsOf(conflict('封印', '封缄'), two).filter((r) => r.kind === 'entry')).toHaveLength(2)
+    expect(takeOffer(conflict('封印', '封缄'), two)).toBeNull()
+  })
+
+  it('counts only readable entries: a rejected or an undecided entry with the source is not a rival', () => {
+    expect(takeOffer(conflict('魔法', '魔術'), kb)).toBeNull() // entry 41 is rejected
+    expect(takeOffer(conflict('王都', '王城'), kb)).toBeNull() // entry 43 is undecided
+    const one = kbOf({ entries: [entry(50, '封印', '封印', 'rejected'), entry(51, '封印', '封印', 'approved')] })
+    expect(takeOffer(conflict('封印', '封缄'), one)?.entry.id).toBe(51)
+  })
+
+  it('is offered for an entry that waits for a person: its rename approves it', () => {
+    expect(takeOffer(conflict('結界', '屏障'), kb)?.entry).toEqual(kb.entries[3])
+  })
+
+  it('is not offered when a profile is the only rival: a term whose source is a character\'s name or an alias', () => {
+    expect(takeOffer(conflict('ユキ', '雪'), kb)).toBeNull() // the name of profile 38
+    expect(takeOffer(conflict('ゆき', '雪'), kb)).toBeNull() // its alias
+  })
+
+  it('is offered for the entry when a profile has the same source too: the entry is the one to rename', () => {
+    const both = kbOf({ entries: [entry(50, 'ユキ', '雪')], profiles: [profile(38, 'ユキ', '小雪')] })
+    expect(takeOffer(conflict('ユキ', '雪人'), both)?.entry.id).toBe(50)
+  })
+
+  it('is not offered for a character conflict, a new name, an undecided term or a wait it does not know', () => {
+    expect(takeOffer(waiting(nameProposal('c2', '封印', '封缄'), 'conflict'), kb)).toBeNull() // an entry's source as a character
+    expect(takeOffer(waiting(nameProposal('n1', 'ユキ', '小雪'), 'new_name', 38), kb)).toBeNull()
+    expect(takeOffer(termProposal('u1', '封印', '封缄'), kb)).toBeNull()
+    expect(takeOffer(waiting(termProposal('x1', '封印', '封缄'), 'a_wait_from_the_future'), kb)).toBeNull()
+  })
+
+  it('is not offered for a kind it does not know, or a proposal that lacks its rendering', () => {
+    const unknown: ReviewProposal = { ...conflict('封印', '封缄'), kind: 'place', payload: { source_term: '封印', target_term: '封缄' } }
+    expect(takeOffer(unknown, kb)).toBeNull()
+    const lacking: ReviewProposal = { ...conflict('封印', '封缄'), payload: { source_term: '封印' } }
+    expect(takeOffer(lacking, kb)).toBeNull()
+    expect(takeOffer(conflict('封印', ''), kb)).toBeNull()
+  })
+
+  it('is not offered when the entry has the proposal\'s rendering already: nothing is left to take, and the server refuses it', () => {
+    expect(takeOffer(conflict('封印', '封印'), kb)).toBeNull()
+  })
+
+  it('goes with the note: the one that says the rendering can be taken exactly when it is offered', () => {
+    for (const p of [conflict('封印', '封缄'), conflict('ユキ', '雪'), conflict('呪文', '咒语')]) {
+      const note = offerForProposal(p, kb).note
+      expect(note === TAKE_NOTE, plain(proposalWords(p))).toBe(takeOffer(p, kb) !== null)
+    }
+  })
+
+  it('names what it renames and what to, with the page it was proposed on, and starts with what the button says', () => {
+    const p = conflict('封印', '封缄', { page_index: 19 })
+    const take = takeOffer(p, kb)
+    expect(take).not.toBeNull()
+    expect(takeControlName(p, take!)).toBe('Take this rendering: rename entry 40 (封印 → 封印) to 封缄, as proposed on page 19')
+    expect(takeControlName(p, take!).startsWith(TAKE_LABEL)).toBe(true)
+  })
+})
+
+// ---- Where a failed request is shown -------------------------------------------------------------------------------------------
+
+describe('where a failed request is shown', () => {
+  it('shows the rules\' refusal beside the item: a 409, whatever it carries', () => {
+    expect(isRefusal(409, true)).toBe(true)
+    expect(isRefusal(409, false)).toBe(true)
+  })
+
+  it('shows a 422 beside the item when it carries the server\'s own sentence, a rendering the KB would not store', () => {
+    expect(isRefusal(422, true)).toBe(true)
+  })
+
+  it('shows a 422 that is FastAPI\'s list in the panel: a body the route did not take is not text for a person', () => {
+    expect(isRefusal(422, false)).toBe(false)
+  })
+
+  it('shows any other failure in the panel: a gone row, a backend that did not answer, a server error', () => {
+    for (const status of [0, 400, 404, 500, 502, 503]) {
+      expect(isRefusal(status, true), String(status)).toBe(false)
+      expect(isRefusal(status, false), String(status)).toBe(false)
+    }
   })
 })

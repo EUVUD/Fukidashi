@@ -28,6 +28,14 @@ import { MIN_FONT_PX, describeFigures, overflowRate, typesetPage } from './types
 // layer is its own chunk, loaded the first time it shows.
 const TypesetLayer = lazy(() => import('./TypesetLayer').then((m) => ({ default: m.TypesetLayer })))
 
+// A rename of the KB panel's that wrote Human edits: the book and the pages it wrote on. `n` counts the renames, so that a page can
+// tell a new one from one that happened before it was opened.
+export interface RenameSignal {
+  n: number
+  book: string
+  pages: readonly number[]
+}
+
 interface Props {
   book: string
   pageIndex: number
@@ -35,6 +43,7 @@ interface Props {
   navigate: (path: string) => void
   onTranslated: (book: string, pageIndex: number) => void
   onRunEnd: () => void // a Run this view was waiting for is over, however it ended (stable: `watch` depends on it)
+  renamed: RenameSignal // the last rename: when it wrote on this page, the page is read again
 }
 
 // The row being edited: the text typed so far, and why the last save failed.
@@ -75,7 +84,7 @@ function runSummary(run: Run): string {
   return parts.join(' · ')
 }
 
-export function PageView({ book, pageIndex, pages, navigate, onTranslated, onRunEnd }: Props) {
+export function PageView({ book, pageIndex, pages, navigate, onTranslated, onRunEnd, renamed }: Props) {
   const [detail, setDetail] = useState<PageDetail | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [translating, setTranslating] = useState(false) // a run of this page is being watched, started here or found on load
@@ -156,6 +165,25 @@ export function PageView({ book, pageIndex, pages, navigate, onTranslated, onRun
       stopWatching.current = null
     }
   }, [book, pageIndex, watch, onTranslated])
+
+  // A rename wrote a Human edit on this page: read it again, as after a Run's end, so that its text, its typesetting and its review line
+  // (the edited regions) follow. A rename that happened before this page was opened is already in what the first read got.
+  const seenRename = useRef(renamed.n)
+  useEffect(() => {
+    if (renamed.n === seenRename.current) return
+    seenRename.current = renamed.n
+    if (renamed.book !== book || !renamed.pages.includes(pageIndex)) return
+    const ctrl = new AbortController()
+    fetchPage(book, pageIndex, ctrl.signal).then(
+      (page) => {
+        if (!ctrl.signal.aborted) setDetail(page)
+      },
+      (e: Error) => {
+        if (!ctrl.signal.aborted) setLoadError(e.message)
+      },
+    )
+    return () => ctrl.abort()
+  }, [renamed, book, pageIndex])
 
   const onTranslate = async () => {
     setTranslating(true)

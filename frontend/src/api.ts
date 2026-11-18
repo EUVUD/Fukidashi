@@ -173,12 +173,17 @@ export function parseEvent(kind: EventKind, lastEventId: string, data: string): 
   return { seq, kind, data: parsed } as TraceEvent
 }
 
-// A failed request, with the status the backend answered (0: it never answered).
+// A failed request, with the status the backend answered (0: it never answered). `fromDetail` says that the message is the
+// backend's own sentence (its `detail` was a string): a refusal of the rules (409), or a rendering it would not store (422).
+// A `detail` that is a list is FastAPI's report of a body that was not what the route takes, which is a bug of the caller's:
+// it is never shown as text, so the message is only the status.
 export class ApiError extends Error {
   status: number
-  constructor(message: string, status: number) {
+  fromDetail: boolean
+  constructor(message: string, status: number, fromDetail = false) {
     super(message)
     this.status = status
+    this.fromDetail = fromDetail
   }
 }
 
@@ -192,13 +197,17 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   if (!res.ok) {
     // A 5xx without the API's {"detail": ...} body comes from the dev server's proxy: the backend is down.
     let detail = res.status >= 500 ? `Cannot reach the backend (${res.status}). Is it running on port 8000?` : `${res.status} ${res.statusText}`
+    let fromDetail = false
     try {
       const body = await res.json()
-      if (typeof body.detail === 'string') detail = body.detail
+      if (typeof body.detail === 'string') {
+        detail = body.detail
+        fromDetail = true
+      }
     } catch {
       // not JSON: keep the message above
     }
-    throw new ApiError(detail, res.status)
+    throw new ApiError(detail, res.status, fromDetail)
   }
   return res.json() as Promise<T>
 }
@@ -364,3 +373,62 @@ export const decideEntry = (book: string, entryId: number, decision: KBDecision)
   request<KBView>(`${kbPath(book)}/entries/${entryId}/decision`, decisionRequest(decision))
 export const decideProfile = (book: string, profileId: number, decision: KBDecision) =>
   request<KBView>(`${kbPath(book)}/profiles/${profileId}/decision`, decisionRequest(decision))
+
+// ---- A rename (api/kb.py: RenamePreview, RenameBox, RenamedPage, RenameOut) ---------------------------------------------------
+// A person changes an entry's target term or a profile's Chinese name, and the boxes of the book that use it follow (OUTLINE §0,
+// Rename; §8, "Rename → whole-book sync"). renameView.ts says what each field means in words.
+
+// What is renamed: an entry's `target_term`, or a profile's `name_tgt`. The word is the row's, and the route's segment.
+export type RenameKind = 'entry' | 'profile'
+
+// A box of the book that a rename changes (`after` is the new translation) or only lists (`after` is null).
+export interface RenameBox {
+  page_index: number
+  idx: number // the box's region id on that page, as `Segment.index`
+  text_ja: string
+  before: string | null // the translation the page displays now; null for a box with none (its page has no succeeded Run)
+  after: string | null // the same with every occurrence of the old rendering replaced; null for a box that is only listed
+}
+
+// What renaming one row would do to the book: nothing is written by asking.
+export interface RenamePreview {
+  kind: RenameKind // what `id` is
+  id: number
+  before: string // the row's rendering now
+  after: string // the new rendering, as the KB stores it (NFKC, trimmed): it can differ from what was typed
+  changes: RenameBox[] // page order, then `idx`
+  listed: RenameBox[] // the same order: the Japanese holds the source, the translation does not hold `before` (or there is none)
+  settles: string[] // ids of the proposals the write settles with the row
+}
+
+// The Human edit a rename wrote on one page: a Run of config `human`, which the page now shows.
+export interface RenamedPage {
+  page_index: number
+  run_id: number
+}
+
+// A rename's write answers what the preview does, computed again, then the Human edits it made and the KB after it.
+export interface RenameOut extends RenamePreview {
+  runs: RenamedPage[] // one for each page with a changed box, in page order
+  kb: KBView
+}
+
+const renamePath = (book: string, kind: RenameKind, id: number) =>
+  `${kbPath(book)}/${kind === 'entry' ? 'entries' : 'profiles'}/${id}/rename`
+
+// The body of both requests is exactly `{ target }`: the route takes no other key.
+const renameRequest = (target: string): RequestInit => ({
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ target }),
+})
+
+// What renaming the row to `target` would do: a read, so nothing is written. It refuses what the write refuses (a 409 with
+// the reason as the message; a 422 with the sentence about a rendering the KB would not store).
+export const previewRename = (book: string, kind: RenameKind, id: number, target: string) =>
+  request<RenamePreview>(`${renamePath(book, kind, id)}/preview`, renameRequest(target))
+
+// The rename itself, in one transaction on the server: the row, the Human edits and the conflicts it settles, or nothing. The
+// server plans again, so the answer, not an earlier preview, says what changed.
+export const renameRow = (book: string, kind: RenameKind, id: number, target: string) =>
+  request<RenameOut>(renamePath(book, kind, id), renameRequest(target))
