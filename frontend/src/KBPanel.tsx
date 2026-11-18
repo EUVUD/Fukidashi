@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useId, useRef, useState, type ReactNode, type RefObject } from 'react'
 import {
   ApiError,
   decideEntry,
@@ -35,7 +35,7 @@ import {
   offerForRow,
   profileControlName,
   proposalControlName,
-  proposalWords,
+  proposalLabel,
   provenanceLabel,
   reasonText,
   rivalsOf,
@@ -57,14 +57,20 @@ interface Props {
 }
 
 // What every row needs of the panel: the book, the way to a page, whether a request is in flight, the reason a decision on
-// the row was refused and the way to decide.
+// the row was refused (and the element that shows it, where focus goes when the button is gone) and the way to decide, which
+// takes the button that asked for it.
 interface Shared {
   book: string
   navigate: (path: string) => void
   disabled: boolean
   errorOf: (ref: ItemRef) => string | null
-  decide: (ref: ItemRef, decision: KBDecision, label: Words) => void
+  refusalRef: RefObject<HTMLParagraphElement | null>
+  decide: (ref: ItemRef, decision: KBDecision, label: Words, control: HTMLElement) => void
 }
+
+// Focus fell to the top of the page: nothing has it, or the body does. That is where the browser puts it when the focused
+// button is disabled, as every control is while a request is in flight.
+const focusIsLost = () => document.activeElement === null || document.activeElement === document.body
 
 // The one panel of a book's Editor KB (OUTLINE §0, Proposal Queue, Human Review Queue and Editor KB; SCOPE.md #5): a disclosure,
 // closed until the reader opens it, whose line carries the counts. It lists what waits for a person, then the entries and the
@@ -81,9 +87,19 @@ export function KBPanel({ book, navigate, runsEnded }: Props) {
   const [said, setSaid] = useState<Words | null>(null) // what the last decision did
   const loading = useRef<AbortController | null>(null)
   const deciding = useRef(false)
-  const reloadAfter = useRef(false) // a load was asked for while a decision was in flight: it follows the answer
+  const reloadAfter = useRef(false) // a load follows the decision's answer: it was asked for in the meantime, or the answer was a 404
   const gone = useRef(false) // the reader left the book: a decision still on its way starts nothing more
+  const refocus = useRef<HTMLElement | null>(null) // the button of a decision that failed: focus goes back once nothing is in flight
   const status = useRef<HTMLParagraphElement>(null)
+  const errorLine = useRef<HTMLParagraphElement>(null) // "The decision failed: …"
+  const refusal = useRef<HTMLParagraphElement>(null) // the refusal beside an item: only one is ever shown, the last decision's
+
+  // What the last decision left on screen (what it did, why it was refused, why it failed) is over.
+  const forget = useCallback(() => {
+    setPanelError(null)
+    setRefused(null)
+    setSaid(null)
+  }, [])
 
   // Reads the KB. A load that is still on its way is dropped for it, and so is a decision's answer being older than a load's.
   const load = useCallback(() => {
@@ -111,40 +127,53 @@ export function KBPanel({ book, navigate, runsEnded }: Props) {
   }, [book])
 
   // When the book is shown, and again whenever a Run of the editor ends (a `full` Run writes the KB at finalize, before its
-  // `run_end`). Read while the panel is closed too: its line is what tells the reader that something waits for them.
+  // `run_end`). Read while the panel is closed too: its line is what tells the reader that something waits for them. A Run's
+  // end also makes what an earlier decision left on screen stale, as Refresh does. A decision still in flight keeps its own
+  // result: `load` holds the read back until its answer is in, and the read clears nothing.
   useEffect(() => {
     gone.current = false
+    if (!deciding.current) forget()
     load()
     return () => {
       gone.current = true
       loading.current?.abort()
     }
-  }, [load, runsEnded])
+  }, [load, forget, runsEnded])
 
-  // The reader asked for it: what the last decision left on screen (what it did, why it was refused, why it failed) is over.
+  // The reader asked for it.
   const refresh = () => {
-    setPanelError(null)
-    setRefused(null)
-    setSaid(null)
+    forget()
     load()
   }
 
   // A decision that was made leaves the button that made it gone from the list (an approved proposal leaves its queue), and
   // focus with it: the line that says what happened takes it, so a keyboard goes on from there, not from the top of the page.
   useEffect(() => {
-    if (said !== null && (document.activeElement === null || document.activeElement === document.body)) {
-      status.current?.focus({ preventScroll: true })
-    }
+    if (said !== null && focusIsLost()) status.current?.focus({ preventScroll: true })
   }, [said])
 
-  const decide = async (ref: ItemRef, decision: KBDecision, label: Words) => {
+  // A decision that failed leaves the same hole: the button was disabled while the request was in flight, so focus fell to the
+  // top of the page. Once nothing is in flight, focus goes back to the button that made the decision; when that is gone from
+  // the panel (a 404: the row was deleted, and the read that follows takes it from the list), to the refusal beside the item,
+  // or to the line that says the decision failed, or to the status line. Focus the reader has moved elsewhere in the meantime
+  // is left where it is.
+  useEffect(() => {
+    const control = refocus.current
+    if (control === null || busy !== null) return
+    refocus.current = null
+    if (!focusIsLost()) return
+    // The button is where the reader was: nothing to scroll to. The lines may be off screen, and are what the reader must see.
+    if (control.isConnected) control.focus({ preventScroll: true })
+    else (refusal.current ?? errorLine.current ?? status.current)?.focus()
+  }, [busy])
+
+  // `control` is the button that asked: where focus goes back to if the decision fails.
+  const decide = async (ref: ItemRef, decision: KBDecision, label: Words, control: HTMLElement) => {
     if (deciding.current) return
     loading.current?.abort() // a read that began before this decision would answer with a KB older than the one it will
     deciding.current = true
     setBusy('deciding')
-    setPanelError(null)
-    setRefused(null)
-    setSaid(null)
+    forget()
     try {
       let next: KBView
       let words: Words
@@ -157,11 +186,16 @@ export function KBPanel({ book, navigate, runsEnded }: Props) {
         words = describeRowDecision(ref.kind, ref.id, label, decision)
       }
       setKb(next)
+      setLoadError(null) // the answer is as fresh as a load's: a read that failed before it is over, as a load that succeeds says
       setSaid(words)
     } catch (e) {
+      refocus.current = control
       // 409: the rules refused it, and the KB is as it was; the reason goes beside the item. Anything else goes in the panel.
       if (e instanceof ApiError && e.status === 409) setRefused({ key: itemKey(ref), message: e.message })
       else setPanelError((e as Error).message)
+      // 404: the item is gone (or its KB is not there): read the KB again, so that the row leaves without Refresh. The error
+      // stays, because `load` clears nothing of what a decision left.
+      if (e instanceof ApiError && e.status === 404) reloadAfter.current = true
     } finally {
       deciding.current = false
       setBusy(null)
@@ -177,6 +211,7 @@ export function KBPanel({ book, navigate, runsEnded }: Props) {
     navigate,
     disabled: busy !== null,
     errorOf: (ref) => (refused?.key === itemKey(ref) ? refused.message : null),
+    refusalRef: refusal,
     decide,
   }
 
@@ -198,7 +233,11 @@ export function KBPanel({ book, navigate, runsEnded }: Props) {
             {said && <Text words={said} />}
           </p>
           {loadError && <p className="error" role="alert">The KB could not be loaded: {loadError}</p>}
-          {panelError && <p className="error" role="alert">The decision failed: {panelError}</p>}
+          {panelError && (
+            <p ref={errorLine} className="error" role="alert" tabIndex={-1}>
+              The decision failed: {panelError}
+            </p>
+          )}
           {kb === null && busy === 'loading' && <p className="muted">Loading the KB…</p>}
           {kb !== null && kb.kb_id === null && <p className="muted">{NO_EDITOR_KB}</p>}
           {kb !== null && kb.kb_id !== null && (
@@ -356,7 +395,7 @@ function Decisions({
 }: {
   offer: Offer
   nameOf: (decision: KBDecision) => string
-  onDecide: (decision: KBDecision) => void
+  onDecide: (decision: KBDecision, control: HTMLElement) => void
   disabled: boolean
 }) {
   if (offer.decisions.length === 0 && offer.note === null) return null
@@ -369,7 +408,7 @@ function Decisions({
           className={decision === 'reject' ? 'secondary' : undefined}
           aria-label={nameOf(decision)}
           disabled={disabled}
-          onClick={() => onDecide(decision)}
+          onClick={(event) => onDecide(decision, event.currentTarget)}
         >
           {verbOf(decision)}
         </button>
@@ -379,9 +418,11 @@ function Decisions({
   )
 }
 
-function Refusal({ message }: { message: string | null }) {
+// The reason the rules refused a decision, beside its item. It can take focus (`focusRef`, which only the one being shown holds):
+// when the decision's button is gone from the panel, the reader's keyboard goes on from here.
+function Refusal({ message, focusRef }: { message: string | null; focusRef: RefObject<HTMLParagraphElement | null> }) {
   return message === null ? null : (
-    <p className="error kb-refusal" role="alert">
+    <p ref={focusRef} className="error kb-refusal" role="alert" tabIndex={-1}>
       {message}
     </p>
   )
@@ -439,10 +480,10 @@ function ProposalItem({ p, kb, shared }: { p: KBProposal; kb: KBView; shared: Sh
       <Decisions
         offer={offerForProposal(p)}
         nameOf={(decision) => proposalControlName(decision, p)}
-        onDecide={(decision) => shared.decide(ref, decision, proposalWords(p))}
+        onDecide={(decision, control) => shared.decide(ref, decision, proposalLabel(p), control)}
         disabled={shared.disabled}
       />
-      <Refusal message={shared.errorOf(ref)} />
+      <Refusal message={shared.errorOf(ref)} focusRef={shared.refusalRef} />
     </li>
   )
 }
@@ -466,10 +507,10 @@ function EntryItem({ e, shared }: { e: KBEntry; shared: Shared }) {
       <Decisions
         offer={offerForRow(e.status)}
         nameOf={(decision) => entryControlName(decision, e)}
-        onDecide={(decision) => shared.decide(ref, decision, words.pair)}
+        onDecide={(decision, control) => shared.decide(ref, decision, words.pair, control)}
         disabled={shared.disabled}
       />
-      <Refusal message={shared.errorOf(ref)} />
+      <Refusal message={shared.errorOf(ref)} focusRef={shared.refusalRef} />
     </li>
   )
 }
@@ -493,10 +534,10 @@ function ProfileItem({ r, shared }: { r: KBProfile; shared: Shared }) {
       <Decisions
         offer={offerForRow(r.status)}
         nameOf={(decision) => profileControlName(decision, r)}
-        onDecide={(decision) => shared.decide(ref, decision, words.pair)}
+        onDecide={(decision, control) => shared.decide(ref, decision, words.pair, control)}
         disabled={shared.disabled}
       />
-      <Refusal message={shared.errorOf(ref)} />
+      <Refusal message={shared.errorOf(ref)} focusRef={shared.refusalRef} />
     </li>
   )
 }
