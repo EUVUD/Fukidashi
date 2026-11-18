@@ -229,7 +229,7 @@ def test_the_write_is_planned_again_so_a_page_that_changed_since_the_preview_is_
 def test_the_write_normalises_the_new_rendering_as_the_kb_does(api, conn, world):
     client, _ = api
 
-    body = post(client, "entries", "write", world.entry, "  屏障　").json()
+    body = post(client, "entries", "write", world.entry, "  屏障\u3000").json()
 
     assert body["after"] == "屏障" and body["kb"]["entries"][0]["target_term"] == "屏障"
 
@@ -333,7 +333,7 @@ def test_a_row_that_is_not_readable_is_a_409_that_says_to_approve_it_first(api, 
 
 
 @pytest.mark.parametrize("route, what", ROUTES)
-@pytest.mark.parametrize("same", ["结界", " 结界 ", "结界　"])
+@pytest.mark.parametrize("same", ["结界", " 结界 ", "结界\u3000"])
 def test_a_rendering_equal_to_the_old_one_after_normalising_is_a_409(api, conn, world, route, what, same):
     client, _ = api
     old = {"entries": "结界", "profiles": "小雪"}[route]
@@ -403,11 +403,11 @@ BAD_BODIES = [
 BAD_RENDERINGS = [
     pytest.param("", id="empty"),
     pytest.param("   ", id="spaces"),
-    pytest.param("　", id="ideographic-space"),
+    pytest.param("\u3000", id="ideographic-space"),
     pytest.param("雪" * 61, id="too-long"),
     pytest.param("a\nb", id="newline"),
     pytest.param("a\tb", id="tab"),
-    pytest.param("a b", id="line-separator"),
+    pytest.param("a\u2028b", id="line-separator"),
     pytest.param("a\x00b", id="nul"),
 ]
 
