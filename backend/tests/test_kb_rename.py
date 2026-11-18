@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
+import time
 from datetime import datetime
 
 import pytest
@@ -717,6 +719,50 @@ def test_the_third_pages_failure_is_after_two_human_edits_were_written_in_the_sa
 
     assert seen == [(True, 0, "屏障"), (True, 1, "屏障"), (True, 2, "屏障")]  # the row was written, the edits came one by one
     assert entry_row(conn, world.entry)["target_term"] == "结界"  # and all of it is gone
+
+
+def test_two_renames_at_once_are_both_kept(conn, world, db_path, monkeypatch):
+    """Each rename reads the book and writes its Human edits in one transaction that takes the write lock first, so whichever
+    goes second reads what the first wrote: box 1 of page 1 holds both renderings, and the two Human edits chain. A pause after
+    each read makes them overlap: without the lock both would read the same base and one rename would be lost."""
+    base = page_run(conn, 1)
+    read = store.segments_with_translations
+
+    def slow_read(*args):
+        rows = read(*args)
+        time.sleep(0.05)
+        return rows
+
+    monkeypatch.setattr(store, "segments_with_translations", slow_read)
+    barrier = threading.Barrier(2)
+    errors, made = [], {}
+
+    def rename(label, call):
+        c = connect(db_path)
+        try:
+            barrier.wait(timeout=10)
+            made[label] = call(c)
+        except Exception as e:  # reported by the main thread
+            errors.append(e)
+        finally:
+            c.close()
+
+    threads = [
+        threading.Thread(target=rename, args=("entry", lambda c: rename_entry(c, world.kb, world.entry, "屏障"))),
+        threading.Thread(target=rename, args=("profile", lambda c: rename_profile(c, world.kb, world.profile, "雪乃"))),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert errors == []
+    assert displayed(conn, 1) == ["布下屏障！", "雪乃，到屏障外面去", "结界消失了"]  # both renamings are on box 1
+    first, second = sorted((next(r for r in result.runs if r.page_index == 1).run_id for result in made.values()))
+    assert attempts_of(conn, first)["base_run_id"] == base
+    assert attempts_of(conn, second)["base_run_id"] == first  # whichever went second read the first's Human edit
+    assert page_run(conn, 1) == second
+    assert entry_row(conn, world.entry)["target_term"] == "屏障" and profile_row(conn, world.profile)["name_tgt"] == "雪乃"
 
 
 @pytest.mark.parametrize("call", [
