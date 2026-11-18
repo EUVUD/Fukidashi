@@ -65,6 +65,28 @@ proposals and change none of the six above:
 What a person decided is recorded: a history line `{"event": "approved" | "rejected", "by": "human", "from": <previous
 status>}` (plus `proposal_id` when the decision came through a proposal), an entry's provenance `human`, and a proposal's
 reason that says a person decided it. A person's outcomes (`HUMAN_OUTCOMES`) are not `RESULTS`, which count what `apply` did.
+
+A person's renames (OUTLINE 8, "Rename → whole-book sync") are the last entry points. `preview_entry_rename` and
+`preview_profile_rename` say what renaming an entry's target term, or a profile's Chinese name, would do to the book, in one
+read-only view of the database; `rename_entry` and `rename_profile` do it, in one transaction that writes nothing when the
+rename is refused or fails partway. Which boxes follow is `kb.rename`'s rule (a box changes when its Japanese holds one of the
+item's keys and its displayed translation holds the old rendering). What is written, all or nothing:
+
+- the row's new rendering, one history line `{"event": "renamed", "by": "human", "from": <previous status>, "before": <old>,
+  "after": <new>}`, and the status `approved` (a rename of a row that waits for a person approves it, so the checks of an
+  approval apply, and a profile settles the new-name proposal it was made from, as deciding it does); an entry's provenance
+  becomes `human`;
+- for an entry, each term conflict in the Human Review Queue on the same source whose proposed rendering is now the entry's:
+  it goes through the term rules again as a person's approval, so it becomes a confirmation (the page joins the entry's
+  evidence, the proposal is `approved`). A conflict with another rendering, an undecided term and every character conflict
+  stay as they are;
+- one Human edit (a `human` Run) for each page with a changed box, based on that page's latest succeeded Run, with an
+  `attempts_json` of `{"config", "base_run_id", "edits": [{"idx", "before", "after"}], "rename": {"kind", "id", "kb_id",
+  "before", "after"}}`: `review_notes` reads its `edits` as the edited regions, and `rename` says why.
+
+A rename is refused, with nothing written, for a KB that is not an Editor KB (KBNotFound), an id the KB does not have
+(ItemNotFound), a rendering the KB would not store (InvalidRendering), a row that is not readable, a rendering equal to the
+row's, an approval's collision, and a book with a `running` Run (DecisionRefused): a `full` Run writes the KB when it ends.
 """
 
 from __future__ import annotations
@@ -76,6 +98,7 @@ from dataclasses import dataclass
 
 from .. import store
 from .entities import APPROVED, PENDING_HUMAN, TERM, KBNotFound, Proposal, proposal_id
+from .rename import Box, BoxChange, plan_boxes, rendering
 
 # Who made an entry: the Curator's rules from an agent's proposal, or a person (a decision of theirs, `decide_*`).
 AGENT = "agent"
@@ -398,11 +421,13 @@ def decide_profile(conn: sqlite3.Connection, kb_id: int, profile_id: int, *, app
         return _decide_profile(conn, profile, approve)
 
 
-def _require_editor_kb(conn: sqlite3.Connection, kb_id: int) -> None:
-    """A person decides in a book's Editor KB only: an eval run's KB is an eval artefact, and nothing here changes one."""
+def _require_editor_kb(conn: sqlite3.Connection, kb_id: int) -> sqlite3.Row:
+    """A person decides in a book's Editor KB only: an eval run's KB is an eval artefact, and nothing here changes one. The
+    KB's row, for a caller that wants its book."""
     kb = store.get_kb(conn, kb_id)
     if kb is None or kb["purpose"] != store.EDITOR:
         raise KBNotFound(f"no Editor KB has id {kb_id}")
+    return kb
 
 
 def _person_reason(approve: bool, earlier: str | None, as_profile: int | None = None) -> str:
@@ -506,3 +531,236 @@ def _refuse_profile_collision(conn: sqlite3.Connection, profile: sqlite3.Row) ->
     if (entry := store.find_entry(conn, profile["kb_id"], name)) is not None:
         raise DecisionRefused(f"profile {profile['id']} cannot be approved: {name} is the source of entry {entry['id']} "
                               f"({entry['target_term']}), a term")
+
+
+# --- a person's renames (OUTLINE 8, "Rename → whole-book sync") ---
+
+# What a rename renames (the `kind` of a plan and of the `rename` record a Human edit keeps).
+ENTRY = "entry"
+PROFILE = "profile"
+
+_RENAMED = "renamed"
+
+
+@dataclass(frozen=True)
+class RenamePlan:
+    """What renaming one row does, as the preview says it and as the write says it after it: the same plan, made the same
+    way. `changes` and `listed` are boxes of the book (`kb.rename`); `settles` are the ids of the proposals the write settles
+    together with the row, in the order they were queued."""
+
+    kind: str  # ENTRY or PROFILE
+    id: int  # the row's id
+    before: str  # the row's rendering now
+    after: str  # the new rendering, as the KB stores it
+    changes: tuple[BoxChange, ...]
+    listed: tuple[BoxChange, ...]
+    settles: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PageRun:
+    """The Human edit a rename wrote on one page."""
+
+    page_index: int
+    run_id: int
+
+
+@dataclass(frozen=True)
+class RenameResult:
+    plan: RenamePlan
+    runs: tuple[PageRun, ...]  # one for each page with a changed box, in page order
+
+
+@dataclass(frozen=True)
+class _Page:
+    """A page of the book as a rename reads it: the segments with the translation the page displays, and the Run that
+    shows it (None when the page has no succeeded Run), which is the base of a Human edit."""
+
+    page_id: int
+    page_index: int
+    run_id: int | None
+    rows: list[sqlite3.Row]  # `store.segments_with_translations`, by `idx`
+
+
+@dataclass(frozen=True)
+class _Prepared:
+    """A rename that passed every check, read in one view of the database: its plan, the row, the book's pages and the
+    proposals the write settles with it."""
+
+    plan: RenamePlan
+    row: sqlite3.Row
+    pages: list[_Page]
+    settling: list[sqlite3.Row]  # proposal rows
+
+
+def preview_entry_rename(conn: sqlite3.Connection, kb_id: int, entry_id: int, target: str) -> RenamePlan:
+    """What renaming entry `entry_id` of the Editor KB `kb_id` to `target` would do: which boxes of the book change, which
+    are only listed, and which proposals are settled. Reads one view of the database and writes nothing. Raises what
+    `rename_entry` raises. Must be called with no transaction open."""
+    with store.reading(conn):
+        return _prepare_entry(conn, kb_id, entry_id, target).plan
+
+
+def preview_profile_rename(conn: sqlite3.Connection, kb_id: int, profile_id: int, target: str) -> RenamePlan:
+    """`preview_entry_rename` for a profile: renaming its Chinese name (`name_tgt`) to `target`."""
+    with store.reading(conn):
+        return _prepare_profile(conn, kb_id, profile_id, target).plan
+
+
+def rename_entry(conn: sqlite3.Connection, kb_id: int, entry_id: int, target: str) -> RenameResult:
+    """A person renames entry `entry_id` of the Editor KB `kb_id`: its target term becomes `target`, as the book's boxes do
+    (`kb.rename`), in one transaction. The entry becomes `approved` with provenance `human` and a `renamed` history line; each
+    term conflict in the Human Review Queue on its source whose proposal has the new rendering is confirmed as a person's
+    approval; each page with a changed box gets a Human edit. Returns the plan and the Human edits' Runs.
+
+    Raises KBNotFound for a KB that is not an Editor KB, ItemNotFound for an entry the KB does not have, InvalidRendering for
+    a `target` the KB would not store (NFKC, trimmed, 1 to 60 characters, one line), and DecisionRefused for an entry that
+    is not readable (`approved` or `pending_human`: approve it first), a `target` equal to its rendering, an approval's
+    collision (for an entry that was `pending_human`) and a book with a `running` Run. In each case, and when any write
+    fails, nothing is written. Must be called with no transaction open."""
+    with store.transaction(conn):
+        prepared = _prepare_entry(conn, kb_id, entry_id, target)
+        plan, entry = prepared.plan, prepared.row
+        store.set_entry_rendering(conn, entry_id, target_term=plan.after, status=APPROVED, provenance=HUMAN,
+                                  event=_renamed(entry["status"], plan))
+        for conflict in prepared.settling:  # the entry holds the new rendering now, so each of these confirms it
+            _term(conn, _stored_proposal(conflict), conflict["run_id"], _APPROVAL, HUMAN)
+        return RenameResult(plan, _write_human_edits(conn, prepared))
+
+
+def rename_profile(conn: sqlite3.Connection, kb_id: int, profile_id: int, target: str) -> RenameResult:
+    """`rename_entry` for a profile: its Chinese name (`name_tgt`) becomes `target`, as the boxes whose Japanese holds its name
+    or one of its aliases do. The profile becomes `approved` with a `renamed` history line, and the new-name proposal it was
+    made from is settled with it while that waits in the Human Review Queue, as deciding the profile does. No conflict is
+    settled: a character conflict is rule 6's. Raises what `rename_entry` raises, for a profile."""
+    with store.transaction(conn):
+        prepared = _prepare_profile(conn, kb_id, profile_id, target)
+        plan, profile = prepared.plan, prepared.row
+        store.set_profile_rendering(conn, profile_id, name_tgt=plan.after, status=APPROVED,
+                                    event=_renamed(profile["status"], plan))
+        for queued in prepared.settling:
+            store.set_proposal_status(conn, queued["proposal_id"], status=APPROVED,
+                                      reason=_person_reason(True, queued["reason"], profile_id))
+        return RenameResult(plan, _write_human_edits(conn, prepared))
+
+
+def _prepare_entry(conn: sqlite3.Connection, kb_id: int, entry_id: int, target: str) -> _Prepared:
+    """Everything a rename of an entry needs, after every check. The preview and the write both start here, so they refuse
+    the same and plan the same."""
+    new = rendering(target)
+    kb = _require_editor_kb(conn, kb_id)
+    entry = store.get_entry(conn, kb_id, entry_id)
+    if entry is None:
+        raise ItemNotFound(f"no entry {entry_id} in the KB")
+    _refuse_rename(entry, f"entry {entry_id}", entry["target_term"], new)
+    if entry["status"] == PENDING_HUMAN:  # the rename approves it
+        _refuse_entry_collision(conn, entry)
+    _refuse_while_running(conn, kb["book_title"])
+    pages = _book_pages(conn, kb["book_title"])
+    boxes = plan_boxes(_boxes(pages), (entry["source_term"],), entry["target_term"], new)
+    agreeing = _agreeing_conflicts(conn, entry, new)
+    plan = RenamePlan(ENTRY, entry_id, entry["target_term"], new, boxes.changes, boxes.listed,
+                      tuple(row["proposal_id"] for row in agreeing))
+    return _Prepared(plan, entry, pages, agreeing)
+
+
+def _prepare_profile(conn: sqlite3.Connection, kb_id: int, profile_id: int, target: str) -> _Prepared:
+    new = rendering(target)
+    kb = _require_editor_kb(conn, kb_id)
+    profile = store.get_profile(conn, kb_id, profile_id)
+    if profile is None:
+        raise ItemNotFound(f"no profile {profile_id} in the KB")
+    _refuse_rename(profile, f"profile {profile_id}", profile["name_tgt"], new)
+    if profile["status"] == PENDING_HUMAN:  # the rename approves it
+        _refuse_profile_collision(conn, profile)
+    _refuse_while_running(conn, kb["book_title"])
+    pages = _book_pages(conn, kb["book_title"])
+    keys = (profile["name_src"], *json.loads(profile["aliases"]))
+    boxes = plan_boxes(_boxes(pages), keys, profile["name_tgt"], new)
+    waiting = _new_name_waiting(conn, profile)
+    plan = RenamePlan(PROFILE, profile_id, profile["name_tgt"], new, boxes.changes, boxes.listed,
+                      tuple(row["proposal_id"] for row in waiting))
+    return _Prepared(plan, profile, pages, waiting)
+
+
+def _refuse_rename(row: sqlite3.Row, label: str, rendering_now: str, new: str) -> None:
+    """Only a readable row is renamed (a `rejected` one is approved first: a rename would otherwise bring it back without
+    anyone deciding that), and only to another rendering."""
+    if row["status"] not in store.READABLE_STATUSES:
+        raise DecisionRefused(f"{label} is {row['status']}, so it cannot be renamed: approve it first")
+    if new == rendering_now:
+        raise DecisionRefused(f"{label} already has the rendering {new}: a rename needs another one")
+
+
+def _refuse_while_running(conn: sqlite3.Connection, book_title: str) -> None:
+    """A `full` Run writes the book's KB when it finishes, so a rename that read the KB before it and wrote after it could
+    meet half of what it wrote: nothing is renamed while any page of the book is running."""
+    running = store.running_pages(conn, book_title)
+    if running:
+        where = ", ".join(f"page {page} (Run {run_id})" for page, run_id in running)
+        raise DecisionRefused(f"a Run is still running on {where} of {book_title}, and a Run that finishes writes the KB: "
+                              f"rename after it ends")
+
+
+def _book_pages(conn: sqlite3.Connection, book_title: str) -> list[_Page]:
+    """Every page of the book, in page order, with the translations its latest succeeded Run displays."""
+    pages = []
+    for page_index in store.book_page_indexes(conn, book_title):
+        page = store.find_page(conn, book_title, page_index)
+        run = store.latest_succeeded_run(conn, page["id"])
+        run_id = None if run is None else run["id"]
+        pages.append(_Page(page["id"], page_index, run_id, store.segments_with_translations(conn, page["id"], run_id)))
+    return pages
+
+
+def _boxes(pages: list[_Page]) -> list[Box]:
+    return [Box(page.page_index, row["idx"], row["text_ja"], row["text_zh_hans"]) for page in pages for row in page.rows]
+
+
+def _agreeing_conflicts(conn: sqlite3.Connection, entry: sqlite3.Row, new: str) -> list[sqlite3.Row]:
+    """The term proposals in the Human Review Queue for the entry's source whose proposed rendering is `new`, in the order
+    they were queued: once the entry has `new`, none of them conflicts with it any more. A conflict with another rendering
+    is not one of them, and neither is a character conflict or an undecided term."""
+    agreeing = []
+    for row in store.kb_proposals(conn, entry["kb_id"], PENDING_HUMAN):
+        if row["kind"] != TERM:
+            continue
+        payload = json.loads(row["payload"])
+        if payload["source_term"] == entry["source_term"] and payload["target_term"] == new:
+            agreeing.append(row)
+    return agreeing
+
+
+def _new_name_waiting(conn: sqlite3.Connection, profile: sqlite3.Row) -> list[sqlite3.Row]:
+    """The proposal that made the profile (rule 4), as a list of at most one, while it still waits in the Human Review
+    Queue: renaming the profile settles it, as deciding the profile does."""
+    pid = made_from_proposal(profile)
+    queued = None if pid is None else store.get_proposal(conn, profile["kb_id"], pid)
+    return [queued] if queued is not None and queued["status"] == PENDING_HUMAN else []
+
+
+def _renamed(before: str, plan: RenamePlan) -> dict:
+    """The history line of a rename: that a person renamed the row, the two renderings, and the status it replaced."""
+    return {"event": _RENAMED, "by": HUMAN, "from": before, "before": plan.before, "after": plan.after}
+
+
+def _write_human_edits(conn: sqlite3.Connection, prepared: _Prepared) -> tuple[PageRun, ...]:
+    """One Human edit for each page with a changed box (as `runs.edit_translation` makes one for a box): a `human` Run
+    based on the page's latest succeeded Run, with that Run's Translations and the changed boxes replaced. Its record lists
+    every box it changed and names the rename. Writes no commit: the caller's transaction owns all-or-nothing."""
+    plan, kb_id = prepared.plan, prepared.row["kb_id"]
+    rename = {"kind": plan.kind, "id": plan.id, "kb_id": kb_id, "before": plan.before, "after": plan.after}
+    runs = []
+    for page in prepared.pages:
+        changes = [change for change in plan.changes if change.page_index == page.page_index]
+        if not changes:
+            continue
+        segment_ids = {row["idx"]: row["id"] for row in page.rows}
+        translations = {row["id"]: row["text_zh_hans"] for row in page.rows if row["text_zh_hans"] is not None}
+        for change in changes:
+            translations[segment_ids[change.idx]] = change.after
+        attempts = {"config": store.HUMAN, "base_run_id": page.run_id,
+                    "edits": [{"idx": c.idx, "before": c.before, "after": c.after} for c in changes], "rename": rename}
+        runs.append(PageRun(page.page_index, store.insert_human_run(
+            conn, page_id=page.page_id, attempts=attempts, translations=translations)))
+    return tuple(runs)
