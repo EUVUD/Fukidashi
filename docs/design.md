@@ -563,6 +563,7 @@ classDiagram
         offerForProposal()
         offerForRow()
         rivalsOf()
+        proposalLabel()
         describeOutcome()
         describeHistoryLine()
     }
