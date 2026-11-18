@@ -137,7 +137,7 @@ def test_boxes_come_in_page_order_and_then_by_idx_whatever_the_order_they_were_g
 
 
 def test_a_box_with_an_empty_japanese_text_is_skipped():
-    boxes = [box(1, 0, "", "结界"), box(1, 1, "   ", "结界"), box(1, 2, "　", "结界")]
+    boxes = [box(1, 0, "", "结界"), box(1, 1, "   ", "结界"), box(1, 2, "\u3000", "结界")]
 
     plan = plan_boxes(boxes, ("結界",), "结界", "屏障")
 
@@ -184,7 +184,7 @@ def test_the_plan_does_not_read_a_translation_that_the_japanese_does_not_point_t
 @pytest.mark.parametrize("text, stored", [
     ("屏障", "屏障"),
     ("  屏障  ", "屏障"),  # trimmed
-    ("　屏障　", "屏障"),  # an ideographic space is trimmed too
+    ("\u3000屏障\u3000", "屏障"),  # an ideographic space is trimmed too
     ("ＡＢＣ", "ABC"),  # NFKC
     ("ﾕｷ", "ユキ"),
     ("雪" * MAX_NAME_CHARS, "雪" * MAX_NAME_CHARS),  # the longest a name may be
@@ -195,19 +195,19 @@ def test_a_rendering_is_stored_nfkc_and_trimmed(text, stored):
 
 
 @pytest.mark.parametrize("text, why", [
-    ("", "at least 1"),
-    ("   ", "at least 1"),
-    ("　", "at least 1"),
-    ("雪" * (MAX_NAME_CHARS + 1), "at most 60"),
+    ("", "it is empty"),
+    ("   ", "it is empty"),
+    ("\u3000", "it is empty"),
+    ("雪" * (MAX_NAME_CHARS + 1), "it has 61 characters, and a name has at most 60"),
     ("a\nb", "one line"),
     ("a\tb", "one line"),
     ("a\rb", "one line"),
     ("a\x00b", "one line"),
-    ("a b", "one line"),
-    ("a b", "one line"),
-    (None, "valid string"),
-    (5, "valid string"),
-    (["屏障"], "valid string"),
+    ("a\u2028b", "one line"),
+    ("a\u2029b", "one line"),
+    (None, "expected text, not NoneType"),
+    (5, "expected text, not int"),
+    (["屏障"], "expected text, not list"),
 ], ids=["empty", "spaces", "ideographic-space", "too-long", "newline", "tab", "carriage-return", "nul", "line-separator",
         "paragraph-separator", "null", "number", "list"])
 def test_a_rendering_the_kb_would_not_store_is_refused_with_the_reason(text, why):
@@ -222,7 +222,7 @@ def test_the_rules_are_the_ones_a_proposal_goes_through():
     """`rendering` is `entities.Name`, so whatever a term or a name may be, a rendering may be, and nothing else."""
     from fukidashi.kb.entities import make_proposal
 
-    for text in ("屏障", "  屏障 ", "ＡＢＣ", "雪" * 60, "", "a\nb", "雪" * 61, "a b"):
+    for text in ("屏障", "  屏障 ", "ＡＢＣ", "雪" * 60, "", "a\nb", "雪" * 61, "a\u2028b"):
         try:
             stored = rendering(text)
         except InvalidRendering:

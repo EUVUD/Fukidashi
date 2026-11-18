@@ -25,7 +25,7 @@ from dataclasses import dataclass
 
 from pydantic import TypeAdapter, ValidationError
 
-from .entities import Name, normalise
+from .entities import MAX_NAME_CHARS, Name, normalise
 
 
 class InvalidRendering(ValueError):
@@ -38,12 +38,23 @@ _RENDERING = TypeAdapter(Name)
 def rendering(text: object) -> str:
     """`text` as the KB stores a rendering: NFKC, trimmed, 1 to 60 characters, one line (no newline, tab or other control
     character), which is what a term's target and a character's name have to be. Raises `InvalidRendering`, with the
-    reason, for anything else, a value that is not text included."""
+    reason, for anything else, a value that is not text included. `Name` decides; the reason is worded here, because its own
+    messages ("Value should have at least 1 item after validation") are for a payload's field, not for a person's input."""
     try:
         return _RENDERING.validate_python(text)
     except ValidationError as exc:
-        problems = "; ".join(e["msg"].removeprefix("Value error, ") for e in exc.errors())
-        raise InvalidRendering(f"invalid new rendering: {problems}") from None
+        raise InvalidRendering(f"invalid new rendering: {_why(text, exc)}") from None
+
+
+def _why(text: object, exc: ValidationError) -> str:
+    if not isinstance(text, str):
+        return f"expected text, not {type(text).__name__}"
+    length = len(normalise(text))
+    if length == 0:
+        return "it is empty (or only spaces)"
+    if length > MAX_NAME_CHARS:
+        return f"it has {length} characters, and a name has at most {MAX_NAME_CHARS}"
+    return "; ".join(e["msg"].removeprefix("Value error, ") for e in exc.errors())  # a control character: `Name` says which
 
 
 @dataclass(frozen=True)

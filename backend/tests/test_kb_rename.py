@@ -180,7 +180,7 @@ def test_a_preview_takes_no_write_lock_so_it_never_waits_for_a_writer(conn, worl
 
 
 def test_the_preview_normalises_the_new_rendering_as_the_kb_does(conn, world):
-    plan = preview_entry_rename(conn, world.kb, world.entry, "  屏障　")
+    plan = preview_entry_rename(conn, world.kb, world.entry, "  屏障\u3000")
 
     assert plan.after == "屏障" and boxes(plan.changes) == ENTRY_CHANGES
 
@@ -550,7 +550,7 @@ def test_a_row_a_person_rejected_is_renamed_only_after_it_is_approved_again(conn
 
 
 @pytest.mark.parametrize("call, row, same", [
-    (preview_entry_rename, "entry", "结界"), (rename_entry, "entry", "结界"), (rename_entry, "entry", "  结界　"),
+    (preview_entry_rename, "entry", "结界"), (rename_entry, "entry", "结界"), (rename_entry, "entry", "  结界\u3000"),
     (preview_profile_rename, "profile", "小雪"), (rename_profile, "profile", "小雪"), (rename_profile, "profile", " 小雪 "),
 ], ids=["entry-preview", "entry-write", "entry-write-trimmed", "profile-preview", "profile-write", "profile-write-trimmed"])
 def test_a_rendering_equal_to_the_old_one_after_normalising_is_refused(conn, world, call, row, same):
@@ -602,7 +602,7 @@ def test_running_pages_lists_each_page_with_its_latest_running_run_in_page_order
 @pytest.mark.parametrize("call, row", [
     (preview_entry_rename, "entry"), (rename_entry, "entry"), (preview_profile_rename, "profile"), (rename_profile, "profile")])
 @pytest.mark.parametrize("target, why", [
-    ("", "at least 1"), ("   ", "at least 1"), ("雪" * 61, "at most 60"), ("a\nb", "one line"), ("a\tb", "one line"),
+    ("", "it is empty"), ("   ", "it is empty"), ("雪" * 61, "it has 61 characters"), ("a\nb", "one line"), ("a\tb", "one line"),
 ], ids=["empty", "spaces", "too-long", "newline", "tab"])
 def test_a_rendering_the_kb_would_not_store_is_refused_and_nothing_is_written(conn, world, call, row, target, why):
     before = snapshot(conn)
