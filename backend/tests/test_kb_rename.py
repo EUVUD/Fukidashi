@@ -18,6 +18,7 @@ from rename_support import (
 
 from fukidashi import runs, store
 from fukidashi.datasets.importer import import_openmantra
+from fukidashi.db import connect
 from fukidashi.kb import KBNotFound
 from fukidashi.kb.curator import (
     ENTRY, HUMAN_OUTCOMES, PROFILE, RESULTS, DecisionRefused, ItemNotFound, PageRun, RenamePlan, apply, decide_entry,
@@ -159,6 +160,23 @@ def test_a_preview_writes_nothing(conn, world, preview, row, target):
     assert snapshot(conn) == before  # no row of the KB, no Run, no Translation, no event
     assert not conn.in_transaction  # and the view it read in is over
     assert displayed(conn, 1) == ["布下结界！", "小雪，到结界外面去", "结界消失了"]
+
+
+@pytest.mark.parametrize("preview, row, target", [
+    (preview_entry_rename, "entry", "屏障"), (preview_profile_rename, "profile", "雪乃"),
+], ids=["entry", "profile"])
+def test_a_preview_takes_no_write_lock_so_it_never_waits_for_a_writer(conn, world, db_path, preview, row, target):
+    """Another connection is in the middle of a write (a `full` Run's finalize, say): the preview reads one view of the
+    database beside it, as a reader does in WAL mode. A preview that took the write lock would wait for the writer and fail."""
+    writer = connect(db_path)
+    writer.execute("BEGIN IMMEDIATE")
+    try:
+        plan = preview(conn, world.kb, getattr(world, row), target)
+    finally:
+        writer.rollback()
+        writer.close()
+
+    assert plan.changes
 
 
 def test_the_preview_normalises_the_new_rendering_as_the_kb_does(conn, world):
