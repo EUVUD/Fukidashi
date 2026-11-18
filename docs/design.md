@@ -267,6 +267,10 @@ classDiagram
         decide_kb_proposal()
         decide_kb_entry()
         decide_kb_profile()
+        preview_entry_rename()
+        rename_kb_entry()
+        preview_profile_rename()
+        rename_kb_profile()
     }
     class BackgroundRuns:::service {
         start()
@@ -390,6 +394,14 @@ classDiagram
         decide_entry()
         decide_profile()
         HUMAN_OUTCOMES
+        preview_entry_rename()
+        rename_entry()
+        preview_profile_rename()
+        rename_profile()
+    }
+    class RenamePlanner:::kb {
+        plan_boxes()
+        rendering()
     }
     class Page:::data
     class Segment:::data
@@ -426,7 +438,7 @@ classDiagram
     PagesRouter ..> BackgroundRuns : translate
     BackgroundRuns ..> Runs : translate_page, store_events
     RunsRouter ..> Store : run events
-    KBRouter ..> CuratorRules : a person's decisions
+    KBRouter ..> CuratorRules : a person's decisions, renames
     KBRouter ..> Store : reads, in one snapshot
     PagesRouter ..> Store : reads
     EvalHarness ..> Runs : validate, translate
@@ -466,6 +478,7 @@ classDiagram
     KBLoader ..> Store : reads
     KBLoader ..> KBSnapshot : builds
     CuratorRules ..> Store : KB writes, one transaction
+    CuratorRules ..> RenamePlanner : which boxes a rename changes
     Runs ..> Page : builds
     Baseline ..> Page : reads
     Baseline ..> LLMClient : chat
@@ -508,8 +521,8 @@ classDiagram
 - `AgentLoop` (`agents/loop.py`) is LangChain's `create_agent` with `LLMClientChatModel` as its model, so every agent call goes through `LLMClient` and is metered once; nothing in the loop retries. Its guardrails are the Step limit (`ModelCallLimitMiddleware`), a check that a reply ending for any reason other than `stop` or `tool_calls` is never an answer, and a tool guard that validates arguments against the `Tool`'s pydantic model, passes the model's mistakes back as the tool's result and does not run a duplicate call again. LangChain stays inside `agents/`: callers get an `AgentResult` of plain values with one step per model call. The Translator Agent is its one caller in the code (`scripts/m2_tool_smoke.py` is the other).
 - `Translator` (`agents/translator.py`) is the `translator` config: it gives `AgentLoop` the page (the same user message as `Baseline`) and `get_previous_context`, whose data `Runs` reads from `Store` before the run, so the tool touches no database in LangGraph's worker threads. It checks the answer with `parse_translations`, repairs it once, and otherwise falls back to `Baseline` with a budget of its own; after a provider error or a spent budget it sends nothing more. The Run's `attempts_json` holds the agent's steps, the repair and the fallback, and `EvalHarness` reports the pages that fell back.
 - `Orchestrator` (`orchestrator/flow.py`) runs `full_no_kb` and `full` as plain code: the flagging `Translator`, then `Reviewer` in a fresh conversation, then at most 2 Send-backs. It imports neither LangChain nor the database and returns an `OrchestratorResult` of plain values. With a `KBSnapshot` it makes the page's one `ProposalCollector`, gives the agents their KB tools through `KBTools`, and returns the page's proposals.
-- **Least privilege for the KB.** `Translator` and `Reviewer` get a `KBSnapshot` (immutable, no connection) and, for the Translator, a `ProposalCollector`. `KBLoader` and `CuratorRules` are the only KB modules that use `Store`, and a test checks that loading the agents or the Orchestrator never loads the database module. `CuratorRules` is the only caller of the store's KB write functions, which another test checks: `apply` at finalize, and since #82 a person's decisions.
-- `KBRouter` (`api/kb.py`, #82) reads a book's Editor KB and takes a person's decisions on it. Its GET reads the entries, the profiles and both queues inside `Store.reading`, one read-only snapshot, so the lists agree while a `full` Run writes, and it never makes a KB. Its decisions go to `CuratorRules.decide_proposal`, `decide_entry` and `decide_profile`, each one transaction that writes nothing when it is refused. They decide only in an Editor KB, and an approved undecided term goes through the same term rules as `apply`. The router has no SQL and calls no write function, and no model is called.
+- **Least privilege for the KB.** `Translator` and `Reviewer` get a `KBSnapshot` (immutable, no connection) and, for the Translator, a `ProposalCollector`. `KBLoader` and `CuratorRules` are the only KB modules that use `Store`, and a test checks that loading the agents or the Orchestrator never loads the database module. `CuratorRules` is the only caller of the store's KB write functions, which another test checks: `apply` at finalize, since #82 a person's decisions, and since #88 renames.
+- `KBRouter` (`api/kb.py`, #82) reads a book's Editor KB and takes a person's decisions on it. Its GET reads the entries, the profiles and both queues inside `Store.reading`, one read-only snapshot, so the lists agree while a `full` Run writes, and it never makes a KB. Its decisions go to `CuratorRules.decide_proposal`, `decide_entry` and `decide_profile`, each one transaction that writes nothing when it is refused. They decide only in an Editor KB, and an approved undecided term goes through the same term rules as `apply`. Since #88 it also takes renames, each with a preview: the preview reads one view and takes no write lock, and the write is one transaction in `CuratorRules` that writes the row, settles what the rename settles and adds one Human edit per page it changes, with the boxes chosen by the pure `RenamePlanner` (`kb/rename.py`). The router has no SQL and calls no write function, and no model is called.
 - **Finalize** (`full` only) is in `Runs`, after a successful page: `Curator` (one call on the Run's client, no tools; it judges the page's term proposals), then `CuratorRules.apply`, then `Store.finish_run`. `EvalHarness` makes one KB per `full` eval run and passes it to every page in order.
 
 ### 4.2 Frontend
@@ -646,6 +659,7 @@ classDiagram
 | Flag, Verdict / Issue | none (inside a `full_no_kb` or `full` Run's `attempts_json`) | `TranslatorResult.flags`, `ReviewResult`; read back by `review_notes.build_review` | `PageReview` (`ReviewFlag`, `ReviewIssue`) / `PageReview` |
 | Curator decision, proposal outcome | `proposals.status` and reason; also a `full` Run's `attempts_json` (`finalize`) | `CuratorResult.decisions`; `curator.Outcome` (one of 9 results) | none yet |
 | A person's KB decision | the item's `status` and a history line with `"by": "human"`; an entry's `provenance`; the proposal's `status` and reason | `curator.decide_proposal` / `decide_entry` / `decide_profile`, answering one of `HUMAN_OUTCOMES` | `ProposalDecisionOut.outcome` / `ProposalDecision.outcome`, worded by `kbView.describeOutcome` |
+| A rename | the row's new rendering, status and a `renamed` history line; the settled proposals; one Human edit (a Run of config `human` whose `attempts_json` carries `rename`) per page that changes | `kb.rename.plan_boxes` (`BoxPlan`), `curator.preview_entry_rename` / `rename_entry` and their profile twins (`RenamePlan`, `RenameResult`) | `RenamePreview`, `RenameOut` (#88); none yet in the frontend (task 047) |
 
 ### 4.4 Where later milestones plug in
 
@@ -659,5 +673,5 @@ classDiagram
   - `Runs.translate_page` takes an optional event sink, which the Orchestrator, the agents and `AgentLoop` call (built, #70: `live_trace.py` holds the contract, `Runs.store_events` stores the events through `Store.add_run_event`).
   - The API runs pages in the background and streams their Live trace events over SSE from the `run_events` table (built, #72: `BackgroundRuns` in `background.py`, the stream in `api/runs.py`).
   - A human edit is a Run of config `human`, written by `Runs.edit_translation` through `Store.insert_human_run` (built, #68).
-  - A person's KB decisions go through `kb/curator.py` (built, #82: `decide_proposal`, `decide_entry` and `decide_profile`, reached through `KBRouter` in `api/kb.py`). The KB panel calls them (built, #84: `KBPanel`, which `App` mounts per book, with what it offers and says decided in the pure module `kbView`; it loads the KB again when `PageView` reports that a Run it followed has ended).
+  - A person's KB decisions go through `kb/curator.py` (built, #82: `decide_proposal`, `decide_entry` and `decide_profile`, reached through `KBRouter` in `api/kb.py`). The KB panel calls them (built, #84: `KBPanel`, which `App` mounts per book, with what it offers and says decided in the pure module `kbView`; it loads the KB again when `PageView` reports that a Run it followed has ended). A rename goes through `kb/curator.py` too (backend built, #88: `preview_entry_rename`, `rename_entry` and their profile twins, with `kb/rename.py` choosing the boxes, reached through `KBRouter`); the panel's Rename control is task 047.
   - The frontend adds a canvas to `PageView` (built, #77: `TypesetLayer`, a Konva stage loaded lazily, draws what the pure module `typeset` lays out with the measure of `canvasText`; `BookTypesetting`, which `App` keys by book, measures a whole book) and editing (built: `TranslationEditor`, #68). SSE adds an event subscription to the `api` module (built, #72: `watchRun`) and a panel that shows the events (built, #74: `TracePanel`, with what it shows decided in the pure module `liveTrace`). `PageView` shows the Flags and Issues of the Run behind the displayed translation (built, #79: `PageDetail.review` from `ReviewNotes`; the words and the grouping by region in the pure module `reviewNotes`, placed by `PageNotes`).
