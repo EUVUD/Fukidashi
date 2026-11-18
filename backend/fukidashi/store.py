@@ -72,6 +72,14 @@ def running_run_id(conn: sqlite3.Connection, page_id: int) -> int | None:
     return None if row is None else row["id"]
 
 
+def running_pages(conn: sqlite3.Connection, book_title: str) -> list[tuple[int, int]]:
+    """The pages of the book that have a `running` Run, as (page index, id of that page's latest `running` Run), in page
+    order. Empty when no Run of the book is running (or the book is unknown)."""
+    return [(r["page_index"], r["run_id"]) for r in conn.execute(
+        """SELECT p.page_index, MAX(r.id) AS run_id FROM runs r JOIN pages p ON p.id = r.page_id
+           WHERE p.book_title = ? AND r.status = 'running' GROUP BY p.id ORDER BY p.page_index""", (book_title,))]
+
+
 def fail_stale_runs(conn: sqlite3.Connection, error: str) -> int:
     """Mark every Run that is `running` as `failed`, with `error` and `finished_at` set; returns how many. For the API's
     start: a Run is only `running` between `start_run` and `finish_run`, so one found at start belongs to a process that
@@ -183,6 +191,7 @@ def run_events(conn: sqlite3.Connection, run_id: int, after_seq: int = 0) -> lis
 KB_WRITES = (
     "insert_proposal", "set_proposal_status", "insert_entry", "insert_profile",
     "add_entry_evidence", "add_profile_evidence", "add_profile_aliases", "set_entry_status", "set_profile_status",
+    "set_entry_rendering", "set_profile_rendering",
 )
 
 # The states a lookup or a KB snippet may return (OUTLINE 3.3): 'proposed' and 'rejected' are not shown.
@@ -411,6 +420,29 @@ def set_profile_status(conn: sqlite3.Connection, profile_id: int, *, status: str
     conn.execute(
         "UPDATE character_profiles SET status = ?, history = ?, updated_at = ? WHERE id = ?",
         (status, _history_with(conn, "character_profiles", profile_id, now, event), now, profile_id),
+    )
+
+
+def set_entry_rendering(
+    conn: sqlite3.Connection, entry_id: int, *, target_term: str, status: str, provenance: str, event: dict,
+) -> None:
+    """A person's rename of an entry: its new rendering, status and provenance, and `event` as the last line of its history.
+    The evidence stays as it is."""
+    now = _now()
+    conn.execute(
+        "UPDATE glossary_entries SET target_term = ?, status = ?, provenance = ?, history = ?, updated_at = ? WHERE id = ?",
+        (target_term, status, provenance, _history_with(conn, "glossary_entries", entry_id, now, event), now, entry_id),
+    )
+
+
+def set_profile_rendering(conn: sqlite3.Connection, profile_id: int, *, name_tgt: str, status: str, event: dict) -> None:
+    """A person's rename of a profile: its new Chinese name and status, and `event` as the last line of its history (the
+    `by` of its lines says who decided: a profile has no provenance column). Its Japanese name, aliases, notes and evidence
+    stay as they are."""
+    now = _now()
+    conn.execute(
+        "UPDATE character_profiles SET name_tgt = ?, status = ?, history = ?, updated_at = ? WHERE id = ?",
+        (name_tgt, status, _history_with(conn, "character_profiles", profile_id, now, event), now, profile_id),
     )
 
 
