@@ -24,6 +24,7 @@ import {
   plain,
   profileControlName,
   proposalControlName,
+  proposalLabel,
   proposalName,
   proposalWords,
   provenanceLabel,
@@ -217,6 +218,24 @@ describe('the words for a payload', () => {
     expect(proposalName(p)).toBe('魔法 → 魔法, proposed on page 18')
   })
 
+  it('names a proposal in a sentence by its pair and its page, the pair keeping its languages', () => {
+    const p = termProposal('u1', '封印', '封缄', { page_index: 19 })
+    expect(plain(proposalLabel(p))).toBe('封印 → 封缄 (proposed on page 19)')
+    expect(proposalLabel(p).slice(0, 3)).toEqual(proposalWords(p))
+    expect(proposalLabel(p)).toContainEqual({ text: '封印', lang: 'ja' })
+    expect(proposalLabel(p)).toContainEqual({ text: '封缄', lang: 'zh-Hans' })
+  })
+
+  it('names a character the same way', () => {
+    const p = nameProposal('n1', 'ユキ', '小雪', { page_index: 20 })
+    expect(plain(proposalLabel(p))).toBe('ユキ → 小雪 (proposed on page 20)')
+  })
+
+  it('tells two proposals of one pair apart by their pages', () => {
+    const [a, b] = [19, 17].map((page_index) => termProposal(`p${page_index}`, '封印', '封缄', { page_index }))
+    expect(plain(proposalLabel(a))).not.toBe(plain(proposalLabel(b)))
+  })
+
   it('gives a reason as it is, and words the lack of one', () => {
     expect(reasonText(termProposal('u1', '魔法', '魔法', { reason: 'conflicts with entry 40, which is 封印' }))).toBe('conflicts with entry 40, which is 封印')
     expect(reasonText(termProposal('u1', '魔法', '魔法'))).toBe('None yet.')
@@ -376,8 +395,9 @@ describe('the rows a conflict collides with', () => {
     expect(plain(describeRival(rivals[0]))).toBe('The KB holds 封印 → 封印 (entry 40, approved)')
   })
 
-  it('does not take a character\'s alias for a collision with a name: only a term meets an alias', () => {
-    expect(rivalsOf(waiting(nameProposal('c6', 'ゆき', '雪'), 'conflict'), kb)).toEqual([])
+  it('looks only for the same name: an alias, or a name that contains one, finds nothing (rule 6 matches those, on the server)', () => {
+    expect(rivalsOf(waiting(nameProposal('c6', 'ゆき', '雪'), 'conflict'), kb)).toEqual([]) // an alias of profile 38
+    expect(rivalsOf(waiting(nameProposal('c6b', 'ユキちゃん', '雪酱'), 'conflict'), kb)).toEqual([]) // contains the name of profile 38
   })
 
   it('finds a row that waits for a person: it is readable too, and the line says so', () => {
@@ -404,11 +424,12 @@ describe('the rows a conflict collides with', () => {
     expect(rivalsOf(waiting(termProposal('r6', '王都', '王城'), 'conflict'), kb)).toEqual([]) // entry 43 is `proposed`
   })
 
-  it('finds nothing when the KB has changed since: no row at all, and says so', () => {
+  it('finds nothing when no row has the source or name: no row at all, and says only that, not why', () => {
     expect(rivalsOf(waiting(termProposal('n1', '呪文', '咒语'), 'conflict'), kb)).toEqual([])
     expect(rivalsOf(waiting(termProposal('n1', '封印', '封缄'), 'conflict'), kbOf())).toEqual([])
-    expect(NO_RIVAL).toMatch(/^No readable entry or profile/)
-    expect(NO_RIVAL).toMatch(/changed since/)
+    expect(NO_RIVAL).toMatch(/^No readable entry or profile with this source or name was found\./)
+    expect(NO_RIVAL).toMatch(/reason says what it collided with/)
+    expect(NO_RIVAL).not.toMatch(/chang/) // rule 6 can make a conflict that no row of the same name explains: nothing changed
   })
 
   it('has rivals for a conflict only: not for a new name, whose own profile is readable, nor for an undecided term', () => {
@@ -435,21 +456,42 @@ describe('the rows a conflict collides with', () => {
 // ---- The outcome of a decision ----------------------------------------------------------------------------------------------
 
 describe('the outcome of a decision', () => {
-  const label = proposalWords(termProposal('u1', '魔法', '魔法'))
+  const proposal = termProposal('u1', '魔法', '魔法', { page_index: 18 })
+  const label = proposalLabel(proposal)
   const say = (outcome: string) => plain(describeOutcome(outcome, label))
   const APPROVED = ['entry_created', 'entry_confirmed', 'profile_approved']
   const NOT_APPROVED = ['held_as_conflict', 'held_as_conflict_across_kinds', 'proposal_rejected', 'profile_rejected']
+  const SEVEN = [...APPROVED, ...NOT_APPROVED]
 
   it('words an undecided term that was approved as a new entry', () => {
-    expect(say('entry_created')).toBe('魔法 → 魔法 was approved by a person and added as a new entry.')
+    expect(say('entry_created')).toBe('魔法 → 魔法 (proposed on page 18) was approved by a person and added as a new entry.')
   })
 
   it('words one that confirmed the entry the KB already holds', () => {
-    expect(say('entry_confirmed')).toBe('魔法 → 魔法 was approved by a person. It confirms an entry the KB already holds.')
+    expect(say('entry_confirmed')).toBe(
+      '魔法 → 魔法 (proposed on page 18) was approved by a person. It confirms an entry the KB already holds.',
+    )
   })
 
   it('words a new name that was approved', () => {
-    expect(say('profile_approved')).toBe('魔法 → 魔法 was approved by a person. The new name is now an approved profile.')
+    expect(say('profile_approved')).toBe(
+      '魔法 → 魔法 (proposed on page 18) was approved by a person. The new name is now an approved profile.',
+    )
+  })
+
+  it('names the page the proposal was made on, in each of the seven outcomes and in one it does not know', () => {
+    for (const outcome of [...SEVEN, 'a_future_outcome']) expect(say(outcome), outcome).toContain('proposed on page 18')
+  })
+
+  it('reads differently for two proposals of one pair made on different pages, in each outcome', () => {
+    const later = proposalLabel(termProposal('c1', '封印', '封缄', { page_index: 19 }))
+    const earlier = proposalLabel(termProposal('u2', '封印', '封缄', { page_index: 17 }))
+    for (const outcome of [...SEVEN, 'a_future_outcome']) {
+      const [a, b] = [later, earlier].map((words) => plain(describeOutcome(outcome, words)))
+      expect(a, outcome).toContain('page 19')
+      expect(b, outcome).toContain('page 17')
+      expect(a, outcome).not.toBe(b)
+    }
   })
 
   it('words only entry_created, entry_confirmed and profile_approved as approved', () => {
@@ -470,12 +512,14 @@ describe('the outcome of a decision', () => {
   })
 
   it('words the two rejections', () => {
-    expect(say('proposal_rejected')).toBe('魔法 → 魔法 was rejected by a person.')
-    expect(say('profile_rejected')).toBe('魔法 → 魔法 was rejected by a person. The new name is a rejected profile.')
+    expect(say('proposal_rejected')).toBe('魔法 → 魔法 (proposed on page 18) was rejected by a person.')
+    expect(say('profile_rejected')).toBe(
+      '魔法 → 魔法 (proposed on page 18) was rejected by a person. The new name is a rejected profile.',
+    )
   })
 
   it('gives each of the seven outcomes its own words', () => {
-    expect(new Set([...APPROVED, ...NOT_APPROVED].map(say)).size).toBe(7)
+    expect(new Set(SEVEN.map(say)).size).toBe(7)
   })
 
   it('shows an outcome it does not know as it is, and does not word it as approved', () => {
@@ -483,13 +527,16 @@ describe('the outcome of a decision', () => {
     expect(words).toContain('a_future_outcome')
     expect(words).not.toMatch(/approv/i)
     // `entry_approved` is the entries route's outcome, which the proposals route never sends: it is shown as it is, not worded
-    expect(say('entry_approved')).toBe('魔法 → 魔法: the server answered "entry_approved".')
+    expect(say('entry_approved')).toBe('魔法 → 魔法 (proposed on page 18): the server answered "entry_approved".')
     expect(say('entry_approved')).not.toMatch(/was approved/)
   })
 
   it('keeps the proposal in the words as it came, with its languages marked', () => {
-    expect(describeOutcome('entry_created', label).slice(0, 3)).toEqual(label)
-    expect(describeOutcome('entry_created', label)).toContainEqual({ text: '魔法', lang: 'ja' })
+    for (const outcome of [...SEVEN, 'a_future_outcome']) {
+      expect(describeOutcome(outcome, label).slice(0, label.length), outcome).toEqual(label)
+      expect(describeOutcome(outcome, label), outcome).toContainEqual({ text: '魔法', lang: 'ja' })
+      expect(describeOutcome(outcome, label), outcome).toContainEqual({ text: '魔法', lang: 'zh-Hans' })
+    }
   })
 
   it('words an entry or a profile that was decided, which the routes answer with no outcome', () => {

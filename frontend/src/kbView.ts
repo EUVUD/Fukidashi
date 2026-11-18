@@ -122,6 +122,11 @@ export const proposalWords = (p: KBProposal): Words => describePayload(p.kind, p
 /** `proposalWords` as one string, with the page: what names a proposal's controls. */
 export const proposalName = (p: KBProposal): string => `${plain(proposalWords(p))}, proposed on page ${p.page_index}`
 
+/** `proposalWords` with the page, still as words: what names a proposal in a sentence, `封印 → 封缄 (proposed on page 19)`. Two
+ *  proposals can have one pair on different pages, and a decision's announcement must not read alike for both. The pair keeps its
+ *  languages. */
+export const proposalLabel = (p: KBProposal): Words => [...proposalWords(p), ` (proposed on page ${p.page_index})`]
+
 /** The proposal's reason, or the words for there being none: the Proposal Queue's terms have none while undecided. */
 export const reasonText = (p: KBProposal): string => p.reason ?? 'None yet.'
 
@@ -241,16 +246,19 @@ export function describeRival(r: Rival): Words {
   ]
 }
 
-/** What a conflict says when no readable row collides with it now. */
+/** What a conflict says when no readable row has its source or name. It says only what the panel knows: `rivalsOf` looks for the
+ *  same source or name, and the server's rules reach further (a character is matched by containment and by a shared alias), so the
+ *  row it collided with may be one this panel does not look for. The reason says what it was. */
 export const NO_RIVAL =
-  'No readable entry or profile collides with it now: the KB may have changed since it was proposed. Its reason says what it collided with.'
+  'No readable entry or profile with this source or name was found. Its reason says what it collided with.'
 
 // ---- The outcome of a decision ---------------------------------------------------------------------------------------------
 
-/** What a person's decision on a proposal did, in words (`label`: the proposal as `proposalWords` has it). The proposals route
- *  sends seven outcomes. Only `entry_created`, `entry_confirmed` and `profile_approved` are worded as approved: when the
- *  rules hold an approved proposal back (`held_as_conflict`, `held_as_conflict_across_kinds`) nothing was added and it waits
- *  for a person again. An outcome this panel does not know is shown as it is, and is not worded as approved either. */
+/** What a person's decision on a proposal did, in words (`label`: the proposal as `proposalLabel` has it, with its page). The
+ *  proposals route sends seven outcomes. Only `entry_created`, `entry_confirmed` and `profile_approved` are worded as
+ *  approved: when the rules hold an approved proposal back (`held_as_conflict`, `held_as_conflict_across_kinds`) nothing was
+ *  added and it waits for a person again. An outcome this panel does not know is shown as it is, and is not worded as approved
+ *  either. */
 export function describeOutcome(outcome: string, label: Words): Words {
   switch (outcome) {
     case 'entry_created':
