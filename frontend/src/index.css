@@ -270,3 +270,21 @@ button.link-button { padding: 0; background: none; color: var(--accent); font-si
 .kb-panel .kb-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; margin-top: 8px; }
 .kb-panel .kb-note { min-width: 0; font-size: 12px; overflow-wrap: anywhere; }
 .kb-panel .kb-refusal { margin-top: 8px; }
+/* A rename (KBPanel.tsx, renameView.ts; OUTLINE §0, Rename; SCOPE.md #6): the card sits under the row's buttons, with the form, then
+   the preview once it has answered. The preview takes focus when it arrives, so it shows the ring a focused box of the page does. The
+   boxes the last rename left to check by hand stay under the row (`.kb-left`), dashed like what waits for a person. */
+.kb-panel .kb-rename { margin-top: 8px; padding: 8px 10px; background: var(--panel); border: 1px solid var(--border); border-left: 4px solid var(--accent); border-radius: 6px; }
+.kb-panel .kb-rename form { margin: 0; }
+.kb-panel .kb-field { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+.kb-panel .kb-field input { flex: 1 1 14em; min-width: 0; padding: 4px 8px; font: inherit; font-size: 15px; color: var(--text); background: var(--bg); border: 1px solid var(--accent); border-radius: 6px; }
+.kb-panel .kb-field input:disabled { opacity: 0.6; }
+.kb-panel .kb-field input:focus-visible, .kb-panel .kb-preview:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.kb-panel .kb-preview { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border); }
+.kb-panel .kb-preview h4 { margin: 0; font-size: 14px; overflow-wrap: anywhere; }
+.kb-panel .kb-boxes { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.kb-panel .kb-boxes ul { list-style: none; margin: 4px 0 0; padding: 0 0 0 10px; border-left: 2px solid var(--border); display: flex; flex-direction: column; gap: 6px; }
+.kb-panel .kb-boxes li { min-width: 0; overflow-wrap: anywhere; }
+.kb-panel .kb-boxes p { margin: 2px 0 0; }
+.kb-panel .kb-settles { margin: 4px 0 0; padding-left: 22px; }
+.kb-panel .kb-settles li { margin-top: 2px; overflow-wrap: anywhere; }
+.kb-panel .kb-left { margin-top: 8px; padding: 2px 0 2px 8px; border-left: 3px dashed var(--flag); }

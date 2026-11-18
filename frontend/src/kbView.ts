@@ -1,6 +1,7 @@
 // What a book's Editor KB says in words, and what a person may do with each row: the summary line, the words for a proposal,
-// the decisions offered, the rows a conflict collides with, the outcome of a decision and the lines of a row's history
-// (OUTLINE §0, Proposal Queue, Human Review Queue and Editor KB; §8, "A person's decisions on KB items"). Pure logic with no
+// the decisions and renames offered, the rows a conflict collides with, the outcome of a decision and the lines of a row's
+// history (OUTLINE §0, Proposal Queue, Human Review Queue, Editor KB and Rename; §8, "A person's decisions on KB items" and
+// "Rename → whole-book sync"). The words of a rename's preview and announcement are renameView.ts's. Pure logic with no
 // React and no DOM. Only types come from './api', so the module loads anywhere and Vitest checks it directly (OUTLINE §8,
 // "Frontend tests"). What the KB holds, and what its rules refuse, is the backend's word (backend/fukidashi/kb/curator.py);
 // the wording is here, and so is what is not offered because the server always refuses it.
@@ -14,14 +15,14 @@ export type Lang = 'ja' | 'zh-Hans'
 export type Piece = string | { text: string; lang: Lang }
 export type Words = readonly Piece[]
 
-const ja = (text: string): Piece => ({ text, lang: 'ja' })
-const zh = (text: string): Piece => ({ text, lang: 'zh-Hans' })
+export const ja = (text: string): Piece => ({ text, lang: 'ja' })
+export const zh = (text: string): Piece => ({ text, lang: 'zh-Hans' })
 
 /** The words as one plain string, for a label, a test or a screen reader's name. */
 export const plain = (words: Words): string => words.map((piece) => (typeof piece === 'string' ? piece : piece.text)).join('')
 
 /** `封印 → 封缄`: a Japanese source and its Simplified Chinese rendering. */
-const pair = (source: string, target: string): Words => [ja(source), ' → ', zh(target)]
+export const pair = (source: string, target: string): Words => [ja(source), ' → ', zh(target)]
 
 /** The pieces with a separator between them. */
 function joined(pieces: readonly Piece[], separator = ', '): Piece[] {
@@ -47,7 +48,7 @@ export const statusLabel = (status: string): string => STATUS_WORDS.get(status) 
 /** Who made a row: `agent`, or a person once they decided it (`human`). */
 export const provenanceLabel = (provenance: string): string => (provenance === 'human' ? 'person' : provenance)
 
-const counted = (n: number, one: string, many = `${one}s`): string => `${n} ${n === 1 ? one : many}`
+export const counted = (n: number, one: string, many = `${one}s`): string => `${n} ${n === 1 ? one : many}`
 
 // ---- The summary line ------------------------------------------------------------------------------------------------------
 
@@ -160,18 +161,21 @@ export interface Offer {
   note: string | null
 }
 
-export const RENAME_NOTE = 'Approving is not offered: taking this rendering would be a rename, which is not built yet.'
+export const CONFLICT_NOTE = 'Approving is not offered: the KB keeps what it holds. Reject the proposal to close it.'
+export const TAKE_NOTE =
+  'Approving is not offered: the KB keeps the entry it holds. Take this rendering to rename that entry to it, or reject the proposal.'
 export const UNDECIDED_NAME_NOTE = 'Approving is not offered: only an undecided term can be approved.'
 
 const BOTH: Offer = { decisions: ['approve', 'reject'], note: null }
 
-/** An undecided term and a new name: both decisions. A conflict: only Reject, with the reason. A name that waits undecided
- *  (a state the rules never leave) and a `waits_for` this panel does not know are not in the table: the first can only be
- *  rejected, as the server has it, and for the second nothing is offered. */
-export function offerForProposal(p: KBProposal): Offer {
+/** An undecided term and a new name: both decisions. A conflict: only Reject, with the reason, and a note that says whether the
+ *  rendering can be taken (`takeOffer`). A name that waits undecided (a state the rules never leave) and a `waits_for` this panel
+ *  does not know are not in the table: the first can only be rejected, as the server has it, and for the second nothing is
+ *  offered. `kb` is the KB the panel shows: whether a rendering can be taken depends on the rows that hold its source. */
+export function offerForProposal(p: KBProposal, kb: KBView): Offer {
   if (!isReview(p)) return p.kind === 'term' ? BOTH : { decisions: ['reject'], note: UNDECIDED_NAME_NOTE }
   if (p.waits_for === 'new_name') return BOTH
-  if (p.waits_for === 'conflict') return { decisions: ['reject'], note: RENAME_NOTE }
+  if (p.waits_for === 'conflict') return { decisions: ['reject'], note: takeOffer(p, kb) === null ? CONFLICT_NOTE : TAKE_NOTE }
   return { decisions: [], note: null }
 }
 
@@ -183,8 +187,16 @@ export function offerForRow(status: string): Offer {
   return { decisions, note: null }
 }
 
+/** Rename is offered on a readable row, `approved` or waiting for a person (its rename approves it). The server refuses a
+ *  rejected or an undecided row, and a status this panel does not know: it is approved first, so it is not offered. */
+export const canRename = (status: string): boolean => isReadable(status)
+
 const VERBS: Record<KBDecision, string> = { approve: 'Approve', reject: 'Reject' }
 export const verbOf = (decision: KBDecision): string => VERBS[decision]
+
+/** What the two rename controls say on their buttons. */
+export const RENAME_LABEL = 'Rename'
+export const TAKE_LABEL = 'Take this rendering'
 
 /** The name of a decision control: it says what it decides, so that a screen reader's list of buttons is not a list of
  *  "Approve" and "Reject". */
@@ -193,10 +205,22 @@ export const entryControlName = (decision: KBDecision, e: KBEntry): string =>
   `${verbOf(decision)} entry ${e.id}: ${plain(describeEntry(e).pair)}`
 export const profileControlName = (decision: KBDecision, r: KBProfile): string =>
   `${verbOf(decision)} profile ${r.id}: ${plain(describeProfile(r).pair)}`
+/** `Rename entry 40: 封印 → 封印`: the row's pair as it is now (`words`: `describeEntry(e).pair`, or the profile's). */
+export const renameControlName = (kind: 'entry' | 'profile', id: number, words: Words): string =>
+  `${RENAME_LABEL} ${kind} ${id}: ${plain(words)}`
+/** `Take this rendering: rename entry 40 (封印 → 封印) to 封缄, as proposed on page 19`. */
+export const takeControlName = (p: KBProposal, take: TakeOffer): string =>
+  `${TAKE_LABEL}: rename entry ${take.entry.id} (${plain(describeEntry(take.entry).pair)}) to ${take.target}, as proposed on page ${p.page_index}`
 
 /** Where a decision's refusal is shown: beside its item. */
 export type ItemRef = { kind: 'proposal'; id: string } | { kind: 'entry'; id: number } | { kind: 'profile'; id: number }
 export const itemKey = (ref: ItemRef): string => `${ref.kind}:${ref.id}`
+
+/** Where a failed request's message is shown. A 409 is the rules' refusal of what was asked, and a 422 that carries the
+ *  server's own sentence (`fromDetail`) is a rendering the KB would not store: both go beside the item, since the person can
+ *  act on them. Anything else goes in the panel, and so does a 422 that is FastAPI's list: that is a body the route did not take,
+ *  a bug of the caller's, and not text for a person. */
+export const isRefusal = (status: number, fromDetail: boolean): boolean => status === 409 || (status === 422 && fromDetail)
 
 // ---- The rows a conflict collides with ---------------------------------------------------------------------------------------
 
@@ -234,6 +258,25 @@ export function rivalsOf(p: KBProposal, kb: KBView): Rival[] {
     return term && r.aliases.includes(source) ? [profileRival(r, source)] : []
   })
   return term ? [...entries, ...profiles] : [...profiles, ...entries]
+}
+
+/** "Take this rendering" on a term conflict: the conflict proposes a rendering for a term that a readable entry already holds,
+ *  and taking it is renaming that entry to it (OUTLINE §8, "Rename → whole-book sync"), which settles the conflict. */
+export interface TakeOffer {
+  entry: KBEntry // the entry that holds the term: what is renamed
+  target: string // the proposal's rendering: what it is renamed to
+}
+
+/** Offered on a term conflict when exactly one readable entry has its source, as `rivalsOf` finds it. Not offered for another
+ *  kind of conflict (a character, or a term whose source is a character's name or alias), where no entry's rename settles
+ *  anything, nor when the entry has the rendering already, nor for a rendering with no text: the server refuses those. */
+export function takeOffer(p: KBProposal, kb: KBView): TakeOffer | null {
+  if (!isConflict(p) || p.kind !== 'term') return null
+  const target = str(p.payload.target_term)
+  const holders = rivalsOf(p, kb).filter((r) => r.kind === 'entry')
+  if (target === '' || holders.length !== 1) return null
+  const entry = kb.entries.find((e) => e.id === holders[0].id)
+  return entry === undefined || entry.target_term === target ? null : { entry, target }
 }
 
 /** `The KB holds 封印 → 封印 (entry 40, approved)`; through an alias, `… (profile 38, approved), which is also called ゆき`. */
@@ -295,6 +338,7 @@ const EVENTS = new Map([
   ['merged', 'Merged'],
   ['approved', 'Approved'],
   ['rejected', 'Rejected'],
+  ['renamed', 'Renamed'],
 ])
 
 /** The backend's UTC time (`2026-11-14T21:33:27+00:00`) as `2026-11-14 21:33:27 UTC`; anything else as it is. */
@@ -305,7 +349,8 @@ export function formatAt(at: string): string {
 
 /** One line of a row's history: what happened, on which page or by a person, and the status it replaced. A page-bound line
  *  (an agent's `created`, `confirmed`, `merged`) says its page. A person's line says so, and the page of the proposal it came
- *  from, or that it came through one. An event this panel does not know is shown as it is. */
+ *  from, or that it came through one. A rename's line says the two renderings, in Simplified Chinese: `Renamed by a person:
+ *  托尔蒂亚家族 → 托尔蒂亚一家 (was approved)`. An event this panel does not know is shown as it is. */
 export function describeHistoryLine(line: HistoryLine): Words {
   const event = str(line.event)
   const page = typeof line.page === 'number' ? line.page : null
@@ -321,6 +366,9 @@ export function describeHistoryLine(line: HistoryLine): Words {
   if (event === 'merged') {
     const aliases = strings(line.aliases)
     words.push(aliases.length > 0 ? ': new aliases ' : ': no new alias', ...joined(aliases.map(ja)))
+  }
+  if (event === 'renamed' && typeof line.before === 'string' && typeof line.after === 'string') {
+    words.push(': ', zh(line.before), ' → ', zh(line.after))
   }
   if (typeof line.from === 'string') words.push(` (was ${statusLabel(line.from)})`)
   return words
