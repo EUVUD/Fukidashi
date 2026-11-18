@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# Vitest's JSON reporter writes its report here unless --outputFile points elsewhere
+.vitest/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
