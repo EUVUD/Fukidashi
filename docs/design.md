@@ -259,6 +259,9 @@ classDiagram
     class ReviewNotes:::service {
         build_review()
     }
+    class MCPServer:::api {
+        lookup_term()
+    }
     class RunsRouter:::api {
         get_run_events()
     }
@@ -440,6 +443,8 @@ classDiagram
     RunsRouter ..> Store : run events
     KBRouter ..> CuratorRules : a person's decisions, renames
     KBRouter ..> Store : reads, in one snapshot
+    MCPServer ..> Store : find_book, find_editor_kb, read-only
+    MCPServer ..> KBLoader : load_snapshot
     PagesRouter ..> Store : reads
     EvalHarness ..> Runs : validate, translate
     EvalHarness ..> Store : reads Runs, Translations; makes the KB (full)
@@ -569,6 +574,7 @@ classDiagram
         busy
         said
         refused
+        card
     }
     class kbView {
         <<module>>
@@ -579,6 +585,15 @@ classDiagram
         proposalLabel()
         describeOutcome()
         describeHistoryLine()
+        canRename()
+        takeOffer()
+        isRefusal()
+    }
+    class renameView {
+        <<module>>
+        describePreview()
+        describeRename()
+        describeLeft()
     }
     class PageNotes {
         ReviewLine
@@ -621,7 +636,8 @@ classDiagram
     App *-- PageList
     App *-- BookTypesetting
     App *-- KBPanel
-    KBPanel ..> api : fetchKB, decideProposal, decideEntry, decideProfile
+    KBPanel ..> api : fetchKB, decideProposal, decideEntry, decideProfile, previewRename, renameRow
+    KBPanel ..> renameView : describePreview, describeRename, describeLeft
     KBPanel ..> kbView : summaryLine, offers, rivalsOf, describeOutcome
     App *-- PageView
     App ..> api : fetchPages
@@ -659,7 +675,7 @@ classDiagram
 | Flag, Verdict / Issue | none (inside a `full_no_kb` or `full` Run's `attempts_json`) | `TranslatorResult.flags`, `ReviewResult`; read back by `review_notes.build_review` | `PageReview` (`ReviewFlag`, `ReviewIssue`) / `PageReview` |
 | Curator decision, proposal outcome | `proposals.status` and reason; also a `full` Run's `attempts_json` (`finalize`) | `CuratorResult.decisions`; `curator.Outcome` (one of 9 results) | none yet |
 | A person's KB decision | the item's `status` and a history line with `"by": "human"`; an entry's `provenance`; the proposal's `status` and reason | `curator.decide_proposal` / `decide_entry` / `decide_profile`, answering one of `HUMAN_OUTCOMES` | `ProposalDecisionOut.outcome` / `ProposalDecision.outcome`, worded by `kbView.describeOutcome` |
-| A rename | the row's new rendering, status and a `renamed` history line; the settled proposals; one Human edit (a Run of config `human` whose `attempts_json` carries `rename`) per page that changes | `kb.rename.plan_boxes` (`BoxPlan`), `curator.preview_entry_rename` / `rename_entry` and their profile twins (`RenamePlan`, `RenameResult`) | `RenamePreview`, `RenameOut` (#88); none yet in the frontend (task 047) |
+| A rename | the row's new rendering, status and a `renamed` history line; the settled proposals; one Human edit (a Run of config `human` whose `attempts_json` carries `rename`) per page that changes | `kb.rename.plan_boxes` (`BoxPlan`), `curator.preview_entry_rename` / `rename_entry` and their profile twins (`RenamePlan`, `RenameResult`) | `RenamePreview`, `RenameOut` (#88) / the same names, worded by `renameView` (#91) |
 
 ### 4.4 Where later milestones plug in
 
@@ -673,5 +689,6 @@ classDiagram
   - `Runs.translate_page` takes an optional event sink, which the Orchestrator, the agents and `AgentLoop` call (built, #70: `live_trace.py` holds the contract, `Runs.store_events` stores the events through `Store.add_run_event`).
   - The API runs pages in the background and streams their Live trace events over SSE from the `run_events` table (built, #72: `BackgroundRuns` in `background.py`, the stream in `api/runs.py`).
   - A human edit is a Run of config `human`, written by `Runs.edit_translation` through `Store.insert_human_run` (built, #68).
-  - A person's KB decisions go through `kb/curator.py` (built, #82: `decide_proposal`, `decide_entry` and `decide_profile`, reached through `KBRouter` in `api/kb.py`). The KB panel calls them (built, #84: `KBPanel`, which `App` mounts per book, with what it offers and says decided in the pure module `kbView`; it loads the KB again when `PageView` reports that a Run it followed has ended). A rename goes through `kb/curator.py` too (backend built, #88: `preview_entry_rename`, `rename_entry` and their profile twins, with `kb/rename.py` choosing the boxes, reached through `KBRouter`); the panel's Rename control is task 047.
+  - A person's KB decisions go through `kb/curator.py` (built, #82: `decide_proposal`, `decide_entry` and `decide_profile`, reached through `KBRouter` in `api/kb.py`). The KB panel calls them (built, #84: `KBPanel`, which `App` mounts per book, with what it offers and says decided in the pure module `kbView`; it loads the KB again when `PageView` reports that a Run it followed has ended). A rename goes through `kb/curator.py` too (backend built, #88: `preview_entry_rename`, `rename_entry` and their profile twins, with `kb/rename.py` choosing the boxes, reached through `KBRouter`); the panel offers it (built, #91: a card in `KBPanel`, worded by the pure module `renameView`, with "Take this rendering" on a term conflict; `App` hands the write's pages to `PageView`, which reads its page again when it is among them).
+  - The minimal MCP server (built, #90: `MCPServer` in `mcp_server.py`) answers `lookup_term` over a book's Editor KB through `Store` and `KBLoader`, read-only and over stdio, with the agents' own answer; it imports nothing from `agents/`.
   - The frontend adds a canvas to `PageView` (built, #77: `TypesetLayer`, a Konva stage loaded lazily, draws what the pure module `typeset` lays out with the measure of `canvasText`; `BookTypesetting`, which `App` keys by book, measures a whole book) and editing (built: `TranslationEditor`, #68). SSE adds an event subscription to the `api` module (built, #72: `watchRun`) and a panel that shows the events (built, #74: `TracePanel`, with what it shows decided in the pure module `liveTrace`). `PageView` shows the Flags and Issues of the Run behind the displayed translation (built, #79: `PageDetail.review` from `ReviewNotes`; the words and the grouping by region in the pure module `reviewNotes`, placed by `PageNotes`).
